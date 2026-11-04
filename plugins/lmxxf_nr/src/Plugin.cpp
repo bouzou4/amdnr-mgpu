@@ -8,6 +8,7 @@
 #include <detours/detours.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <vector>
 #include <cstdarg>
@@ -39,9 +40,13 @@ const char* const kModels[] = { "Full (71 blocks)", "Small (31 blocks)" };
 const char* const kStyles[] = { "Auto (2 before / after upscaling, 0 terminal)", "0 (NVIDIA look)", "1", "2" };
 const char* const kPasses[] = { "1", "2 (about 2x the network)", "3 (2 run + 1 predicted, about 2x)" };
 
+std::atomic<int> g_eclInFlight { 0 }; // calls inside the detour, waited out before a hot-reload unload
+
 void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
 {
+    g_eclInFlight++;
     Engine().OnExecute(queue, count, lists);
+    g_eclInFlight--;
 }
 
 NrSettings ReadSettings()
@@ -193,12 +198,110 @@ void SettingsTrigger()
     Log(OptiLog_Info, "settings trigger: %s", applied.c_str());
 }
 
+// Keys read only at start: the ini trigger sets them in memory, they apply after a restart
+bool RestartOnly(const std::string& k)
+{
+    return k == "MultiGpu" || k.rfind("Mgpu", 0) == 0 || k == "RuntimeDir" || k == "ModulesDir" || k == "WeightsDir" ||
+           (k == "Placement" && !g_hudlessRequested);
+}
+
+// Test rigs: <dumpDir>\lmxxf_nr_ini.trigger, Key=Value lines of [Plugin.lmxxf_nr] (any key): set in memory, then
+// every setting is read again and applied like the menu
+void IniTrigger()
+{
+    static uint32_t n = 0;
+    if (g_dumpDir.empty() || n++ % 30 != 15)
+        return;
+    const std::wstring path = g_dumpDir + L"\\lmxxf_nr_ini.trigger";
+    FILE* f = _wfopen(path.c_str(), L"r");
+    if (f == nullptr)
+        return;
+    auto trim = [](const std::string& v)
+    {
+        const size_t a = v.find_first_not_of(" \t\r\n"), b = v.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+    };
+    char line[600];
+    std::string applied, restart;
+    bool preset = false;
+    while (fgets(line, sizeof(line), f))
+    {
+        const std::string l = line;
+        const size_t eq = l.find('=');
+        if (l[0] == ';' || l[0] == '#' || eq == std::string::npos)
+            continue;
+        const std::string k = trim(l.substr(0, eq)), v = trim(l.substr(eq + 1));
+        if (k.empty())
+            continue;
+        g_api->SetString(g_plugin, k.c_str(), v.c_str());
+        preset |= k == "Preset";
+        std::string& to = RestartOnly(k) ? restart : applied;
+        to += (to.empty() ? "" : ", ") + k + "=" + v;
+    }
+    fclose(f);
+    DeleteFileW(path.c_str());
+    g_ui = ReadSettings();
+    if (const Preset p = PresetFromIni(g_api->GetInt(g_plugin, "Preset", 0)); preset && p != Preset::Custom)
+        ApplyPreset(g_ui, p);
+    ConfigureAll(g_ui);
+    Log(OptiLog_Info, "ini trigger: %s%s%s", applied.c_str(), restart.empty() ? "" : "; restart-only: ", restart.c_str());
+}
+
+// Test rigs: <dumpDir>\lmxxf_nr_frames.trigger "<seconds> <tag>": present-to-present ms for that long, one per
+// line, into frames_<tag>.txt
+void FrameLogTrigger()
+{
+    using Clock = std::chrono::steady_clock;
+    static uint32_t n = 0;
+    static std::vector<float> ms;
+    static Clock::time_point start {}, last {};
+    static double seconds = 0;
+    static std::string tag;
+    const auto now = Clock::now();
+    if (seconds > 0)
+    {
+        ms.push_back(std::chrono::duration<float, std::milli>(now - last).count());
+        last = now;
+        if (now - start < std::chrono::duration<double>(seconds))
+            return;
+        const std::wstring out = g_dumpDir + L"\\frames_" + std::wstring(tag.begin(), tag.end()) + L".txt";
+        if (FILE* o = _wfopen((out + L".tmp").c_str(), L"w"))
+        {
+            for (float v : ms)
+                fprintf(o, "%.3f\n", v);
+            fclose(o);
+            MoveFileExW((out + L".tmp").c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+        Log(OptiLog_Info, "frame log %s: %zu presents in %.1f s", tag.c_str(), ms.size(), seconds);
+        seconds = 0;
+        ms.clear();
+        return;
+    }
+    if (g_dumpDir.empty() || n++ % 10 != 5)
+        return;
+    const std::wstring path = g_dumpDir + L"\\lmxxf_nr_frames.trigger";
+    FILE* f = _wfopen(path.c_str(), L"r");
+    if (f == nullptr)
+        return;
+    double s = 10;
+    char t[64] = "w";
+    if (fscanf(f, "%lf %63s", &s, t) < 1)
+        s = 10;
+    fclose(f);
+    DeleteFileW(path.c_str());
+    seconds = std::clamp(s, 0.5, 600.0);
+    tag = t;
+    start = last = now;
+}
+
 void Present(OptiPresentFrame* frame, void*)
 {
     if (frame->phase == OptiPresent_AfterOverlay)
     {
         FramePacing(frame);
         SettingsTrigger();
+        IniTrigger();
+        FrameLogTrigger();
     }
     if (MgpuActive())
         return MgpuOnPresent(frame);
@@ -475,7 +578,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     // The OptiScaler module holds the api table; its folder is where OptiScaler.dll / dxgi.dll lives
     HMODULE opti = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR) api, &opti);
+                       (LPCWSTR) api->Log, &opti); // not api: under the hot-reload loader it is the loader's copy
     auto path = [&](const char* key)
     {
         char v[MAX_PATH] = {};
@@ -514,6 +617,30 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     Log(OptiLog_Info, "lmxxf_nr loaded, plugin API size %u, placement %s, size %s", api->size,
         kPlacements[(int) g_ui.placement], kSizes[(int) g_ui.size]);
     return api->RegisterTab(plugin, "Neural Rendering", "lmxxf DLSS 5 Neural Rendering", DrawTab, nullptr);
+}
+
+// Hot-reload loader: called at a present before this module is unloaded. Waits for the GPU, destroys the session,
+// removes the queue detour. False keeps the module (multi-GPU owns the game's device and swapchain).
+extern "C" __declspec(dllexport) bool OptiPluginShutdown()
+{
+    if (MgpuActive() || MgpuFallback() || !Engine().Shutdown())
+        return false;
+    if (o_ExecuteCommandLists != nullptr)
+    {
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourDetach(&(PVOID&) o_ExecuteCommandLists, hkExecuteCommandLists);
+        if (DetourTransactionCommit() != NO_ERROR)
+            return Log(OptiLog_Error, "hot reload: detour removal failed"), false;
+        for (int i = 0; i < 1000 && g_eclInFlight.load() != 0; i++)
+            Sleep(1);
+        Sleep(50); // a caller between the jump and the counter
+        o_ExecuteCommandLists = nullptr;
+    }
+    delete &Engine(); // GPU idle: its D3D12 objects can go
+    delete &DisplayEngine();
+    Log(OptiLog_Info, "shut down for hot reload");
+    return true;
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)

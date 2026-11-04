@@ -123,6 +123,7 @@ class NrEngine
     bool RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in);
     void SettleOwn(); // before presenting a RunOwn frame: its network answer is done
     void SeqIdle(const char* why); // no NR this frame: logs why a requested sequence dump waits (rate-limited)
+    bool Shutdown(); // hot reload: GPU idle, worker joined, session destroyed; false if a game list holds our work
     void Quiesce();   // CPU wait for all queued network work: its inputs may be freed after
     // Leaves the session alone: the game card's engine while the display card runs NR
     void SetSuspended(bool s) { _suspended = s; }
