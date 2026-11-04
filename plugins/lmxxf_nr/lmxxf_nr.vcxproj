@@ -51,6 +51,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="src\Autoconfig.h" />
     <ClInclude Include="src\Nr.h" />
     <ClInclude Include="src\Runtime.h" />
     <ClInclude Include="src\Shaders.h" />
@@ -62,6 +63,7 @@
     <ClInclude Include="third_party\lmxxf\LmxxfNrApi.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\Autoconfig.cpp" />
     <ClCompile Include="src\Nr.cpp" />
     <ClCompile Include="src\Plugin.cpp" />
     <ClCompile Include="src\Runtime.cpp" />

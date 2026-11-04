@@ -1,5 +1,6 @@
 // Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../LICENSE.
 // OptiScaler ASI plugin: lmxxf's DLSS 5 Neural Rendering runtime around the upscaler.
+#include "Autoconfig.h"
 #include "MgpuPlugin.h"
 #include "Nr.h"
 #include "Presets.h"
@@ -45,20 +46,20 @@ void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT cou
 NrSettings ReadSettings()
 {
     NrSettings s;
-    s.enabled = g_api->GetBool(g_plugin, "Enabled", true);
-    s.placement = (Placement) std::clamp(g_api->GetInt(g_plugin, "Placement", 1), 0, 2);
-    s.size = (NetworkSize) std::clamp(g_api->GetInt(g_plugin, "NetworkSize", 0), 0, 2);
-    s.model = std::clamp(g_api->GetInt(g_plugin, "Model", 0), 0, 1);
-    s.passes = std::clamp(g_api->GetInt(g_plugin, "MultiPass", 1), 1, 3);
-    s.style = std::clamp(g_api->GetInt(g_plugin, "Style", 0), 0, 2);
-    s.strength = std::clamp(g_api->GetFloat(g_plugin, "Strength", 1.0f), 0.0f, 2.0f);
-    s.motion = g_api->GetBool(g_plugin, "MotionVectors", true);
-    s.exposure = g_api->GetBool(g_plugin, "Exposure", true);
-    s.serialize = g_api->GetBool(g_plugin, "Serialize", false);
-    s.temporal = g_api->GetBool(g_plugin, "Temporal", true);
-    s.paperWhite = std::clamp(g_api->GetFloat(g_plugin, "HdrPaperWhite", 200.0f), 80.0f, 1000.0f);
-    s.wholeFrameFallback = g_api->GetBool(g_plugin, "WholeFrameFallback", true);
-    s.meter = g_api->GetBool(g_plugin, "FlickerMeter", true);
+    s.enabled = g_keys.Bool("Enabled", true);
+    s.placement = (Placement) std::clamp(g_keys.Int("Placement", 1), 0, 2);
+    s.size = (NetworkSize) std::clamp(g_keys.Int("NetworkSize", 0), 0, 2);
+    s.model = std::clamp(g_keys.Int("Model", 0), 0, 1);
+    s.passes = std::clamp(g_keys.Int("MultiPass", 1), 1, 3);
+    s.style = std::clamp(g_keys.Int("Style", 0), 0, 2);
+    s.strength = std::clamp(g_keys.Float("Strength", 1.0f), 0.0f, 2.0f);
+    s.motion = g_keys.Bool("MotionVectors", true);
+    s.exposure = g_keys.Bool("Exposure", true);
+    s.serialize = g_keys.Bool("Serialize", false);
+    s.temporal = g_keys.Bool("Temporal", true);
+    s.paperWhite = std::clamp(g_keys.Float("HdrPaperWhite", 200.0f), 80.0f, 1000.0f);
+    s.wholeFrameFallback = g_keys.Bool("WholeFrameFallback", true);
+    s.meter = g_keys.Bool("FlickerMeter", true);
     return s;
 }
 
@@ -89,6 +90,8 @@ void Text(const char* fmt, ...)
 }
 
 RuntimePaths g_paths;
+std::vector<std::string> g_antiCheat; // hits: the plugin stays inert
+std::wstring g_userDir;
 
 // Not from OptiPluginInit: that runs inside OptiScaler's DllMain
 void EnsureRuntime()
@@ -212,6 +215,14 @@ void DrawTab(void*)
     const NrSettings active = Engine().Settings();
 
     g_api->Section("Neural Rendering");
+    if (!g_antiCheat.empty())
+    {
+        g_api->TextColored(1.0f, 0.45f, 0.4f, 1.0f, "Anti-cheat found in this game: the plugin is disabled.");
+        for (const auto& h : g_antiCheat)
+            g_api->TextDisabled(h.c_str());
+        g_api->TextDisabled("Injected rendering code can get an account banned. Remove OptiScaler from this game.");
+        return;
+    }
     bool changed = false;
 
     // Combo order: the presets, then Custom
@@ -330,16 +341,37 @@ void DrawTab(void*)
     g_api->TextDisabled("Size, model, passes and style rebuild the network (a few seconds without NR).");
 
     g_api->Section("Runtime");
-    if (rt.module == nullptr)
+    if (rt.module == nullptr && !rt.tried)
     {
-        g_api->TextColored(1.0f, 0.45f, 0.4f, 1.0f, rt.error.empty() ? "Loaded at the first upscaled frame" : rt.error.c_str());
+        g_api->TextDisabled("Loaded at the first upscaled frame");
+    }
+    else if (rt.module == nullptr)
+    {
+        g_api->TextColored(1.0f, 0.45f, 0.4f, 1.0f, "No lmxxf runtime found: NR is off.");
+        Text("Put LmxxfNrRuntime.dll with its DLSS5-AMD folder (or a paths.ini naming them) in");
+        Text("    %ls", g_userDir.c_str());
+        Text("or next to lmxxf_nr.asi, or point LMXXF_NR_DIR at it, then restart the game.");
+        g_api->TextDisabled("Searched:");
+        for (const auto& s : rt.searched)
+            g_api->TextDisabled(s.c_str());
     }
     else
     {
         Text("%ls", rt.dllPath.c_str());
+        Text("Found in: %s", rt.source.c_str());
         Text("Layout: %s, %s function table, frame info %u bytes%s", rt.LayoutName(), rt.hasTimings ? "full" : "v1",
              rt.temporalSize ? rt.temporalSize : st.frameInfoSize, rt.Native() ? ", lmxxf history ABI" : "");
         Text("Assets: %ls", rt.assets.c_str());
+        if (rt.hashed)
+            Text("Modules: %zu checked against SHA256SUMS", rt.hashed);
+    }
+    if (g_keys.hasProfile)
+    {
+        std::string from;
+        for (const auto& k : g_keys.fromProfile)
+            from += (from.empty() ? "" : ", ") + k;
+        Text("Profile: %s%s%s", g_keys.profile.name.c_str(), from.empty() ? "" : ", sets ", from.c_str());
+        g_api->ItemTooltip("lmxxf_nr_profiles.ini beside the plugin. Keys in [Plugin.lmxxf_nr] of OptiScaler.ini win.");
     }
 
     g_api->Section("Multi-GPU");
@@ -386,7 +418,17 @@ void DrawTab(void*)
 
 bool OverlayText(char* buf, size_t size, void*)
 {
+    if (!g_antiCheat.empty())
+    {
+        snprintf(buf, size, "off: anti-cheat found (see the Neural Rendering tab)");
+        return true;
+    }
     const NrSettings s = Engine().Settings();
+    if (s.enabled && !Engine().RuntimeLoaded() && Engine().GetRuntime().tried)
+    {
+        snprintf(buf, size, "off: no lmxxf runtime found (see the Neural Rendering tab)");
+        return true;
+    }
     if (!s.enabled || !Engine().RuntimeLoaded())
         return false;
     if (MgpuFallback())
@@ -451,32 +493,90 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     g_api = api;
     g_plugin = plugin;
 
+    // The OptiScaler module holds the api table; its folder is where OptiScaler.dll / dxgi.dll lives
+    HMODULE opti = nullptr, self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR) api, &opti);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR) &OptiPluginInit, &self);
+    const std::wstring exeDir = ModuleDir(nullptr), optiDir = ModuleDir(opti), pluginDir = ModuleDir(self);
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    const std::wstring exeName = std::filesystem::path(exePath).filename().wstring();
+
+    // Anti-cheat: stay inert, say why in the tab and the overlay
+    g_antiCheat = Autoconfig::DetectAntiCheat(exeDir, exeName);
+    for (auto& m : Autoconfig::LoadedAntiCheatModules())
+        g_antiCheat.push_back(m);
+    if (!g_antiCheat.empty())
+    {
+        for (const auto& h : g_antiCheat)
+            Log(OptiLog_Error, "anti-cheat found: %s: plugin disabled", h.c_str());
+        if (OPTI_API_HAS(api, RegisterOverlayText))
+            api->RegisterOverlayText(plugin, "NR", OverlayText, nullptr);
+        return api->RegisterTab(plugin, "Neural Rendering", "lmxxf DLSS 5 Neural Rendering", DrawTab, nullptr);
+    }
+
+    // [Plugin.lmxxf_nr] (the user) > lmxxf_nr_profiles.ini beside the plugin > built-in defaults
+    g_keys.user = [](const char* key, std::string* value)
+    {
+        char v[1024] = {};
+        if (!g_api->GetString(g_plugin, key, v, sizeof(v), ""))
+            return false;
+        *value = v;
+        return true;
+    };
+    Autoconfig::Ini profiles;
+    const std::wstring profilePath = pluginDir + L"\\lmxxf_nr_profiles.ini";
+    if (profiles.Load(profilePath))
+    {
+        g_keys.hasProfile = Autoconfig::MatchProfile(profiles, exeName, exeDir, &g_keys.profile);
+        if (g_keys.hasProfile)
+        {
+            Log(OptiLog_Info, "profile %s ([%s])", g_keys.profile.name.c_str(), g_keys.profile.section.c_str());
+            for (const auto& [k, v] : g_keys.profile.keys)
+                if (k != "Name" && k != "Path" && !Autoconfig::ProfileKeyUsed(k))
+                    Log(OptiLog_Info, "profile key %s=%s: not used at run time by this build", k.c_str(), v.c_str());
+        }
+        else
+            Log(OptiLog_Info, "no profile for %ls in %ls", exeName.c_str(), profilePath.c_str());
+    }
+    g_keys.multiGpu = g_keys.Bool("MultiGpu", false);
+
     g_ui = ReadSettings();
-    if (const Preset p = PresetFromIni(g_api->GetInt(g_plugin, "Preset", 0)); p != Preset::Custom)
+    // A profile preset never overrides rows the user set
+    const bool presetFromProfile = !g_keys.UserSet("Preset");
+    const bool userRows = g_keys.UserSet("Model") || g_keys.UserSet("NetworkSize") || g_keys.UserSet("MultiPass") ||
+                          g_keys.UserSet("Temporal");
+    if (const Preset p = PresetFromIni(g_keys.Int("Preset", 0)); p != Preset::Custom && !(presetFromProfile && userRows))
     {
         ApplyPreset(g_ui, p);
-        Log(OptiLog_Info, "preset %s: model %s, size %s, passes %d, history %s", FindPreset(p)->name,
-            kModels[g_ui.model], kSizes[(int) g_ui.size], g_ui.passes, g_ui.temporal ? "on" : "off");
+        Log(OptiLog_Info, "preset %s%s: model %s, size %s, passes %d, history %s", FindPreset(p)->name,
+            presetFromProfile ? " (profile)" : "", kModels[g_ui.model], kSizes[(int) g_ui.size], g_ui.passes,
+            g_ui.temporal ? "on" : "off");
     }
     ConfigureAll(g_ui);
 
-    // The OptiScaler module holds the api table; its folder is where OptiScaler.dll / dxgi.dll lives
-    HMODULE opti = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR) api, &opti);
-    auto path = [&](const char* key)
-    {
-        char v[MAX_PATH] = {};
-        api->GetString(plugin, key, v, sizeof(v), "");
-        return std::filesystem::path(v).wstring();
-    };
-    g_paths.extra = path("RuntimeDir");
-    g_paths.modules = path("ModulesDir");
-    g_paths.weights = path("WeightsDir");
-    g_paths.exe = ModuleDir(nullptr);
-    g_paths.opti = ModuleDir(opti);
+    // Runtime search: ini, LMXXF_NR_DIR, the plugin folder, %LOCALAPPDATA%\lmxxf-nr, game and OptiScaler folders
+    Autoconfig::DiscoveryInputs in;
+    in.iniRuntime = g_keys.Path("RuntimeDir");
+    in.iniModules = g_keys.Path("ModulesDir");
+    in.iniWeights = g_keys.Path("WeightsDir");
+    wchar_t env[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LMXXF_NR_DIR", env, MAX_PATH) > 0)
+        in.envDir = env;
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", env, MAX_PATH) > 0)
+        in.userDir = std::wstring(env) + L"\\lmxxf-nr";
+    g_userDir = in.userDir;
+    in.pluginDir = pluginDir;
+    in.exeDir = exeDir;
+    in.optiDir = optiDir;
+    g_paths.candidates = Autoconfig::BuildCandidates(in);
+    g_paths.exe = exeDir;
+    for (const auto& c : g_paths.candidates)
+        Log(OptiLog_Debug, "runtime search: %s %ls", c.source.c_str(), c.dir.c_str());
 
-    const std::wstring dumpDir = g_paths.opti + L"\\lmxxf_nr_dumps";
+    const std::wstring dumpDir = optiDir + L"\\lmxxf_nr_dumps";
     Engine().dumpDir = dumpDir;
     g_dumpDir = dumpDir;
     const bool mgpu = MgpuInit(api, plugin, dumpDir);

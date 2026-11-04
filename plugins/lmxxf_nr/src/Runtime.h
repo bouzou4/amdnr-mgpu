@@ -7,15 +7,27 @@
 #include <cstddef>
 #include <string>
 
-#include "../third_party/lmxxf/LmxxfNrApi.h"
+#include <vector>
 
-// Where the runtime and its assets are looked for
+#include "../third_party/lmxxf/LmxxfNrApi.h"
+#include "Autoconfig.h"
+
+// Where the runtime and its assets are looked for, in order (Autoconfig::BuildCandidates)
 struct RuntimePaths
 {
-    std::wstring extra, exe, opti; // RuntimeDir setting, the game's exe folder, the OptiScaler folder
-    std::wstring modules;          // ModulesDir setting: a HIP module folder with SHA256SUMS
-    std::wstring weights;          // WeightsDir setting: tiled weights, passed as LMXXF_WEIGHTS_DIR
+    std::vector<Autoconfig::RuntimeCandidate> candidates;
+    std::wstring exe; // the game's exe folder, also searched for lmxxf's package
 };
+
+// A candidate's runtime dll and assets, found and hash-checked without loading anything
+struct RuntimeLayout
+{
+    std::wstring dll, assets, weights;
+    int layout = 0; // Runtime::Layout
+    size_t hashed = 0; // modules checked against SHA256SUMS
+    std::string error;
+};
+bool ResolveRuntime(const Autoconfig::RuntimeCandidate& c, const std::wstring& exeDir, RuntimeLayout* out);
 
 // The user-installed LmxxfNrRuntime.dll, through lmxxf's C ABI v1
 struct Runtime
@@ -39,8 +51,12 @@ struct Runtime
     std::wstring assets; // what Create gets as assets_directory
     LmxxfNrCapabilities caps {};
     std::string error;
+    std::string source;                  // the candidate it came from
+    std::vector<std::string> searched;   // "<source>: <dir>: <why not>" per rejected candidate
+    size_t hashed = 0;
+    bool tried = false;
 
-    // Finds and loads the runtime: RuntimeDir first, then the game and OptiScaler folders
+    // Finds and loads the runtime from the first candidate that resolves
     bool Load(const RuntimePaths& paths);
 
     // lmxxf's own ABI with motion-fed history: sole export, full table, history_supported. Gets the temporal

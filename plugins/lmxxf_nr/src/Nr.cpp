@@ -154,16 +154,21 @@ bool NrEngine::LoadRuntime(const RuntimePaths& paths)
     if (_rt.Load(paths))
     {
         Log(OptiLog_Info,
-            "runtime %ls (%s, assets %ls, %zu exports, %s table %u bytes, max input %ux%u, hip_ready %u, history %u, "
-            "native %d); env: free_res %d, style %d, multi_pass %d",
-            _rt.dllPath.c_str(), _rt.LayoutName(), _rt.assets.c_str(), _rt.exports, _rt.hasTimings ? "full" : "v1",
+            "runtime %ls (%s, from %s, assets %ls, %zu modules hashed, %zu exports, %s table %u bytes, max input %ux%u, "
+            "hip_ready %u, history %u, native %d); env: free_res %d, style %d, multi_pass %d",
+            _rt.dllPath.c_str(), _rt.LayoutName(), _rt.source.c_str(), _rt.assets.c_str(), _rt.hashed, _rt.exports,
+            _rt.hasTimings ? "full" : "v1",
             _rt.tableSize, _rt.caps.max_input_width, _rt.caps.max_input_height, _rt.caps.hip_ready,
             _rt.caps.history_supported, _rt.Native(), _rt.envFreeRes, _rt.envStyle, _rt.envMultiPass);
+        for (const auto& s : _rt.searched)
+            Log(OptiLog_Info, "  skipped %s", s.c_str());
         return true;
     }
     _stats.state = "no runtime";
     _stats.error = _rt.error;
     Log(OptiLog_Warn, "%s", _rt.error.c_str());
+    for (const auto& s : _rt.searched)
+        Log(OptiLog_Warn, "  searched %s", s.c_str());
     return false;
 }
 
