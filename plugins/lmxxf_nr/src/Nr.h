@@ -166,9 +166,10 @@ class NrEngine
     bool EnsureCopies(const D3D12_RESOURCE_DESC& d);
     // Frame dump on <dumpDir>\lmxxf_nr_dump.trigger: the network output, what it was fed, and the result
     void MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result = nullptr,
-                   D3D12_RESOURCE_STATES resultState = D3D12_RESOURCE_STATE_COPY_SOURCE);
+                   D3D12_RESOURCE_STATES resultState = D3D12_RESOURCE_STATE_COPY_SOURCE, ID3D12Resource* source = nullptr,
+                   ID3D12Resource* hudless = nullptr);
     void FinishDump();
-    ComPtr<ID3D12Resource> _dumpTex[3];
+    ComPtr<ID3D12Resource> _dumpTex[5];
     bool _dumpArmed = false;
     uint64_t _dumpGameValue = 0, _dumpOwnValue = 0;
     uint32_t _dumpCount = 0;

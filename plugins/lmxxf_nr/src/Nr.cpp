@@ -1060,7 +1060,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(bb, _termOut.Get());
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
-        MaybeDump(list, enh, bb, bbState);
+        MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud);
     }
 
     // Feed the HUD-less colour, linearised (no motion vectors at present time)
@@ -1286,7 +1286,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
 }
 
 void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result,
-                         D3D12_RESOURCE_STATES resultState)
+                         D3D12_RESOURCE_STATES resultState, ID3D12Resource* source, ID3D12Resource* hudless)
 {
     if (_dumpArmed || dumpDir.empty() || enh == nullptr || (_dumpCount++ % 30) != 0)
         return;
@@ -1295,9 +1295,9 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
         return;
     DeleteFileW(trigger.c_str());
 
-    ID3D12Resource* src[3] = { enh, _feed.Get(), result };
-    const D3D12_RESOURCE_STATES st[3] = { kRead, kRead, resultState };
-    for (int i = 0; i < 3; i++)
+    ID3D12Resource* src[5] = { enh, _feed.Get(), result, source, hudless };
+    const D3D12_RESOURCE_STATES st[5] = { kRead, kRead, resultState, kRead, kRead };
+    for (int i = 0; i < 5; i++)
     {
         if (src[i] == nullptr)
             continue;
@@ -1324,8 +1324,8 @@ void NrEngine::FinishDump()
     const bool gameDone = _dumpGameValue != 0 && _gameFence->GetCompletedValue() >= _dumpGameValue;
     if (!ownDone && !gameDone)
         return;
-    const wchar_t* names[3] = { L"enh", L"fed", L"result" };
-    for (int i = 0; i < 3; i++)
+    const wchar_t* names[5] = { L"enh", L"fed", L"result", L"source", L"hudless" };
+    for (int i = 0; i < 5; i++)
     {
         if (_dumpTex[i])
             Mgpu::DumpTexture(_device.Get(), _queue.Get(), _dumpTex[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST,

@@ -37,6 +37,20 @@ Menu: a "Neural Rendering" tab (settings, runtime, multi-GPU and NR stats). FPS 
 
 Dumps: create `lmxxf_nr_dumps\lmxxf_nr_dump.trigger` in the OptiScaler folder: the next NR frame writes the network output, what it was fed and the result (`.raw` + `.bmp`); `mgpu_dump.trigger` there dumps multi-GPU frames.
 
+## Measured (Satisfactory main menu, 3840x2160, FSR 4 output, RDNA 4, the runtime + pak pair)
+
+| Placement | fps | Network + handoff (GPU) | Edit (dump) |
+|---|---|---|---|
+| NR off | 73.3 | - | - |
+| After upscaling, 1080 tier, overlapped | 40.2 | 18.6 ms (shares the GPU with the next frame) | mean 0.069, 98.8 % of pixels |
+| After upscaling, `Serialize=true` (game waits for the network) | 35.5 | 9.8 ms (`hip_ms` 9.5-9.7) | mean 0.065 |
+| Before upscaling (2304x1296 colour -> 1920x1080) | 27.2 | 15.8 ms | mean 0.069, 98.1 % |
+| Terminal (HUD-less, at present) | 45.6 | 20.5 ms | UI pixels (26.3 %) identical to the back buffer, every scene pixel changed |
+| Multi-GPU, whole frame, NR every frame | 63 (render card bound) | 9.6 ms on the display card | 99.9 % of pixels changed |
+| Multi-GPU, HUD-less | 56 (presenter) | 9.7 ms | UI identical, scene changed |
+
+Details: `docs/MGPU_DESIGN.md` section 11.
+
 ## Build
 
 `build.ps1` (VS 2022, v143, Release x64, logical threads - 2) builds `x64\lmxxf_nr\lmxxf_nr.asi` at the repository root. It uses OptiScaler's plugin SDK header (`src/plugin_sdk/`), lmxxf's MIT header (`third_party/lmxxf/`) and Microsoft Detours (MIT) as vendored by OptiScaler under `src/`.

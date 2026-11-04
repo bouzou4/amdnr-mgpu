@@ -1,6 +1,6 @@
 # Multi-GPU Neural Rendering: design
 
-Status: design. The design branch is `mgpu/onboarding`; the build base (M2) is `mgpu/base`.
+Status: M3-M5 implemented on `mgpu/terminal` (see 10), and as part of the lmxxf_nr plugin on `mgpu/plugin` (see 11). The design branch is `mgpu/onboarding`; the build base (M2) is `mgpu/base`.
 
 This fork is a modified AMDNR. It is not the original AMDNR and is not endorsed by its author. The credit for AMDNR goes to 3zwr1 (https://github.com/3zwr1/AMD-NR---OptiScaler), and AMDNR's notice is kept in `Licenses/AMDNR_NOTICE.txt`.
 
@@ -271,3 +271,100 @@ The settings follow the project rules: a setting does only what its row says, an
 ## 9. Tools
 
 `mgpu/tools/` holds the MIT diagnostics carried over from the archived `optinr-amd` project: `optinr_diag`, `gpu_pref_probe`, `p2p_probe`, `sl_tap`, the header fetch scripts and `sl_tap_view.py`. They have their own CMake; see `mgpu/tools/README.md`.
+
+## 10. Status on `mgpu/terminal` (M3-M5)
+
+Code: `src/OptiScaler/mgpu/` (`MgpuCore` topology and redirect, `MgpuSwapChain` proxy + ring + presenter, `MgpuGpuLoad` per-card engine use, `MgpuDump` frame dumps, `MgpuHost` the only entry point for OptiScaler code: config, logging, NR backend, menu tab, overlay lines). Hook points in existing files are marked `[mgpu]`: `Config.h/.cpp` (the `[Mgpu]` block), `hooks/D3D12_Hooks.cpp` (redirect in `hkD3D12CreateDevice`), `hooks/DxgiFactory_Hooks.cpp` (no FG swapchain, proxy in `CreateSwapChainForHwnd`), `dlssnr/amd/AmdBridge.cpp` (`RuntimeGate`: no NR on the render card), `menu/menu_common.*` (Multi-GPU tab, overlay lines), `OptiScaler.vcxproj`, `OptiScaler.ini`. With `Enabled=false` (default) none of them changes behaviour.
+
+What differs from the change list in 5:
+
+- **One proxy instead of TerminalCapture + SwapchainRedirect.** The game's swapchain is a proxy `IDXGISwapChain4` whose back buffers are render-card textures; OptiScaler's `WrappedIDXGISwapChain4` and its menu sit on top of it unchanged. At `Present` a prerecorded copy-queue list (per back buffer and slot) copies the back buffer into a ring slot (placed footprint in a `SHARED | SHARED_CROSS_ADAPTER` heap) and signals a shared "filled" fence. The game queue waits for a buffer's last send before reusing it. The display card's presenter thread takes the newest scheduled frame (skip to newest), waits on "filled" on the GPU, copies the slot into the real back buffer (prerecorded per slot and real buffer), signals "released", runs NR, and presents (`FLIP_DISCARD`, `ALLOW_TEARING`, `Present(0, ALLOW_TEARING)` when the game uses sync 0). A slot is rewritten only after "released" reached the last frame the display card took from it. The game's lead over the display card is capped at two frames; a `FRAME_LATENCY_WAITABLE_OBJECT` swapchain gets a semaphore released per consumed frame.
+- **No output passthrough module.** The game keeps the display card's adapter object (outputs, HDR desc, modes), only its device is created on the render card; `GetContainingOutput`, fullscreen, `ResizeTarget`, colour space and HDR metadata go to the real swapchain. Satisfactory kept its 3840x2160 window.
+- **Devices DXGI, D3D12 and OptiScaler create for themselves are not redirected** (caller module check): redirecting DXGI's own device hung the cross-adapter present.
+- **NR (M5) is whole frame first.** The presenter runs AMDNR's final image context (`dlssnr/amd/PresentExperimental.h`, lmxxf runtime, no-motion carry) on the display device and queue: the runtime binds HIP by LUID (`hip_device=0 (luid)`). The menu and the game's HUD go through NR. `Mode=hudless` is built in pass 2 (below).
+- `[Mgpu]` keys: `Enabled`, `RenderAdapterBus`, `DisplayAdapterBus` (PCI bus, auto = the card without / with outputs), `Mode` (whole-frame / hudless), `Presenter` (false = Windows' cross-adapter present, the M3 test), `Fallback` (inline / off: what runs when no second card is found). Frame dumps: create `mgpu_dumps\mgpu_dump.trigger` beside the DLL (content: frame count); each frame gives `render` (render-card back buffer), `ingest` (display card after the copy) and `display` (after NR) as .raw + .bmp.
+- `mgpu/tools/mgpu_harness`: a minimal D3D12 title (borderless window on the monitor, moving bars, frame counter strip, tearing present) that loads the build as `dxgi.dll`.
+
+### Results (2026-11-04, display card bus 3 Gen5 x8, render card bus 7 Gen4 x8)
+
+Satisfactory 1.2.4.1 main menu (live 3D scene, game cap 60 fps), 3840x2160 R10G10B10A2, FSR 4 through OptiScaler, no input:
+
+| Run | Render card (bus 7) | Display card (bus 3) | Frame time | Send / ingest | Added latency | NR |
+|---|---|---|---|---|---|---|
+| Single card, NR off (baseline) | - | 3D 67 %, compute 22 % | 16.69 ms, Hardware: Independent Flip | - | - | - |
+| Single card, NR inline (baseline) | - | 3D 65 %, compute 54 % | 32.5 ms mean, p99 62 ms, Composed: Flip | - | - | `hip_ms` 11.7, every frame |
+| M3, Windows cross-adapter present | renders (copy engine 15 %) | 3D 7 % | game ran to its menu, clean exit | - | - | - |
+| M4, proxy + ring, NR off | 70-100 % busy | 11 % busy | 16.67 ms, 0 skipped | 2.38 ms at 14.0 GB/s / 1.15 ms at 28.8 GB/s | about 5 ms | - |
+| M5, NR on the display card | 70 % busy | 50-52 % busy | 16.67 ms, 0 skipped | same | about 5 ms | `hip_ms` 16.9, model every 2nd frame (300 per 600), record+submit 0.55 ms CPU |
+
+- M4 image: 10 consecutive frames bit-identical between the render-card back buffer and the display card's back buffer (and different from each other).
+- M5 image: render == ingest bit-exact; the presented frame differs (NR edit). The render card does not wait for NR: the game stays at its 60 fps cap where inline NR halves it.
+- Harness (uncapped, 4K): M4 365-386 fps, bound by the render card's Gen4 x8 link (send 2.38 ms at 14 GB/s, ingest 1.17 ms at 28.5 GB/s, 2.5 ms added latency); M5 123 fps, bound by the display card (96 % busy: the host passes at 4K plus a 25.7 ms network every sixth frame).
+- PresentMon could not confirm the present mode for the M4/M5 runs: from about 04:00 every PresentMon session on this machine (game or harness, filtered or not, realtime or from an ETL) reports lost events and writes no rows. The real swapchain matches the recipe that reached Hardware: Independent Flip in the NeuralHub spike: flip discard, tearing, a window covering its monitor, per-monitor DPI awareness (logged at proxy creation: Satisfactory's window is 3840x2160 at 0,0 on a 3840x2160 monitor, DPI awareness per monitor).
+
+### Open
+
+- PresentMon on the display card's swapchain (Independent Flip, VRR) still to be captured (done in pass 2, below).
+
+### Pass 2 (2026-11-04): uncapped, HUD-less, temporal inputs
+
+Code:
+
+- **HUD-less source.** OptiScaler's HUDfix pick, without frame generation: with `[FrameGen] FGInput=upscaler` and FG output off, `Hudfix_Dx12` and `ResTrack_Dx12` treat the multi-GPU sink as their consumer (`MgpuHost::HudlessSink`); the upscaler Evaluate arms HUDfix for the frame (`MgpuHost::UpscaleEvaluated`) and the proxy's Present closes the window (`Hudfix_Dx12::PresentStart`). The pick is copied into a staging texture per game back buffer and tagged with the frame id; only same-format picks are taken.
+- **Ring.** Each slot gains two regions after the back buffer: the HUD-less colour (same footprint) and the motion vectors (R16G16 float, up to the frame's size). The send list per slot is recorded at Present when the staging carries the frame's tag; constants (vector scale, jitter, reset, depth sense) travel in CPU memory with the slot.
+- **UI composite** (`MgpuComposite`): NR runs on the HUD-less colour; `mask = smoothstep(2/1023, 16/1023, max3|bb - hudless|)`, `out = lerp(nr, bb, mask)` (mask 1 = the back buffer's texel, mask 0 = NR's). A group-shared count of `max3 > 2/1023` is read back per slot; above `UiGate` (percent, default 15) the frame runs whole-frame NR and the count is still taken, so the mode comes back when the share drops.
+- **Temporal stage.** The runtime pair in use exports the fork ABI: `LMXXF_NR_FRAME_FLAG_TEMPORAL`, `motion` / `motion_scale_*` / `history_reset` / `output_smooth` in `LmxxfNrFrameInfo` (`dlssnr/lmxxf/runtime/LmxxfNrApi.h`), already driven by the backend's motion path inline. `[Mgpu] Temporal=true` sends the vectors and drives that path on the display card: display-sized unjittered colour, render-sized vectors (the backend resamples and rescales them), constant depth, history reset on a game reset, a vector size change or a gap over 250 ms.
+- **`[Mgpu] NrEveryFrame`**: the presenter waits for the answer in flight before each no-motion frame (`Lmxxf::Backend::WaitAnswer`).
+- **Uncapped menu**: Satisfactory caps its main menu with the console variable `FG.MaxMainMenuFPS` (help text in the game module: "FPS cap when in main menu. 0 = do not limit FPS in main menu"); the runs add `[SystemSettings] FG.MaxMainMenuFPS=0` to `Engine.ini` and restore it byte-exact.
+
+Satisfactory main menu, uncapped, 3840x2160, FSR 4, no input, 30 s windows (PresentMon 2.6, 90 s warm-up):
+
+| Run | fps | Frame time | Render card | Display card | Model runs | `hip_ms` |
+|---|---|---|---|---|---|---|
+| Single card, NR off | 72.4 | 13.81 ms (p99 15.0) | - | 3D 87 %, compute 28 % | - | - |
+| Single card, inline NR, every frame | 37.5 | 26.66 ms | - | 3D 66 %, compute 56 % | 600 / 600 | 11.7 |
+| Single card, inline NR, interleave 2 | 47.6 | 21.02 ms | - | 3D 74 %, compute 44 % | 300 / 600 | 11.5 |
+| MGPU, NR off | 65.5 | 15.26 ms | 3D 88 %, copy 16 % | 3D 8 % | - | - |
+| MGPU, NR (answer used when ready) | 65.4 | 15.29 ms | 91 % busy | 36 % busy, compute 37 % | 200 / 600 | 17.1 |
+| MGPU, NR, interleave 2 | 65.6 | 15.26 ms | 90 % busy | 38 % busy | 200 / 600 | 17.7 |
+| MGPU, NR every frame (`NrEveryFrame`) | 66.0 | 15.16 ms | 92 % busy | 66 % busy | 600 / 600 | 10.1 |
+| MGPU, HUD-less (`UiGate=50`) | 49.8 | 20.08 ms | 92 % busy | 38 % busy | 200 / 600 | 19.1 |
+| MGPU, HUD-less + temporal | 46.0 | 21.72 ms | 91 % busy | 69 % busy | 600 / 600, history 590 | 13.0 |
+
+- **Present mode**: every run, single card and MGPU, is `Hardware: Independent Flip`, `AllowsTearing=1`, `SyncInterval=0`, `PresentFlags=512` (ALLOW_TEARING) on every frame; under MGPU the only swapchain PresentMon sees is the display card's real one. PresentMon had stopped writing rows because a realtime ETW session left by an earlier probe (`sat_base_next_probe`, no consumer) was still running; after `logman stop` it works unelevated.
+- **MGPU vs inline**: the render card is the limit under MGPU (65 fps with NR off, 91 % busy; the render card on bus 7 is 10 % slower here than the display card running alone), and NR costs it nothing: 66 fps with the network on every frame, against 37.5 inline. With the answer used when ready the network runs every third frame at 65 fps (`hip_ms` 17 ms while it overlaps the ingest and host passes); waiting for it each frame brings `hip_ms` to 10.1 ms and every frame fresh at the same frame rate. The send queue lead makes the added latency 15 ms uncapped (5 ms at the 60 cap): the game runs two frames ahead of the display card.
+- **HUD-less**: HUDfix's pick on this menu is the scene without the menu (dumps: `runs/p2b_hud50/dumps`, `hudless` vs `ingest`). The menu's two translucent panels make 34.9 % of the pixels differ, so the default 15 % gate falls back to whole frame (`runs/p2_hud`, logged `HUD-less gate: ... whole frame`); with `UiGate=50` the composite runs: in 10 dumped frames every UI pixel (2.35 M, `max3 > 16/1023`) equals the back buffer bit for bit and every scene pixel (5.37 M, `bb == hudless`) equals NR's output bit for bit (`dump_metrics.json`). Cost: the render card goes from 15.3 to 17.5 ms (resource tracking and two 33 MB copies), the display card's `hip_ms` from 17 to 19 ms.
+- **Temporal**: the vectors arrive (2304x1296 R16G16 float, low-res, scale 2304/1296: UV units; 5308 of 5400 frames carried them) and the network runs with history (590 of 600 frames, 10 resets from the game's reset flag), but the composed output equals the HUD-less input bit for bit in every dumped frame while the backend reports an edit (mean 0.021): the motion path's result is not reaching the frame, so the flicker and ghost metrics of this run (both 0) measure nothing yet. No-motion HUD-less reference: flicker 0.00134 on input-static pixels (input change 0 there), ghost share 4.8 % of changed pixels (`runs/p2b_hud50/dump_metrics.json`). The menu camera moves (5.5 % of pixels static frame to frame, 2.8 % change by more than 0.05), so the menu itself is the moving sequence.
+
+### Open
+
+- Temporal stage: find why the motion path's result equals its input on the display card (candidates: the constant depth against the game's depth sense in the temporal pass, the residual-temporal setting, the post-placement layout `writeBack`); then the still / moving 10-frame gates with `dump_metrics.py`, and depth over the ring if the pass needs it.
+- HUD-less gate: during a run the measured share jumps to 74.9 % or 100 % for a few frames (115-209 gate transitions per run), so some frames still pair a back buffer with another frame's pick; the gate catches them, the tag pairing needs a look. The Satisfactory menu needs `UiGate` above 35 %: whether the default stays 15 % is a decision.
+- `hip_ms` under contention (17-19 ms with the answer used when ready, 10 ms when waited for); the render card's 2.2 ms HUD-less overhead.
+- M6 passthrough items (HDR PQ / scRGB, exclusive fullscreen, resize while running) and the 10-minute stability run.
+- The GPU Engine PDH counters report garbage for the render card's 3D and compute engines in typeperf (values above 10^9 %); the in-process sampler (`MgpuGpuLoad`) reads sane values.
+
+## 11. The plugin version (`mgpu/plugin`)
+
+On this branch the multi-GPU path is part of the lmxxf_nr plugin (`plugins/lmxxf_nr/src/mgpu/`, MIT) on plain upstream OptiScaler plus the plugin API extensions (`docs/PLUGIN_API_EXTENSIONS.md`): the device redirect is the adapter override (5), the proxy swapchain the swapchain provider (6), the HUD-less pick and the back buffer come from the present callback (2), the motion vectors from the upscale callbacks (1). `MgpuCore`, `MgpuSwapChain`, `MgpuComposite`, `MgpuGpuLoad` and `MgpuDump` are the `mgpu/terminal` pass-2 modules with three changes; `MgpuHost` is replaced by `MgpuPlugin.cpp`, and NR on the display card is the plugin's own engine (lmxxf's C API) instead of AMDNR's backend.
+
+Changes against pass 2:
+
+- **Pairing.** The HUD-less pick is handed over in the present of the frame it was captured in (`hudless` is NULL otherwise) and copied into the frame's staging right before the proxy's Present, on the game's queue. On the Satisfactory menu the measured UI share stays at 34.9 % (the menu's real coverage) for the whole run, one gate trip at the start, against 74.9 % / 100 % readings and 115-209 trips per run in pass 2.
+- **Gate.** The UI share is not a reason for whole-frame NR any more: HUD-less mode never runs NR over the UI. `MgpuUiGate` (default 0.90) only detects a wrong pairing; then, and when a frame has no pick, the frame is presented without NR.
+- **Frames ahead.** `MgpuMaxFramesAhead` (default 1, was 2 fixed).
+- **NR on the display card.** The plugin engine on the display device and queue: with `MgpuNrEveryFrame` (default on) it feeds the frame, runs the network, waits for it on the GPU and applies this frame's edit; otherwise the previous frame's edit, moved by the frame's vectors. With a runtime that takes the temporal layout the network gets the vectors and keeps a history.
+
+Satisfactory main menu, 3840x2160, FSR 4, no input, 30 s windows; display card bus 3, render card bus 7. "Steady" is the 10 s timeline in the middle of the window:
+
+| Run | fps (window / steady) | Render card | Display card | NR | Added latency | Present |
+|---|---|---|---|---|---|---|
+| MGPU, NR off, uncapped | 60.6 / 63 | 15.9 ms, 93 % busy | 13 % busy | - | 15.4 ms | Hardware: Independent Flip |
+| MGPU, whole frame, NR every frame, history | 59.7 / 63 | 16.0 ms, 94 % | 60 % busy | 9.6 ms (`hip_ms` 9.5), 600 / 600 | 15.6 ms | Hardware: Independent Flip |
+| same, frames ahead 2 | 59.8 / 63 | 15.9 ms, 93 % | 59 % | 9.6 ms | 15.5 ms | Hardware: Independent Flip |
+| same, history off | 59.6 | 15.9 ms, 93 % | 60 % | 9.5 ms | 15.4 ms | Hardware: Independent Flip |
+| MGPU, HUD-less, NR every frame, history | (window composed) / 56 from the presenter | 17.8 ms, 93 % | 54 % | 9.7 ms | 17.4 ms | Composed: Flip (another window had the foreground) |
+
+- The render card is the limit (63 fps with NR on or off); NR costs it nothing, as in pass 2 (65-66 fps there with two frames ahead).
+- Added latency is the same with one or two frames ahead here (15.4-15.6 ms): it is the render card's time to finish the frame plus the send, not the proxy's queue.
+- Dumps: render == ingest bit for bit; whole frame: the presented frame differs from the ingest on 99.9 % of the pixels, the network's edit mean 0.021 with history on and off. HUD-less: in 3 dumped frames every UI pixel (30.1 %, `max3 |bb - hudless| > 16/1023`) equals the back buffer bit for bit and every scene pixel changed.
