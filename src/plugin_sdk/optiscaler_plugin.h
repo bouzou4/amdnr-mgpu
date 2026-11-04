@@ -166,6 +166,9 @@ extern "C"
         uint64_t upscaleFrameId; // OptiUpscaleFrame::frameId of the last evaluate, 0 when none
         uint32_t hudlessSource;  // OptiHudlessSource of hudless (appended)
         uint32_t frameGeneration; // OptiFrameGen: generated frames are presented between the game's (appended)
+        // 1: the game's Present on its own FG swapchain, before that FG reads backBuffer and hudless (this frame's
+        // FG input): edits to both reach the frames it generates; its presents are not called back (appended)
+        uint32_t fgSwapchain;
     } OptiPresentFrame;
 
     typedef enum OptiHudlessSource

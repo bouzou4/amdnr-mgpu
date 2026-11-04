@@ -1073,6 +1073,32 @@ ID3D12Resource* PluginApi::TakeGameHudless(uint32_t* state, bool* generating)
     return std::exchange(_gameHudless, nullptr);
 }
 
+ID3D12Resource* PluginApi::PeekGameHudless(uint32_t* state, bool* generating)
+{
+    std::lock_guard<std::mutex> lock(_gameFgMutex);
+    const bool fresh = std::chrono::steady_clock::now() - _gameFgSeen < std::chrono::milliseconds(500);
+    *generating = fresh && _gameFgGenerating;
+    *state = _gameHudlessState;
+    return fresh ? _gameHudless : nullptr;
+}
+
+namespace
+{
+std::atomic<int64_t> _fgSwapchainPresent { 0 };
+}
+
+void PluginApi::NoteFgSwapchainPresent()
+{
+    _fgSwapchainPresent.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+}
+
+bool PluginApi::FgSwapchainPresenting()
+{
+    const auto last = std::chrono::steady_clock::time_point(
+        std::chrono::steady_clock::duration(_fgSwapchainPresent.load(std::memory_order_relaxed)));
+    return std::chrono::steady_clock::now() - last < std::chrono::milliseconds(500);
+}
+
 void PluginApi::RunPresentCallbacks(OptiPresentFrame* frame)
 {
     std::vector<std::shared_ptr<PresentCallback>> callbacks;

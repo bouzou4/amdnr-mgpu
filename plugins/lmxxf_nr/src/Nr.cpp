@@ -172,7 +172,7 @@ void NrEngine::Configure(const NrSettings& s)
     std::lock_guard lock(_mutex);
     _settings = s;
     // A history session drops adaptive ViT reuse: toggling history rebuilds it off the render thread
-    _dirty = s.size != _active.size || s.model != _active.model || s.style != _active.style ||
+    _dirty = s.size != _active.size || s.model != _active.model || s.Style() != _active.Style() ||
              s.Passes() != _active.Passes() || (_rt.Native() && s.History() != _active.History());
 }
 
@@ -228,7 +228,7 @@ void NrEngine::ApplyEnv()
     if (_rt.envStyle)
     {
         const char* styles[] = { "0", "1", "2" };
-        SetRuntimeEnv("DLSS5_STYLE", styles[std::clamp(_settings.style, 0, 2)]);
+        SetRuntimeEnv("DLSS5_STYLE", styles[std::clamp(_settings.Style(), 0, 2)]);
     }
     if (_rt.envMultiPass)
     {
@@ -1007,6 +1007,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
+        c.colorStrength = _settings.ColorStrength(true);
         c.encoding = encoding;
         c.useNorm = norm != nullptr;
 
@@ -1238,18 +1239,24 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     if (!s.enabled || s.placement != Placement::Terminal)
         return;
 
-    // The game's frame generation presents generated frames here too: whole frame on every present (consistent)
+    // The game's frame generation presents generated frames here too: whole frame on every present (consistent).
+    // At the game's Present on its FG swapchain the HUD-less colour is this frame's FG input: HUD-less NR, and the
+    // edit also goes onto that input so the generated frames are made from NR'd frames
     constexpr size_t kFgEnd = offsetof(OptiPresentFrame, frameGeneration) + sizeof(uint32_t);
-    const bool gameFg = f->size >= kFgEnd && f->frameGeneration != OptiFrameGen_Off;
+    constexpr size_t kFgScEnd = offsetof(OptiPresentFrame, fgSwapchain) + sizeof(uint32_t);
+    const bool fgSc = f->size >= kFgScEnd && f->fgSwapchain != 0;
+    const bool gameFg = f->size >= kFgEnd && f->frameGeneration != OptiFrameGen_Off && !fgSc;
     const uint32_t hudSource = f->size >= kFgEnd ? f->hudlessSource : OptiHudless_Hudfix;
     const bool haveHud = f->hudless != nullptr && !gameFg;
+    const bool editHud = haveHud && fgSc && hudSource == OptiHudless_FfxFG && f->frameGeneration != OptiFrameGen_Off;
     _hudlessStreak = haveHud ? 0 : _hudlessStreak + 1;
     // A lone missed pick keeps the HUD-less mode (no NR that frame); a run of them falls back
     const bool whole = !haveHud && s.wholeFrameFallback && (gameFg || _hudlessStreak > 30);
     {
         std::lock_guard lock(_mutex);
-        _stats.source = haveHud ? (hudSource == OptiHudless_FfxFG ? "HUD-less colour (the game's FSR FG input)"
-                                                                  : "HUD-less colour (OptiScaler HUDfix)")
+        _stats.source = haveHud ? (editHud ? "HUD-less colour at the game's FG swapchain (generated frames from NR'd frames)"
+                                   : hudSource == OptiHudless_FfxFG ? "HUD-less colour (the game's FSR FG input)"
+                                                                    : "HUD-less colour (OptiScaler HUDfix)")
                         : whole ? (gameFg ? "whole frame, UI included (the game's frame generation: every present)"
                                           : "whole frame, UI included (no HUD-less colour)")
                         : s.wholeFrameFallback ? "waiting for a HUD-less colour"
@@ -1308,6 +1315,19 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
                                                                                            : 1;
     _stats.encoding = encoding;
 
+    // The FG input is edited in place: the feed and the edit read its copy
+    ID3D12Resource* hudTarget = nullptr;
+    if (editHud && EnsureHudCopies(hud->GetDesc()))
+    {
+        hudTarget = hud;
+        Barrier(list, hud, hudState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(list, _hudCopy.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(_hudCopy.Get(), hud);
+        Barrier(list, _hudCopy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+        Barrier(list, hud, D3D12_RESOURCE_STATE_COPY_SOURCE, hudState);
+        hud = _hudCopy.Get();
+        hudState = kRead;
+    }
     Barrier(list, hud, hudState, kRead);
 
     uint64_t wait = 0;
@@ -1329,6 +1349,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
+        c.colorStrength = _settings.ColorStrength(false);
         c.uiLow = _settings.uiLow;
         c.uiHigh = _settings.uiHigh;
         c.encoding = encoding;
@@ -1340,7 +1361,21 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(bb, _termOut.Get());
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
-        MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud);
+        if (hudTarget != nullptr)
+        {
+            // Same edit on the HUD-less input, all of it scene (no UI mask: it is compared with itself)
+            const auto hd = hud->GetDesc();
+            ID3D12Resource* hsrv[4] = { hud, enh, _feed.Get(), hud };
+            const DXGI_FORMAT hfmt[4] = { hd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT, hd.Format };
+            Barrier(list, _hudOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Dispatch(list, _psoTerminal.Get(), c, hsrv, hfmt, _hudOut.Get(), hd.Format, w, h);
+            Barrier(list, _hudOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            const auto ts = D3D12_RESOURCE_STATES(f->hudlessState);
+            Barrier(list, hudTarget, ts, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(hudTarget, _hudOut.Get());
+            Barrier(list, hudTarget, D3D12_RESOURCE_STATE_COPY_DEST, ts);
+        }
+        MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud, hudTarget, D3D12_RESOURCE_STATES(f->hudlessState));
     }
 
     // Feed the HUD-less colour, linearised, with the vectors of the evaluate of this frame
@@ -1455,6 +1490,22 @@ bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
     return true;
 }
 
+bool NrEngine::EnsureHudCopies(const D3D12_RESOURCE_DESC& hd)
+{
+    if (_hudCopy && _hudCopy->GetDesc().Width == hd.Width && _hudCopy->GetDesc().Height == hd.Height &&
+        _hudCopy->GetDesc().Format == hd.Format)
+        return true;
+    _hudCopy = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, hd.Format, false, kRead);
+    _hudOut = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, UavFormat(hd.Format), true,
+                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (_hudCopy && _hudOut)
+        return true;
+    _hudCopy.Reset();
+    _hudOut.Reset();
+    Log(OptiLog_Warn, "HUD-less copies failed for format %d: generated frames without NR", (int) hd.Format);
+    return false;
+}
+
 bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in)
 {
     if (!RuntimeLoaded() || in.src == nullptr || in.dst == nullptr || !Settings().enabled)
@@ -1515,6 +1566,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
+        c.colorStrength = _settings.ColorStrength(false);
         c.encoding = in.encoding;
         c.paperWhite = _settings.paperWhite / 80.0f;
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1601,7 +1653,8 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
 }
 
 void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result,
-                         D3D12_RESOURCE_STATES resultState, ID3D12Resource* source, ID3D12Resource* hudless)
+                         D3D12_RESOURCE_STATES resultState, ID3D12Resource* source, ID3D12Resource* hudless,
+                         ID3D12Resource* hudResult, D3D12_RESOURCE_STATES hudResultState)
 {
     if (_dumpArmed || dumpDir.empty() || enh == nullptr || (_dumpCount++ % 30) != 0)
         return;
@@ -1610,9 +1663,9 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
         return;
     DeleteFileW(trigger.c_str());
 
-    ID3D12Resource* src[5] = { enh, _feed.Get(), result, source, hudless };
-    const D3D12_RESOURCE_STATES st[5] = { kRead, kRead, resultState, kRead, kRead };
-    for (int i = 0; i < 5; i++)
+    ID3D12Resource* src[6] = { enh, _feed.Get(), result, source, hudless, hudResult };
+    const D3D12_RESOURCE_STATES st[6] = { kRead, kRead, resultState, kRead, kRead, hudResultState };
+    for (int i = 0; i < 6; i++)
     {
         if (src[i] == nullptr)
             continue;
@@ -1761,8 +1814,8 @@ void NrEngine::FinishDump()
     const bool gameDone = _dumpGameValue != 0 && _gameFence->GetCompletedValue() >= _dumpGameValue;
     if (!ownDone && !gameDone)
         return;
-    const wchar_t* names[5] = { L"enh", L"fed", L"result", L"source", L"hudless" };
-    for (int i = 0; i < 5; i++)
+    const wchar_t* names[6] = { L"enh", L"fed", L"result", L"source", L"hudless", L"hudless_result" };
+    for (int i = 0; i < 6; i++)
     {
         if (_dumpTex[i])
             Mgpu::DumpTexture(_device.Get(), _queue.Get(), _dumpTex[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST,

@@ -27,14 +27,16 @@ bool g_hasPresent = false;
 void ConfigureAll(const NrSettings& s)
 {
     Engine().Configure(s);
-    DisplayEngine().Configure(s);
+    NrSettings d = s; // the display card's engine works on presented, display-referred frames
+    d.display = true;
+    DisplayEngine().Configure(d);
 }
 bool g_hudlessRequested = false;
 
 const char* const kPlacements[] = { "Before upscaling", "After upscaling", "Terminal (HUD-less)" };
 const char* const kSizes[] = { "1080 tier", "1440 (2560x1440)", "Native" };
 const char* const kModels[] = { "Full (71 blocks)", "Small (31 blocks)" };
-const char* const kStyles[] = { "0 (NVIDIA look)", "1", "2" };
+const char* const kStyles[] = { "Auto (2 before / after upscaling, 0 terminal)", "0 (NVIDIA look)", "1", "2" };
 const char* const kPasses[] = { "1", "2 (about 2x the network)", "3 (2 run + 1 predicted, about 2x)" };
 
 void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
@@ -50,8 +52,9 @@ NrSettings ReadSettings()
     s.size = (NetworkSize) std::clamp(g_api->GetInt(g_plugin, "NetworkSize", 0), 0, 2);
     s.model = std::clamp(g_api->GetInt(g_plugin, "Model", 0), 0, 1);
     s.passes = std::clamp(g_api->GetInt(g_plugin, "MultiPass", 1), 1, 3);
-    s.style = std::clamp(g_api->GetInt(g_plugin, "Style", 0), 0, 2);
+    s.style = std::clamp(g_api->GetInt(g_plugin, "Style", -1), -1, 2);
     s.strength = std::clamp(g_api->GetFloat(g_plugin, "Strength", 1.0f), 0.0f, 2.0f);
+    s.colorStrength = std::min(g_api->GetFloat(g_plugin, "ColorStrength", -1.0f), 1.0f);
     s.motion = g_api->GetBool(g_plugin, "MotionVectors", true);
     s.exposure = g_api->GetBool(g_plugin, "Exposure", true);
     s.serialize = g_api->GetBool(g_plugin, "Serialize", false);
@@ -70,6 +73,7 @@ void WriteSettings(const NrSettings& s)
     g_api->SetInt(g_plugin, "MultiPass", s.passes);
     g_api->SetInt(g_plugin, "Style", s.style);
     g_api->SetFloat(g_plugin, "Strength", s.strength);
+    g_api->SetFloat(g_plugin, "ColorStrength", s.colorStrength);
     g_api->SetBool(g_plugin, "MotionVectors", s.motion);
     g_api->SetBool(g_plugin, "Exposure", s.exposure);
     g_api->SetBool(g_plugin, "Temporal", s.temporal);
@@ -254,13 +258,21 @@ void DrawTab(void*)
         g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "Passes apply to the Full model: pick Full to use them.");
 
     g_api->Disabled(!rt.Styles());
-    if (g_api->Combo("Style", &g_ui.style, kStyles, 3, nullptr))
+    int32_t styleItem = g_ui.style + 1;
+    if (g_api->Combo("Style", &styleItem, kStyles, 4, nullptr))
+    {
+        g_ui.style = styleItem - 1;
         changed = true;
+    }
     g_api->Disabled(false);
     g_api->ItemTooltip(rt.Styles() ? "DLSS5_STYLE, 0 matches NVIDIA's output" : "This runtime does not read DLSS5_STYLE");
 
     if (g_api->SliderFloat("Strength", &g_ui.strength, 0.0f, 2.0f, "%.2f"))
         changed = true;
+    if (g_api->SliderFloat("Colour", &g_ui.colorStrength, -1.0f, 1.0f, g_ui.colorStrength < 0 ? "auto" : "%.2f"))
+        changed = true;
+    g_api->ItemTooltip("Share of the network's colour change: 0 keeps the game's chroma with the network's luma, 1 takes its "
+                       "colour. Auto: 0 before / after upscaling (the game grades on top), 1 at the display placements");
     if (g_api->Checkbox("Move the edit with motion vectors", &g_ui.motion))
         changed = true;
     if (g_api->Checkbox("Network history from motion vectors", &g_ui.temporal))
