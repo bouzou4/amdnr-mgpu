@@ -863,6 +863,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
             UpscalerInputsDx11wDx12::UpscaleEnd(InParameters, deviceContext);
         }
     }
+    else if (Hudfix_Dx11::PluginOnly() && WithDx12::IsInited() && IsFGSourceFeature(handleId))
+    {
+        // HUD-less capture for a plugin present callback, the FG input path without FG
+        Dx11WithDx12::Init(D3D11Device, InDevCtx);
+        Hudfix_Dx11::UpscaleStart();
+        Hudfix_Dx11::UpscaleEnd(deviceContext->FrameCount(), state.lastFGFrameTime);
+    }
 
     if (suppressDx11HudfixTracking)
         Hudfix_Dx11::SetSkipStatus(false);

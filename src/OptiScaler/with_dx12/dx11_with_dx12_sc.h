@@ -11,6 +11,8 @@
 
 using Microsoft::WRL::ComPtr;
 
+struct OptiPresentFrame;
+
 class DECLSPEC_UUID("23b064bb-482d-416c-93b1-829acedfb3d0") Dx11wDx12SC final : public IDXGISwapChain4
 {
   public:
@@ -84,6 +86,7 @@ class DECLSPEC_UUID("23b064bb-482d-416c-93b1-829acedfb3d0") Dx11wDx12SC final : 
     void _RefreshCachedSwapchainDesc();
     UINT _GetDx11BackBufferIndexForPresent() const;
     void _AdvanceFakeBackBufferIndex();
+    void _FillPluginPresentFrame(OptiPresentFrame& f, UINT syncInterval, UINT flags);
     bool _WaitForInteropCopyOnPresentQueue();
 
     IDXGISwapChain* _real = nullptr;

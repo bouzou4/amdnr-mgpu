@@ -7,6 +7,7 @@
 #include <framegen/IFGFeature_Dx12.h>
 #include <resource_tracking/ResTrack_dx11.h>
 #include <with_dx12/with_dx12.h>
+#include <plugins/PluginApi.h>
 
 #include <algorithm>
 
@@ -349,6 +350,9 @@ bool Hudfix_Dx11::IsResourceCheckActive()
             return false;
     }
 
+    if (PluginOnly())
+        return state.currentFeature != nullptr;
+
     if (!Config::Instance()->IsFGEnabled() || !Config::Instance()->FGHUDFix.value_or_default())
         return false;
 
@@ -518,7 +522,8 @@ bool Hudfix_Dx11::PublishCaptureToFg(ID3D11DeviceContext* context, Dx11ResourceI
 
     auto& state = State::Instance();
     auto* fg = state.currentFG;
-    if (fg == nullptr)
+    const bool pluginOnly = PluginOnly();
+    if (fg == nullptr && !pluginOnly)
         return false;
 
     const auto activeUpscaleFrame = ActiveUpscaleFrame();
@@ -530,6 +535,16 @@ bool Hudfix_Dx11::PublishCaptureToFg(ID3D11DeviceContext* context, Dx11ResourceI
     {
         LOG_WARN("DX11 Hudfix failed to prepare shared capture");
         return false;
+    }
+
+    // Plugin: the present's D3D11 -> D3D12 fence covers the copy (Dx11wDx12SC::Present)
+    if (pluginOnly)
+    {
+        if (_sharedCapture[index].Dx12Resource == nullptr)
+            return false;
+        _pluginHudless = _sharedCapture[index].Dx12Resource;
+        _pluginHudlessFrame = activeUpscaleFrame;
+        return true;
     }
 
     if (!Dx11WithDx12::SyncDx11ToDx12())
@@ -763,9 +778,28 @@ void Hudfix_Dx11::ResetCounters()
         counter = 0;
 }
 
+bool Hudfix_Dx11::PluginOnly()
+{
+    if (!PluginApi::WantsHudless() || State::Instance().swapchainInteropApi != SwapchainInteropApi::Dx11wDx12)
+        return false;
+
+    auto fg = State::Instance().currentFG;
+    return fg == nullptr || !fg->IsActive() || !Config::Instance()->IsFGEnabled();
+}
+
+ID3D12Resource* Hudfix_Dx11::PluginHudless(UINT64* frame)
+{
+    std::lock_guard<std::mutex> lock(_checkMutex);
+    if (frame != nullptr)
+        *frame = _pluginHudlessFrame;
+    return _pluginHudless;
+}
+
 void Hudfix_Dx11::ReleaseResources()
 {
     std::lock_guard<std::mutex> lock(_checkMutex);
+    _pluginHudless = nullptr;
+    _pluginHudlessFrame = 0;
 
     for (size_t i = 0; i < BUFFER_COUNT; ++i)
     {

@@ -52,6 +52,7 @@ class PluginApi
     // Present callbacks of the plugins
     static bool HasPresentCallbacks();
     static bool WantsHudless(); // a plugin asked for the HUD-less capture without frame generation
+    static bool WantsDx11Interop(); // D3D11 games present through a D3D12 swapchain for the present callbacks
     static uint64_t LastUpscaleFrameId();
     // HUD-less colour the game hands its own frame generation, and whether it generates frames
     static void SetGameFg(const char* source, ID3D12Resource* hudless, uint32_t hudlessState, bool generating);

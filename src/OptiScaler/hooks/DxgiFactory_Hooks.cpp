@@ -561,9 +561,11 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
             D3D11Hooks::HookToDevice(device);
             State::Instance().currentD3D11Device = device;
 
-            if (!_skipFGSwapChainCreation && State::Instance().activeFgInput == FGInput::Upscaler &&
-                State::Instance().activeFgOutput != FGOutput::NoFG &&
-                State::Instance().activeFgInput != FGInput::NvngxFG)
+            const bool fgInterop = State::Instance().activeFgInput == FGInput::Upscaler &&
+                                   State::Instance().activeFgOutput != FGOutput::NoFG &&
+                                   State::Instance().activeFgInput != FGInput::NvngxFG;
+            // A plugin's present callbacks see D3D11 games' frames on this D3D12 swapchain
+            if (!_skipFGSwapChainCreation && (fgInterop || PluginApi::WantsDx11Interop()))
             {
                 auto hiddenHwnd = CreateHiddenSwapchainWindow();
 
@@ -598,6 +600,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
 
                     if (SUCCEEDED(realScResult) && PrepareDx12InteropDesc(fgDesc, tearingSupported))
                     {
+                        if (fgInterop)
                         {
                             ScopedSkipFGSCCreation skipFGSCCreation {};
                             fgScResult = FGHooks::CreateSwapChain(realFactory, dx12Queue, &fgDesc, &fgSwapChain);
@@ -957,9 +960,11 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
             D3D11Hooks::HookToDevice(device);
             State::Instance().currentD3D11Device = device;
 
-            if (!_skipFGSwapChainCreation && State::Instance().activeFgInput == FGInput::Upscaler &&
-                State::Instance().activeFgOutput != FGOutput::NoFG &&
-                State::Instance().activeFgInput != FGInput::NvngxFG)
+            const bool fgInterop = State::Instance().activeFgInput == FGInput::Upscaler &&
+                                   State::Instance().activeFgOutput != FGOutput::NoFG &&
+                                   State::Instance().activeFgInput != FGInput::NvngxFG;
+            // A plugin's present callbacks see D3D11 games' frames on this D3D12 swapchain
+            if (!_skipFGSwapChainCreation && (fgInterop || PluginApi::WantsDx11Interop()))
             {
                 // For dx11 swapchain
                 auto hiddenHwnd = CreateHiddenSwapchainWindow();
@@ -993,6 +998,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
 
                     if (realScResult == S_OK && PrepareDx12InteropDesc1(fgDesc, tearingSupported))
                     {
+                        if (fgInterop)
                         {
                             ScopedSkipFGSCCreation skipFGSCCreation {};
                             fgScResult = FGHooks::CreateSwapChainForHwnd(

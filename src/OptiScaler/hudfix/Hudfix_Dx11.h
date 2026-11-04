@@ -90,6 +90,8 @@ class Hudfix_Dx11
     inline static std::mutex _checkMutex;
     inline static std::mutex _captureMutex;
     inline static std::mutex _counterMutex;
+    inline static ID3D12Resource* _pluginHudless = nullptr;
+    inline static UINT64 _pluginHudlessFrame = 0;
     inline static INT64 _captureCounter[BUFFER_COUNT] = {};
 
     static bool CheckCapture();
@@ -124,5 +126,9 @@ class Hudfix_Dx11
     static void ReleaseResources();
 
     static bool GetSkipStatus() { return _skipTracking; }
+
+    // HUD-less capture for a plugin present callback (PluginApi::WantsHudless) with frame generation off
+    static bool PluginOnly();
+    static ID3D12Resource* PluginHudless(UINT64* frame);
     static void SetSkipStatus(bool status) { _skipTracking = status; }
 };

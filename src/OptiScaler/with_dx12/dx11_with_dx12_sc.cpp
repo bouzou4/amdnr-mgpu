@@ -9,6 +9,7 @@
 
 #include <hudfix/Hudfix_Dx11.h>
 #include <resource_tracking/ResTrack_dx11.h>
+#include <plugins/PluginApi.h>
 
 #include <Util.h>
 #include <Config.h>
@@ -370,7 +371,8 @@ HRESULT STDMETHODCALLTYPE Dx11wDx12SC::Present(UINT SyncInterval, UINT Flags)
     const bool dx11HudfixPresent = Config::Instance()->FGHUDFix.value_or_default() &&
                                    State::Instance().activeFgInput == FGInput::Upscaler &&
                                    State::Instance().swapchainInteropApi == SwapchainInteropApi::Dx11wDx12;
-    if (dx11HudfixPresent)
+    const bool pluginHudfix = Hudfix_Dx11::PluginOnly();
+    if (dx11HudfixPresent || pluginHudfix)
     {
         ResTrack_Dx11::ClearPossibleHudless();
         Hudfix_Dx11::PresentStart();
@@ -403,6 +405,17 @@ HRESULT STDMETHODCALLTYPE Dx11wDx12SC::Present(UINT SyncInterval, UINT Flags)
     // For a plain external DX12 presenter, draw Opti's overlay here.
     // For a real FG swapchain, FGHooks::FGPresent/LocalPresent owns overlay/present-side work;
     // drawing it here would double-enter the overlay path before the FG present hook.
+    // Plugin present callbacks on the D3D12 back buffer, frame generation off
+    OptiPresentFrame pluginPresent {};
+    const bool pluginPresentOn = !fgHookedPresenter && PluginApi::HasPresentCallbacks() && _dx12Device != nullptr &&
+                                 (_fg == nullptr || !_fg->IsActive() || _fg->IsPaused());
+    if (pluginPresentOn)
+    {
+        _FillPluginPresentFrame(pluginPresent, SyncInterval, Flags);
+        pluginPresent.phase = OptiPresent_BeforeOverlay;
+        PluginApi::RunPresentCallbacks(&pluginPresent);
+    }
+
     if (!fgHookedPresenter)
         MenuOverlayDx::Present(_fgSwapChain, SyncInterval, Flags, nullptr, _dx12CommandQueue, _handle, false);
     else
@@ -411,6 +424,12 @@ HRESULT STDMETHODCALLTYPE Dx11wDx12SC::Present(UINT SyncInterval, UINT Flags)
     LOG_DEBUG("frame {}, dx11Index {}, real3Index {}, fakeIndex {}, bufferCount {}", State::Instance().frameCount,
               dx11Index, _real3 != nullptr ? _real3->GetCurrentBackBufferIndex() : 0xFFFFFFFF, _currentFakeIndex,
               _bufferCount);
+
+    if (pluginPresentOn)
+    {
+        pluginPresent.phase = OptiPresent_AfterOverlay;
+        PluginApi::RunPresentCallbacks(&pluginPresent);
+    }
 
     // Some memes with Vk swapchains on Lunyx and overlays
     if (_real != nullptr && !State::Instance().isRunningOnLinux)
@@ -1359,6 +1378,47 @@ UINT Dx11wDx12SC::_GetDx11BackBufferIndexForPresent() const
         return _real3->GetCurrentBackBufferIndex();
 
     return _bufferCount > 0 ? _currentFakeIndex : 0;
+}
+
+void Dx11wDx12SC::_FillPluginPresentFrame(OptiPresentFrame& f, UINT syncInterval, UINT flags)
+{
+    static uint64_t frameId = 0;
+    const auto& state = State::Instance();
+
+    f.size = sizeof(OptiPresentFrame);
+    f.api = OptiApi_D3D12;
+    f.device = _dx12Device;
+    f.queue = _dx12CommandQueue;
+    f.swapchain = _fgSwapChain;
+
+    ID3D12Resource* buffer = nullptr;
+    if (_fgSwapChain->GetBuffer(_fgSwapChain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer)) == S_OK)
+    {
+        f.backBuffer = buffer;
+        buffer->Release(); // the swapchain keeps it
+    }
+
+    f.backBufferState = D3D12_RESOURCE_STATE_PRESENT;
+    f.colorSpace = state.outputColorSpace.dxgiColorSpace;
+    f.width = state.currentSwapchainDesc.BufferDesc.Width;
+    f.height = state.currentSwapchainDesc.BufferDesc.Height;
+    f.format = state.currentSwapchainDesc.BufferDesc.Format;
+
+    // D3D11 HUD-less pick, shared with D3D12; this present's fence covers its copy
+    UINT64 hudlessFrame = 0;
+    auto hudless = Hudfix_Dx11::PluginHudless(&hudlessFrame);
+    if (hudless != nullptr && hudlessFrame == Hudfix_Dx11::ActiveUpscaleFrame())
+    {
+        f.hudless = hudless;
+        f.hudlessState = D3D12_RESOURCE_STATE_COMMON;
+        f.hudlessSource = OptiHudless_Hudfix;
+    }
+
+    f.frameGeneration = OptiFrameGen_Off;
+    f.syncInterval = syncInterval;
+    f.presentFlags = flags;
+    f.frameId = ++frameId;
+    f.upscaleFrameId = PluginApi::LastUpscaleFrameId();
 }
 
 void Dx11wDx12SC::_AdvanceFakeBackBufferIndex() { _currentFakeIndex = (_currentFakeIndex + 1) % _bufferCount; }

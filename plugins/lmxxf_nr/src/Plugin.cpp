@@ -8,6 +8,7 @@
 #include <detours/detours.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <vector>
 #include <cstdarg>
@@ -109,10 +110,22 @@ void UpscaleBefore(OptiUpscaleFrame* frame, void*)
     Engine().OnUpscale(frame, false);
 }
 
+void FramePacing(const OptiPresentFrame* frame);
+void SettingsTrigger();
+std::atomic<bool> g_presentSeen = false;
+
 void UpscaleAfter(OptiUpscaleFrame* frame, void*)
 {
     if (MgpuActive())
         return MgpuOnUpscale(frame);
+    if (!g_presentSeen.load(std::memory_order_relaxed)) // bridged D3D11 / Vulkan games: no D3D12 presents
+    {
+        OptiPresentFrame pf {};
+        pf.width = frame->outputWidth;
+        pf.height = frame->outputHeight;
+        FramePacing(&pf);
+        SettingsTrigger();
+    }
     EnsureRuntime();
     Engine().OnUpscale(frame, true);
     if (Engine().Settings().placement == Placement::Terminal)
@@ -193,6 +206,7 @@ void Present(OptiPresentFrame* frame, void*)
 {
     if (frame->phase == OptiPresent_AfterOverlay)
     {
+        g_presentSeen.store(true, std::memory_order_relaxed);
         FramePacing(frame);
         SettingsTrigger();
     }

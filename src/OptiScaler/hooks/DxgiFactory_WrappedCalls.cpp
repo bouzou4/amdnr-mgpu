@@ -26,8 +26,17 @@
 
 static bool ShouldCreateDx11wDx12Swapchain()
 {
+    if (PluginApi::WantsDx11Interop())
+        return true;
+
     return State::Instance().activeFgInput == FGInput::Upscaler && State::Instance().activeFgOutput != FGOutput::NoFG &&
            State::Instance().activeFgInput != FGInput::NvngxFG;
+}
+
+static bool PluginOnlyDx11Interop()
+{
+    return !(State::Instance().activeFgInput == FGInput::Upscaler && State::Instance().activeFgOutput != FGOutput::NoFG &&
+             State::Instance().activeFgInput != FGInput::NvngxFG);
 }
 
 static bool PrepareDx12InteropDesc(DXGI_SWAP_CHAIN_DESC& desc)
@@ -274,6 +283,7 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChain(IDXGIFactory* realFactory, Wrap
 
                     if (SUCCEEDED(realScResult) && PrepareDx12InteropDesc(fgDesc))
                     {
+                        if (!PluginOnlyDx11Interop())
                         {
                             ScopedSkipFGSCCreation skipFGSCCreation {};
                             fgScResult = FGHooks::CreateSwapChain(wrappedFactory, dx12Queue, &fgDesc, &fgSwapChain);
@@ -667,6 +677,7 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChainForHwnd(IDXGIFactory2* realFacto
 
                     if (SUCCEEDED(realScResult) && PrepareDx12InteropDesc1(fgDesc))
                     {
+                        if (!PluginOnlyDx11Interop())
                         {
                             ScopedSkipFGSCCreation skipFGSCCreation {};
                             fgScResult = FGHooks::CreateSwapChainForHwnd(
