@@ -38,6 +38,8 @@ void Configure(const Settings& s, const Env& e)
 const Settings& CurrentSettings() { return s_settings; }
 const Env& CurrentEnv() { return s_env; }
 Stats& MutableStats() { return s_stats; }
+static PerfKnobs s_perf;
+PerfKnobs& Perf() { return s_perf; }
 
 void Log(int level, const std::string& s)
 {

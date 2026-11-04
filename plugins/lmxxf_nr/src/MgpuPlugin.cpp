@@ -232,6 +232,11 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
     s.dred = std::clamp(api->GetInt(plugin, "MgpuDred", api->GetBool(plugin, "MgpuDred", false) ? 1 : 0), 0, 2);
     s.forwardOutputs = api->GetBool(plugin, "MgpuForwardOutputs", true);
+    s.perfSkip = (unsigned) api->GetInt(plugin, "MgpuPerfSkip", 0);
+    s.perfDummyMB = (unsigned) std::clamp(api->GetInt(plugin, "MgpuPerfDummyMB", 0), 0, 512);
+    s.perfDummyDst = api->GetInt(plugin, "MgpuPerfDummyDst", 0);
+    s.perfSendOnGame = api->GetBool(plugin, "MgpuPerfSendOnGame", false);
+    s.perfCopyPrio = api->GetInt(plugin, "MgpuPerfCopyPrio", 1);
 
     g_dir = dumpDir;
     Mgpu::Env e;
@@ -264,6 +269,10 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     };
     e.dumpDir = dumpDir;
     Mgpu::Configure(s, e);
+    Mgpu::Perf().skip = s.perfSkip;
+    Mgpu::Perf().dummyMB = s.perfDummyMB;
+    Mgpu::Perf().dummyDst = s.perfDummyDst;
+    Mgpu::Perf().onGame = s.perfSendOnGame;
     DisplayEngine().name = L"display";
     DisplayEngine().dumpDir = dumpDir;
 
@@ -272,6 +281,8 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     g_on = true;
     Log(OptiLog_Info, "multi-GPU on: hudless %d, NR every frame %d, motion vectors %d, UI gate %.2f, frames ahead %u",
         s.hudless, s.nrEveryFrame, s.temporal, s.uiGate, s.maxLead);
+    Log(OptiLog_Info, "multi-GPU perf: skip %u dummy %u MB dst %d send on game %d copy prio %d", s.perfSkip,
+        s.perfDummyMB, s.perfDummyDst, s.perfSendOnGame, s.perfCopyPrio);
     return true;
 }
 

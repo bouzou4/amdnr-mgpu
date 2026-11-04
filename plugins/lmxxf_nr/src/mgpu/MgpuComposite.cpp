@@ -201,3 +201,144 @@ UINT UiComposite::Count(UINT slot)
     return v;
 }
 } // namespace Mgpu
+
+namespace Mgpu
+{
+static const char* kDiffShader = R"(
+Texture2D<float4> bbT : register(t0);
+Texture2D<float4> hudT : register(t1);
+RWByteAddressBuffer flags : register(u0);
+cbuffer C : register(b0) { uint w; uint h; uint tx; uint base; };
+groupshared uint gs;
+[numthreads(16, 16, 1)]
+void main(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    if (gi == 0) gs = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint d = 0;
+    [unroll] for (uint y = 0; y < 4; ++y)
+    [unroll] for (uint x = 0; x < 4; ++x)
+    {
+        uint2 p = g.xy * 64 + t.xy + uint2(x, y) * 16;
+        if (p.x < w && p.y < h)
+            d |= any(asuint(bbT.Load(int3(p, 0))) != asuint(hudT.Load(int3(p, 0)))) ? 1u : 0u;
+    }
+    if (d) InterlockedOr(gs, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0) flags.Store((base + g.y * tx + g.x) * 4, gs);
+}
+)";
+
+bool TileDiff::Init(ID3D12Device* dev, DXGI_FORMAT fmt, UINT w, UINT h, UINT buffers)
+{
+    _dev = dev;
+    _fmt = fmt;
+    _w = w;
+    _h = h;
+    _tx = (w + kTile - 1) / kTile;
+    _ty = (h + kTile - 1) / kTile;
+    _n = _tx * _ty;
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m ? (PFN_Compile) GetProcAddress(m, "D3DCompile") : nullptr;
+    if (!compile)
+        return false;
+    ComPtr<ID3DBlob> cs, err;
+    if (FAILED(compile(kDiffShader, strlen(kDiffShader), "mgpu_tile_diff", nullptr, nullptr, "main", "cs_5_0",
+                       D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err)))
+    {
+        Log(2, std::format("tile diff: compile failed: {}", err ? (const char*) err->GetBufferPointer() : "?"));
+        return false;
+    }
+    D3D12_DESCRIPTOR_RANGE ranges[2] {};
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 };
+    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2 };
+    D3D12_ROOT_PARAMETER params[2] {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = { 2, ranges };
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = { 0, 0, 4 };
+    D3D12_ROOT_SIGNATURE_DESC rd { 2, params };
+    ComPtr<ID3DBlob> rs;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &err)) ||
+        FAILED(dev->CreateRootSignature(0, rs->GetBufferPointer(), rs->GetBufferSize(), IID_PPV_ARGS(&_root))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};
+    pd.pRootSignature = _root.Get();
+    pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_pso))))
+        return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3 * buffers,
+                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap))))
+        return false;
+    _inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_RESOURCE_DESC b {};
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    b.Width = UINT64(_n) * 4 * buffers;
+    b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+    b.SampleDesc.Count = 1;
+    b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES dp { D3D12_HEAP_TYPE_DEFAULT }, rp { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC bu = b;
+    bu.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return SUCCEEDED(dev->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &bu, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  IID_PPV_ARGS(&_flags))) &&
+           SUCCEEDED(dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&_readback)));
+}
+
+void TileDiff::Record(ID3D12GraphicsCommandList* cl, UINT i, ID3D12Resource* bb, ID3D12Resource* hud)
+{
+    auto cpu = _heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(i) * 3 * _inc;
+    auto gpu = _heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += UINT64(i) * 3 * _inc;
+    for (auto* r : { bb, hud })
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC s {};
+        s.Format = _fmt;
+        s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        s.Texture2D.MipLevels = 1;
+        _dev->CreateShaderResourceView(r, &s, cpu);
+        cpu.ptr += _inc;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u {};
+    u.Format = DXGI_FORMAT_R32_TYPELESS;
+    u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    u.Buffer.NumElements = UINT(_flags->GetDesc().Width / 4);
+    u.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    _dev->CreateUnorderedAccessView(_flags.Get(), nullptr, &u, cpu);
+
+    auto b0 = Tr(_flags.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cl->ResourceBarrier(1, &b0);
+    ID3D12DescriptorHeap* heaps[] = { _heap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootSignature(_root.Get());
+    cl->SetPipelineState(_pso.Get());
+    cl->SetComputeRootDescriptorTable(0, gpu);
+    const UINT k[4] = { _w, _h, _tx, i * _n };
+    cl->SetComputeRoot32BitConstants(1, 4, k, 0);
+    cl->Dispatch(_tx, _ty, 1);
+    auto b1 = Tr(_flags.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cl->ResourceBarrier(1, &b1);
+    cl->CopyBufferRegion(_readback.Get(), UINT64(i) * _n * 4, _flags.Get(), UINT64(i) * _n * 4, UINT64(_n) * 4);
+    auto b2 = Tr(_flags.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    cl->ResourceBarrier(1, &b2);
+}
+
+const UINT* TileDiff::Map(UINT i)
+{
+    UINT* p = nullptr;
+    D3D12_RANGE r { SIZE_T(i) * _n * 4, SIZE_T(i + 1) * _n * 4 };
+    if (FAILED(_readback->Map(0, &r, (void**) &p)))
+        return nullptr;
+    return p + SIZE_T(i) * _n;
+}
+
+void TileDiff::Unmap()
+{
+    D3D12_RANGE w { 0, 0 };
+    _readback->Unmap(0, &w);
+}
+} // namespace Mgpu

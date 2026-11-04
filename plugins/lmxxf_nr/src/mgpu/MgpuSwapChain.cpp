@@ -13,6 +13,13 @@ static inline UINT64 AlignUp(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1)
 static inline double Ema(double prev, double v) { return prev <= 0 ? v : prev * 0.95 + v * 0.05; }
 static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms);
 
+// HUD-less colour and vectors serve NR only: not captured or sent while it is off (perf skip bit 16 keeps them)
+static bool ExtrasUsed()
+{
+    const auto& e = CurrentEnv();
+    return (Perf().skip.load() & 16) || !e.nrWanted || e.nrWanted();
+}
+
 static std::atomic<ProxySwapChain*> s_active { nullptr };
 ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
 
@@ -193,7 +200,7 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
 
     D3D12_COMMAND_QUEUE_DESC q {};
     q.Type = D3D12_COMMAND_LIST_TYPE_COPY;
-    q.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    q.Priority = CurrentSettings().perfCopyPrio ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
     if (FAILED(_rdev->CreateCommandQueue(&q, IID_PPV_ARGS(&_rcopy))))
     {
         q.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
@@ -322,6 +329,7 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
         _hudR.clear();
         _mvR.clear();
         _hudTag.assign(_gameCount, 0);
+        _diffTag.assign(_gameCount, 0);
         _mvTag.assign(_gameCount, 0);
         _mvConst.assign(_gameCount, Guides {});
         if (_wantHud)
@@ -482,7 +490,18 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
             Log(2, "HUD-less resources failed: whole frame");
             _wantHud = false;
         }
+        delete _diff;
+        _diff = new TileDiff();
+        if (!_diff->Init(_rdev.Get(), rd.Format, rd.Width, rd.Height, _gameCount))
+        {
+            Log(1, "tile diff unavailable: the whole HUD-less colour is sent");
+            delete _diff;
+            _diff = nullptr;
+        }
     }
+
+    if (FAILED(hr = CreatePerf()))
+        return hr;
 
     std::lock_guard g(StatsMutex());
     auto& st = MutableStats();
@@ -566,6 +585,88 @@ HRESULT ProxySwapChain::CreateIngestLists()
     return S_OK;
 }
 
+static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
+{
+    if (!f || f->GetCompletedValue() >= v)
+        return;
+    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (f->SetEventOnCompletion(v, e) == S_OK)
+        WaitForSingleObject(e, ms);
+    CloseHandle(e);
+}
+
+HRESULT ProxySwapChain::CreatePerf()
+{
+    HRESULT hr;
+    for (UINT s = 0; s < K; ++s)
+        if (FAILED(hr = _rdev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_rgAlloc[s]))) ||
+            FAILED(hr = _rdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _rgAlloc[s].Get(), nullptr,
+                                                 IID_PPV_ARGS(&_rgList[s]))) ||
+            FAILED(hr = _rgList[s]->Close()))
+            return hr;
+    _dummyKey = 0;
+    return S_OK;
+}
+
+// Render thread, ring lock held: (re)build the dummy copy for the current knobs
+void ProxySwapChain::EnsureDummy(unsigned mb, int dst, bool onGame)
+{
+    const UINT64 key = mb ? (UINT64(mb) << 8 | UINT64(dst & 1) << 1 | (onGame ? 1 : 0)) : 0;
+    if (key == _dummyKey)
+        return;
+    WaitFence(_filledR.Get(), _scheduled, 3000);
+    for (UINT s = 0; s < K; ++s)
+    {
+        _dummyList[s].Reset();
+        _dummyAlloc[s].Reset();
+    }
+    _dummySrc.Reset();
+    _dummyDst.Reset();
+    _dummyHeap.Reset();
+    _dummyKey = key;
+    if (!mb)
+        return;
+    const UINT64 n = UINT64(mb) << 20;
+    D3D12_RESOURCE_DESC b {};
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    b.Width = n;
+    b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+    b.SampleDesc.Count = 1;
+    b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
+    HRESULT hr = _rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&_dummySrc));
+    if (SUCCEEDED(hr) && dst == 1)
+        hr = _rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                            IID_PPV_ARGS(&_dummyDst));
+    else if (SUCCEEDED(hr))
+    {
+        D3D12_HEAP_DESC hd {};
+        hd.SizeInBytes = AlignUp(n, 65536);
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+        hr = _rdev->CreateHeap(&hd, IID_PPV_ARGS(&_dummyHeap));
+        b.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        if (SUCCEEDED(hr))
+            hr = _rdev->CreatePlacedResource(_dummyHeap.Get(), 0, &b, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                             IID_PPV_ARGS(&_dummyDst));
+    }
+    const auto type = onGame ? D3D12_COMMAND_LIST_TYPE_DIRECT : D3D12_COMMAND_LIST_TYPE_COPY;
+    for (UINT s = 0; s < K && SUCCEEDED(hr); ++s)
+    {
+        if (FAILED(hr = _rdev->CreateCommandAllocator(type, IID_PPV_ARGS(&_dummyAlloc[s]))) ||
+            FAILED(hr = _rdev->CreateCommandList(0, type, _dummyAlloc[s].Get(), nullptr, IID_PPV_ARGS(&_dummyList[s]))))
+            break;
+        _dummyList[s]->CopyBufferRegion(_dummyDst.Get(), 0, _dummySrc.Get(), 0, n);
+        hr = _dummyList[s]->Close();
+    }
+    if (FAILED(hr))
+        for (UINT s = 0; s < K; ++s)
+            _dummyList[s].Reset();
+    Log(0, std::format("perf: dummy copy {} MB to {} on the {} queue: {:X}", mb, dst == 1 ? "VRAM" : "shared",
+                       onGame ? "game" : "copy", (uint32_t) hr));
+}
+
 // DXGI left or refused exclusive fullscreen on its own (the window not in front) and rejects presents until the real
 // swapchain is resized: the game's buffers are ours, so the presenter resizes the real one itself
 HRESULT ProxySwapChain::RenewReal()
@@ -603,6 +704,16 @@ void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
             drop(p);
         v.clear();
     };
+    drop(_dummySrc);
+    drop(_dummyDst);
+    drop(_dummyHeap);
+    for (UINT s = 0; s < K; ++s)
+    {
+        drop(_dummyList[s]);
+        drop(_dummyAlloc[s]);
+        drop(_rgList[s]);
+        drop(_rgAlloc[s]);
+    }
     dropAll(_fList);
     dropAll(_fAlloc);
     if (retire && _ui)
@@ -659,6 +770,8 @@ void ProxySwapChain::RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource
 {
     std::lock_guard g(_capM);
     const UINT i = _bbIndex;
+    if ((Perf().skip.load() & 4) || !ExtrasUsed())
+        return;
     if (!_wantHud || i >= _hudR.size() || !_hudR[i] || !src || !cl)
         return;
     const auto d = src->GetDesc();
@@ -682,13 +795,27 @@ void ProxySwapChain::RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource
     for (auto& x : b)
         std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
     cl->ResourceBarrier(nb, b);
-    _hudTag[i] = _scheduled + 1;
+    _hudTag[i] = _queued + 1;
+    if (_diff && !(Perf().skip.load() & 32))
+    {
+        const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_BARRIER t[2] = { Tr(_hudR[i].Get(), D3D12_RESOURCE_STATE_COMMON, ns),
+                                        Tr(_bb[i].Get(), D3D12_RESOURCE_STATE_PRESENT, ns) };
+        cl->ResourceBarrier(2, t);
+        _diff->Record(cl, i, _bb[i].Get(), _hudR[i].Get());
+        for (auto& x : t)
+            std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+        cl->ResourceBarrier(2, t);
+        _diffTag[i] = _queued + 1;
+    }
 }
 
 void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& gd)
 {
     std::lock_guard g(_capM);
     const UINT i = _bbIndex;
+    if ((Perf().skip.load() & 8) || !ExtrasUsed())
+        return;
     if (!_wantMv || i >= _mvR.size() || !gd.motion || !cl)
         return;
     auto d = gd.motion->GetDesc();
@@ -732,18 +859,9 @@ void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& g
     cl->ResourceBarrier(nb, b);
     _mvConst[i] = gd;
     _mvConst[i].motion = nullptr;
-    _mvTag[i] = _scheduled + 1;
+    _mvTag[i] = _queued + 1;
 }
 
-static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
-{
-    if (!f || f->GetCompletedValue() >= v)
-        return;
-    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (f->SetEventOnCompletion(v, e) == S_OK)
-        WaitForSingleObject(e, ms);
-    CloseHandle(e);
-}
 
 void ProxySwapChain::DrainRender()
 {
@@ -771,6 +889,7 @@ void ProxySwapChain::StartPresenter()
     _probeFrames = 4;
     _stop = false;
     _thread = std::thread([this] { PresenterLoop(); });
+    _sender = std::thread([this] { SenderLoop(); });
 }
 
 void ProxySwapChain::StopPresenter()
@@ -780,6 +899,8 @@ void ProxySwapChain::StopPresenter()
         _stop = true;
     }
     _cv.notify_all();
+    if (_sender.joinable())
+        _sender.join(); // sends what was queued: the game queue waits on those fence values
     if (_thread.joinable())
         _thread.join();
     if (_dq && _dFence)
@@ -912,7 +1033,29 @@ void ProxySwapChain::PresenterLoop()
                     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
                     c->ResourceBarrier(1, &b);
                 };
-                if (haveHud)
+                if (haveHud && meta.tiles)
+                {
+                    // HUD-less = back buffer outside the runs (bit-equal there), the sent runs inside
+                    D3D12_RESOURCE_BARRIER b[2] = { Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                    Tr(_hudD.Get(), ns, D3D12_RESOURCE_STATE_COPY_DEST) };
+                    c->ResourceBarrier(2, b);
+                    c->CopyResource(_hudD.Get(), _realBb[m].Get());
+                    for (const auto& r : meta.runs)
+                    {
+                        D3D12_RESOURCE_DESC rdsc = _hudD->GetDesc();
+                        rdsc.Width = r.w;
+                        rdsc.Height = r.h;
+                        D3D12_TEXTURE_COPY_LOCATION dl { _hudD.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                        D3D12_TEXTURE_COPY_LOCATION sl { _slotD[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                        _ddev->GetCopyableFootprints(&rdsc, 0, 1, r.offset, &sl.PlacedFootprint, nullptr, nullptr, nullptr);
+                        c->CopyTextureRegion(&dl, r.x, r.y, 0, &sl, nullptr);
+                    }
+                    for (auto& x : b)
+                        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+                    c->ResourceBarrier(2, b);
+                }
+                else if (haveHud)
                     ingest(_hudD.Get(), _hudOffset);
                 if (haveMv)
                     ingest(_mvD.Get(), _mvOffset);
@@ -1166,10 +1309,11 @@ void ProxySwapChain::PresenterLoop()
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
                                "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
-                               "hudless {} missed {} ui {:.2f}% gate {} motion {}",
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {} tiles {:.1f}%",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
                                st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
-                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames));
+                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
+                               st.hudTileShare * 100));
     }
 }
 
@@ -1189,7 +1333,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             return hr;
     }
     const UINT i = _bbIndex;
-    const UINT64 next = _scheduled + 1;
+    const UINT64 next = _queued + 1;
     if (!env.dumpDir.empty() && next % 30 == 0)
     {
         const std::wstring trig = env.dumpDir + L"\\mgpu_dump.trigger";
@@ -1210,71 +1354,33 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         }
     }
     if (next >= _dumpFrom && next < _dumpTo)
+    {
         DumpTexture(_rdev.Get(), _gameQueue.Get(), _bb[i].Get(), D3D12_RESOURCE_STATE_PRESENT,
                     env.dumpDir + std::format(L"\\f{:06}_render", next));
+        std::lock_guard cg(_capM);
+        if (i < _hudR.size() && _hudTag[i] == next)
+            DumpTexture(_rdev.Get(), _gameQueue.Get(), _hudR[i].Get(), D3D12_RESOURCE_STATE_COMMON,
+                        env.dumpDir + std::format(L"\\f{:06}_hudsrc", next));
+    }
     if (_lost)
         return PresentFallback(sync, flags);
     _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
 
-    double sendMs = -1;
     {
         std::unique_lock lk(_m);
         // Bound the lead over the display card ([Mgpu] MaxFramesAhead, default 1).
-        const UINT64 lead = (std::max)(1u, CurrentSettings().maxLead);
-        _cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return _scheduled < _consumed + lead || _stop; });
-        const UINT64 g = _scheduled + 1;
-        const UINT s = UINT(g % K);
-        if (g > K && _filledR->GetCompletedValue() >= g - K && _rQuery)
-            sendMs = ReadTs(_rReadback.Get(), s, _rTsFreq);
-        _rcopy->Wait(_rgameFence.Get(), _rgameValue);
-        if (_picked[s])
-            _rcopy->Wait(_releasedR.Get(), _picked[s]);
-        ID3D12CommandList* l[2] = { _rList[i * K + s].Get(), nullptr };
-        UINT nl = 1;
-        SlotMeta meta {};
-        if (_rxList[s])
-        {
-            std::lock_guard cg(_capM);
-            meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g;
-            meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g;
-            if (meta.hud || meta.mv)
-            {
-                // the slot's previous send list must be done before its allocator is reset
-                if (g > K)
-                    WaitFence(_filledR.Get(), g - K, 500);
-                _rxAlloc[s]->Reset();
-                auto* c = _rxList[s].Get();
-                c->Reset(_rxAlloc[s].Get(), nullptr);
-                auto send = [&](ID3D12Resource* srcTex, UINT64 offset)
-                {
-                    auto sd = srcTex->GetDesc();
-                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-                    _rdev->GetCopyableFootprints(&sd, 0, 1, offset, &fp, nullptr, nullptr, nullptr);
-                    D3D12_TEXTURE_COPY_LOCATION dl { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-                    dl.PlacedFootprint = fp;
-                    D3D12_TEXTURE_COPY_LOCATION sl { srcTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-                    c->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
-                };
-                if (meta.hud)
-                    send(_hudR[i].Get(), _hudOffset);
-                if (meta.mv)
-                {
-                    send(_mvR[i].Get(), _mvOffset);
-                    meta.g = _mvConst[i];
-                    meta.mvDesc = _mvR[i]->GetDesc();
-                }
-                c->Close();
-                l[nl++] = c;
-            }
-        }
-        _meta[s] = meta;
-        _rcopy->ExecuteCommandLists(nl, l);
-        _rcopy->Signal(_filledR.Get(), g);
-        _sync[s] = sync;
-        _flags[s] = flags;
-        _tSched[s] = std::chrono::steady_clock::now();
-        _scheduled = g;
-        _bbFrame[i] = g;
+        const UINT64 lead = Perf().lead.load() ? Perf().lead.load() : (std::max)(1u, CurrentSettings().maxLead);
+        _cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return _queued < _consumed + lead || _stop; });
+        Job j;
+        j.g = _queued + 1;
+        j.i = i;
+        j.gameValue = _rgameValue;
+        j.sync = sync;
+        j.flags = flags;
+        j.t = std::chrono::steady_clock::now();
+        _jobs.push_back(j);
+        _queued = j.g;
+        _bbFrame[i] = j.g;
     }
     _cv.notify_all();
 
@@ -1294,12 +1400,190 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     if (_lastRender.time_since_epoch().count())
         st.renderFrameMs = Ema(st.renderFrameMs, std::chrono::duration<double, std::milli>(now - _lastRender).count());
     _lastRender = now;
+    return S_OK;
+}
+
+void ProxySwapChain::SenderLoop()
+{
+    SetThreadDescription(GetCurrentThread(), L"Mgpu sender");
+    for (;;)
+    {
+        Job j;
+        {
+            std::unique_lock lk(_m);
+            _cv.wait(lk, [&] { return _stop || !_jobs.empty(); });
+            if (_jobs.empty())
+                break; // stop, nothing left
+            j = _jobs.front();
+            _jobs.pop_front();
+        }
+        Send(j);
+    }
+}
+
+// Sender thread, in frame order: the copies of frame j.g into its ring slot, then the slot is handed to the presenter
+void ProxySwapChain::Send(const Job& j)
+{
+    const UINT64 g = j.g;
+    const UINT i = j.i;
+    const UINT s = UINT(g % K);
+    const unsigned skip = Perf().skip.load();
+    const bool onGame = Perf().onGame.load() && _rgList[s];
+    EnsureDummy(Perf().dummyMB.load(), Perf().dummyDst.load(), onGame);
+    ID3D12CommandQueue* sq = onGame ? _gameQueue.Get() : _rcopy.Get();
+    double sendMs = -1;
+    if (!onGame && g > K && _filledR->GetCompletedValue() >= g - K && _rQuery)
+        sendMs = ReadTs(_rReadback.Get(), s, _rTsFreq);
+    UINT64 picked;
+    {
+        std::lock_guard lk(_m);
+        picked = _picked[s];
+    }
+    if (!onGame)
+        _rcopy->Wait(_rgameFence.Get(), j.gameValue);
+    if (picked)
+        sq->Wait(_releasedR.Get(), picked);
+    ID3D12CommandList* l[3] = { _rList[i * K + s].Get(), nullptr, nullptr };
+    UINT nl = (skip & 1) ? 0 : 1;
+    // the slot's previous send lists must be done before their allocators are reset
+    if (g > K)
+        WaitFence(_filledR.Get(), g - K, 500);
+    if (onGame)
+    {
+        _rgAlloc[s]->Reset();
+        _rgList[s]->Reset(_rgAlloc[s].Get(), nullptr);
+        nl = 0;
+    }
+    SlotMeta meta {};
+    double tileShare = -1;
+    if (_rxList[s])
+    {
+        std::lock_guard cg(_capM);
+        meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g && !(skip & 2);
+        meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g && !(skip & 2);
+        if (meta.hud || meta.mv)
+        {
+            auto* c = onGame ? _rgList[s].Get() : _rxList[s].Get();
+            if (!onGame)
+            {
+                _rxAlloc[s]->Reset();
+                c->Reset(_rxAlloc[s].Get(), nullptr);
+            }
+            auto send = [&](ID3D12Resource* srcTex, UINT64 offset)
+            {
+                auto sd = srcTex->GetDesc();
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+                _rdev->GetCopyableFootprints(&sd, 0, 1, offset, &fp, nullptr, nullptr, nullptr);
+                D3D12_TEXTURE_COPY_LOCATION dl { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                dl.PlacedFootprint = fp;
+                D3D12_TEXTURE_COPY_LOCATION sl { srcTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                c->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+            };
+            if (meta.hud && _diff && _diffTag[i] == g)
+            {
+                // the frame's tile flags are on the CPU once the game's work of the frame is done
+                WaitFence(_rgameFence.Get(), j.gameValue, 500);
+                if (_rgameFence->GetCompletedValue() >= j.gameValue)
+                    if (const UINT* f = _diff->Map(i))
+                    {
+                        const UINT T = TileDiff::kTile, tx = _diff->TilesX(), ty = _diff->TilesY();
+                        UINT on = 0;
+                        for (UINT k = 0; k < tx * ty; ++k)
+                            on += f[k] ? 1 : 0;
+                        tileShare = double(on) / double(tx * ty);
+                        if (tileShare <= 0.6)
+                        {
+                            meta.tiles = true;
+                            UINT64 off = _hudOffset;
+                            D3D12_RESOURCE_DESC rd = _hudR[i]->GetDesc();
+                            for (UINT y = 0; y < ty; ++y)
+                                for (UINT x = 0; x < tx;)
+                                {
+                                    if (!f[y * tx + x])
+                                    {
+                                        ++x;
+                                        continue;
+                                    }
+                                    UINT e = x;
+                                    while (e < tx && f[y * tx + e])
+                                        ++e;
+                                    TileRun r { x * T, y * T, (std::min)(e * T, UINT(rd.Width)) - x * T,
+                                                (std::min)((y + 1) * T, rd.Height) - y * T, off };
+                                    D3D12_RESOURCE_DESC bd = rd;
+                                    bd.Width = r.w;
+                                    bd.Height = r.h;
+                                    D3D12_TEXTURE_COPY_LOCATION dl { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                                    UINT64 bytes = 0;
+                                    _rdev->GetCopyableFootprints(&bd, 0, 1, off, &dl.PlacedFootprint, nullptr, nullptr, &bytes);
+                                    D3D12_TEXTURE_COPY_LOCATION sl { _hudR[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                                    D3D12_BOX box { r.x, r.y, 0, r.x + r.w, r.y + r.h, 1 };
+                                    c->CopyTextureRegion(&dl, 0, 0, 0, &sl, &box);
+                                    meta.runs.push_back(r);
+                                    off = AlignUp(off + bytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+                                    x = e;
+                                }
+                        }
+                        _diff->Unmap();
+                        static int logged = 0;
+                        if (logged < 3 && ++logged)
+                            Log(0, std::format("tiles frame {}: {} of {} tiles, {} runs, {} bytes from offset {} (slot {})", g,
+                                               on, tx * ty, meta.runs.size(),
+                                               meta.runs.empty() ? 0 : meta.runs.back().offset - _hudOffset, _hudOffset,
+                                               _slotBytes));
+                    }
+            }
+            if (meta.hud && !meta.tiles)
+                send(_hudR[i].Get(), _hudOffset);
+            if (meta.mv)
+            {
+                send(_mvR[i].Get(), _mvOffset);
+                meta.g = _mvConst[i];
+                meta.mvDesc = _mvR[i]->GetDesc();
+            }
+            if (!onGame)
+            {
+                c->Close();
+                l[nl++] = c;
+            }
+        }
+    }
+    if (onGame)
+    {
+        auto* c = _rgList[s].Get();
+        if (!(skip & 1))
+        {
+            D3D12_TEXTURE_COPY_LOCATION dst { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+            dst.PlacedFootprint = _fp;
+            D3D12_TEXTURE_COPY_LOCATION src { _bb[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        c->Close();
+        l[nl++] = c;
+    }
+    if (_dummyList[s])
+        l[nl++] = _dummyList[s].Get();
+    if (nl)
+        sq->ExecuteCommandLists(nl, l);
+    sq->Signal(_filledR.Get(), g);
+    {
+        std::lock_guard lk(_m);
+        _meta[s] = std::move(meta);
+        _sync[s] = j.sync;
+        _flags[s] = j.flags;
+        _tSched[s] = j.t;
+        _scheduled = g;
+    }
+    _cv.notify_all();
+
+    std::lock_guard sg(StatsMutex());
+    auto& st = MutableStats();
     if (sendMs > 0)
     {
         st.sendMs = Ema(st.sendMs, sendMs);
         st.sendGBs = double(_payloadBytes) / (st.sendMs * 1e6);
     }
-    return S_OK;
+    if (tileShare >= 0)
+        st.hudTileShare = Ema(st.hudTileShare, tileShare);
 }
 
 // Display card gone: the game keeps its back buffers, a swapchain on the render card's queue presents copies of them
@@ -1388,7 +1672,7 @@ HRESULT ProxySwapChain::PresentFallback(UINT sync, UINT flags)
     }
     {
         std::lock_guard g(_m);
-        _consumed = ++_scheduled;
+        _consumed = _queued = ++_scheduled;
     }
     _presentCount++;
     if (_waitable)
@@ -1418,6 +1702,8 @@ ProxySwapChain::~ProxySwapChain()
     ReleaseRetired();
     delete _ui;
     _ui = nullptr;
+    delete _diff;
+    _diff = nullptr;
     _real.Reset();
     if (_waitable)
         CloseHandle(_waitable);

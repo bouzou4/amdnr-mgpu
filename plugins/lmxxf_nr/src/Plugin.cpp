@@ -143,10 +143,88 @@ void FramePacing(const OptiPresentFrame* frame)
     windowStart = now;
 }
 
+// PerfLog=true: game present intervals per 300 frames; perf.txt in the dump folder switches the multi-GPU knobs
+void PerfPoll()
+{
+    static FILETIME last {};
+    const std::wstring f = g_paths.opti + L"\\lmxxf_nr_dumps\\perf.txt";
+    WIN32_FILE_ATTRIBUTE_DATA a {};
+    if (!GetFileAttributesExW(f.c_str(), GetFileExInfoStandard, &a) || CompareFileTime(&a.ftLastWriteTime, &last) == 0)
+        return;
+    last = a.ftLastWriteTime;
+    FILE* fp = _wfopen(f.c_str(), L"r");
+    if (!fp)
+        return;
+    char line[512] = {};
+    fgets(line, sizeof(line), fp);
+    fclose(fp);
+    char tag[64] = "-";
+    for (char* t = strtok(line, " \r\n"); t; t = strtok(nullptr, " \r\n"))
+    {
+        int v = 0;
+        if (sscanf(t, "skip=%d", &v) == 1)
+            Mgpu::Perf().skip = (unsigned) v;
+        else if (sscanf(t, "dummy=%d", &v) == 1)
+            Mgpu::Perf().dummyMB = (unsigned) std::clamp(v, 0, 512);
+        else if (sscanf(t, "dst=%d", &v) == 1)
+            Mgpu::Perf().dummyDst = v;
+        else if (sscanf(t, "lead=%d", &v) == 1)
+            Mgpu::Perf().lead = (unsigned) std::clamp(v, 0, 3);
+        else if (sscanf(t, "ongame=%d", &v) == 1)
+            Mgpu::Perf().onGame = v != 0;
+        else if (sscanf(t, "nr=%d", &v) == 1)
+        {
+            NrSettings n = Engine().Settings();
+            n.enabled = v != 0;
+            ConfigureAll(n);
+        }
+        else
+            sscanf(t, "tag=%63s", tag);
+    }
+    Log(OptiLog_Info, "perf config %s: skip %u dummy %u MB dst %d on game %d lead %u nr %d", tag, Mgpu::Perf().skip.load(),
+        Mgpu::Perf().dummyMB.load(), Mgpu::Perf().dummyDst.load(), (int) Mgpu::Perf().onGame.load(), Mgpu::Perf().lead.load(),
+        (int) Engine().Settings().enabled);
+}
+
+void PerfTick(const OptiPresentFrame* f)
+{
+    static const bool on = g_api->GetBool(g_plugin, "PerfLog", false);
+    if (!on || f->phase != OptiPresent_AfterOverlay)
+        return;
+    static LARGE_INTEGER freq {}, prev {};
+    static std::vector<float> ms;
+    static uint64_t n = 0;
+    if (++n % 30 == 0)
+    {
+        const auto before = Mgpu::Perf().skip.load() ^ Mgpu::Perf().dummyMB.load() << 8 ^ Mgpu::Perf().onGame.load() << 20;
+        PerfPoll();
+        if (before != (Mgpu::Perf().skip.load() ^ Mgpu::Perf().dummyMB.load() << 8 ^ Mgpu::Perf().onGame.load() << 20))
+            ms.clear();
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    if (prev.QuadPart)
+        ms.push_back(float(double(now.QuadPart - prev.QuadPart) * 1000.0 / double(freq.QuadPart)));
+    prev = now;
+    if (ms.size() < 300)
+        return;
+    double sum = 0;
+    for (float v : ms)
+        sum += v;
+    std::sort(ms.begin(), ms.end());
+    const double mean = sum / ms.size();
+    Log(OptiLog_Info, "perf: %zu frames mean %.3f ms (%.2f fps) p50 %.3f p99 %.3f max %.3f", ms.size(), mean,
+        1000.0 / mean, ms[ms.size() / 2], ms[ms.size() * 99 / 100], ms.back());
+    ms.clear();
+}
+
 void Present(OptiPresentFrame* frame, void*)
 {
     if (frame->phase == OptiPresent_AfterOverlay)
         FramePacing(frame);
+    PerfTick(frame);
     if (MgpuActive())
         return MgpuOnPresent(frame);
     EnsureRuntime();
