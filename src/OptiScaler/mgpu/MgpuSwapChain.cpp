@@ -140,6 +140,17 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
         std::lock_guard g(StatsMutex());
         MutableStats().presenter = true;
     }
+    {
+        // Independent flip needs a window covering its monitor and per-monitor DPI awareness.
+        RECT wr {};
+        GetWindowRect(hwnd, &wr);
+        MONITORINFO mi { sizeof(mi) };
+        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        const auto aw = GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd));
+        Log(0, std::format("window {}x{} at {},{}; monitor {}x{}; DPI awareness {} (2 = per monitor)", wr.right - wr.left,
+                           wr.bottom - wr.top, wr.left, wr.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                           mi.rcMonitor.bottom - mi.rcMonitor.top, (int) aw));
+    }
     Log(0, std::format("proxy swapchain {}x{} fmt {} game buffers {} real buffers {} tearing {} waitable {}",
                        _gameDesc.Width, _gameDesc.Height, (int) _gameDesc.Format, _gameCount, _realCount, _tearing,
                        _waitable != nullptr));
