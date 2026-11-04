@@ -1054,6 +1054,14 @@ class Config
 
     // --- end DLSS 5 Neural Rendering -------------------------------------------------------------
 
+    // [mgpu] Multi-GPU (mgpu/): game renders on one card, the other presents (and runs NR).
+    CustomOptional<bool> MgpuEnabled { false };
+    CustomOptional<int32_t> MgpuRenderAdapterBus { -1 };  // PCI bus; -1 = the card with no outputs
+    CustomOptional<int32_t> MgpuDisplayAdapterBus { -1 }; // PCI bus; -1 = the card with outputs
+    CustomOptional<std::string> MgpuMode { std::string("whole-frame") }; // whole-frame | hudless
+    CustomOptional<bool> MgpuPresenter { true };          // false: Windows cross-adapter present (M3 test)
+    CustomOptional<std::string> MgpuFallback { std::string("inline") }; // inline | off
+
     // DLSS
     CustomOptional<bool> DLSSEnabled { true };
     CustomOptional<bool> RenderPresetOverride { false };

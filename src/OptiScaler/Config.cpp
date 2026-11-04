@@ -540,6 +540,13 @@ bool Config::Reload(std::filesystem::path iniPath)
             AmdGraphicsWaitExperimental.set_from_config(readBool("DlssNr", "AmdGraphicsWaitExperimental"));
             AmdEveryFrame.set_from_config(readBool("DlssNr", "AmdEveryFrame"));
             AmdFinalImage.set_from_config(readBool("DlssNr", "AmdFinalImage"));
+            // [mgpu]
+            MgpuEnabled.set_from_config(readBool("Mgpu", "Enabled"));
+            MgpuRenderAdapterBus.set_from_config(readInt("Mgpu", "RenderAdapterBus"));
+            MgpuDisplayAdapterBus.set_from_config(readInt("Mgpu", "DisplayAdapterBus"));
+            MgpuMode.set_from_config(readString("Mgpu", "Mode", true));
+            MgpuPresenter.set_from_config(readBool("Mgpu", "Presenter"));
+            MgpuFallback.set_from_config(readString("Mgpu", "Fallback", true));
             AmdSpinDraw.set_from_config(readInt("DlssNr", "AmdSpinDraw"));
             AmdVkLateCopyWait.set_from_config(readBool("DlssNr", "AmdVkLateCopyWait"));
             // Competitor-audit fixes (0.3.3.2 rebuild): kill switches, never saved
@@ -1726,6 +1733,13 @@ bool Config::SaveIni()
     ini.SetValue("DlssNr", "AmdGraphicsWaitExperimental", GetBoolValue(Instance()->AmdGraphicsWaitExperimental.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdEveryFrame", GetBoolValue(Instance()->AmdEveryFrame.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdFinalImage", GetBoolValue(Instance()->AmdFinalImage.value_for_config()).c_str());
+    // [mgpu]
+    ini.SetValue("Mgpu", "Enabled", GetBoolValue(Instance()->MgpuEnabled.value_for_config()).c_str());
+    ini.SetValue("Mgpu", "RenderAdapterBus", GetIntValue(Instance()->MgpuRenderAdapterBus.value_for_config()).c_str());
+    ini.SetValue("Mgpu", "DisplayAdapterBus", GetIntValue(Instance()->MgpuDisplayAdapterBus.value_for_config()).c_str());
+    ini.SetValue("Mgpu", "Mode", Instance()->MgpuMode.value_for_config_or("auto").c_str());
+    ini.SetValue("Mgpu", "Presenter", GetBoolValue(Instance()->MgpuPresenter.value_for_config()).c_str());
+    ini.SetValue("Mgpu", "Fallback", Instance()->MgpuFallback.value_for_config_or("auto").c_str());
     ini.SetValue("DlssNr", "AmdSpinDraw", GetIntValue(Instance()->AmdSpinDraw.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdVkLateCopyWait", GetBoolValue(Instance()->AmdVkLateCopyWait.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdNeuralListRecovery", GetBoolValue(Instance()->AmdNeuralListRecovery.value_for_config()).c_str());

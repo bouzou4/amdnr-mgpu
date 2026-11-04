@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -312,12 +312,19 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="dlssnr\amd\AmdPreSr.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="mgpu\MgpuCore.cpp" />
+    <ClCompile Include="mgpu\MgpuSwapChain.cpp" />
+    <ClCompile Include="mgpu\MgpuGpuLoad.cpp" />
+    <ClCompile Include="mgpu\MgpuHost.cpp" />
     <ClCompile Include="dlssnr\amd\AmdBridge.cpp" />
     <ClCompile Include="dlssnr\lmxxf\LmxxfBackend.cpp" />
     <ClInclude Include="dlssnr\amd\AmdPreSr.h" />
     <ClInclude Include="dlssnr\amd\SubmissionState.h" />
     <ClInclude Include="dlssnr\amd\RuntimeNotification.h" />
     <ClInclude Include="dlssnr\amd\RuntimeHostLoad.h" />
+    <ClInclude Include="mgpu\MgpuCore.h" />
+    <ClInclude Include="mgpu\MgpuSwapChain.h" />
+    <ClInclude Include="mgpu\MgpuHost.h" />
     <ClInclude Include="dlssnr\amd\AmdBridge.h" />
     <ClInclude Include="dlssnr\lmxxf\LmxxfBackend.h" />
   </ItemGroup>

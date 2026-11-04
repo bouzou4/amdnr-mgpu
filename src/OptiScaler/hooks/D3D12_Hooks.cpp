@@ -1,6 +1,7 @@
 // Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "D3D12_Hooks.h"
+#include <mgpu/MgpuHost.h> // [mgpu]
 #include <dlssnr/DlssNr_ExposureScan.h>
 
 #include <Util.h>
@@ -1341,6 +1342,12 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
     LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel,
               Util::WhoIsTheCaller(_ReturnAddress()));
 
+    // [mgpu] hook point: Mgpu's own devices pass through; the game's device goes to the render card.
+    if (MgpuHost::InternalDeviceCreate())
+        return o_D3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+    if (MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
+        pAdapter = MgpuHost::AdapterForDevice(pAdapter);
+
 #ifdef ENABLE_DEBUG_LAYER_DX12
     LOG_WARN("Debug layers active!");
     if (debugController == nullptr && D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)) == S_OK)
@@ -1370,7 +1377,7 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
             LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));
 
             auto primaryGpu = IdentifyGpu::getPrimaryGpu();
-            if (!IsEqualLUID(desc.AdapterLuid, primaryGpu.luid))
+            if (!IsEqualLUID(desc.AdapterLuid, primaryGpu.luid) && !MgpuHost::IsRenderAdapter(desc.AdapterLuid)) // [mgpu]
             {
                 LOG_WARN("D3D12Device created with non-primary GPU");
                 nonPrimaryGpu = true;
@@ -1529,7 +1536,7 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
             LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));
 
             auto primaryGpu = IdentifyGpu::getPrimaryGpu();
-            if (!IsEqualLUID(desc.AdapterLuid, primaryGpu.luid))
+            if (!IsEqualLUID(desc.AdapterLuid, primaryGpu.luid) && !MgpuHost::IsRenderAdapter(desc.AdapterLuid)) // [mgpu]
                 LOG_WARN("D3D12Device created with non-primary GPU");
         }
     }

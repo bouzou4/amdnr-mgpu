@@ -24,6 +24,8 @@
 
 // #define DETAILED_SC_LOGS
 
+#include <mgpu/MgpuHost.h> // [mgpu]
+
 #ifdef DETAILED_SC_LOGS
 #include <magic_enum.hpp>
 #endif
@@ -828,8 +830,8 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
                                       D3D12_COMMAND_LIST_TYPE_DIRECT);
         }
 
-        // Create FG SwapChain
-        if (!_skipFGSwapChainCreation)
+        // Create FG SwapChain ([mgpu] not when the display card presents)
+        if (!_skipFGSwapChainCreation && !MgpuHost::OwnsSwapchains())
         {
             ScopedSkipFGSCCreation skipFGSCCreation {};
             FGSCResult = FGHooks::CreateSwapChainForHwnd(realFactory, real, hWnd, &localDesc,
@@ -986,6 +988,11 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
 
         {
             ScopedSkipParentWrapping skipParentWrapping {};
+            // [mgpu] hook point: a proxy whose real swapchain lives on the display card
+            result = MgpuHost::CreateSwapChainForHwnd((void*) o_CreateSwapChainForHwnd, realFactory, cq != nullptr ? real : nullptr, hWnd,
+                                                      &localDesc, pFullscreenDesc != nullptr ? &localFullscreenDesc : nullptr,
+                                                      pRestrictToOutput, ppSwapChain);
+            if (result == E_NOTIMPL || FAILED(result))
             result = o_CreateSwapChainForHwnd(realFactory, pDevice, hWnd, &localDesc,
                                               pFullscreenDesc != nullptr ? &localFullscreenDesc : nullptr,
                                               pRestrictToOutput, ppSwapChain);

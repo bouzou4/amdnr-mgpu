@@ -8,6 +8,7 @@
 #include "BridgeRules.h" // (0.3.4) the settle rule (P10) and the self-TerminateProcess stamp rule (P22), pure
 #include "PresentExperimental.h"
 #include "DynamicNr.h"
+#include <mgpu/MgpuHost.h> // [mgpu]
 #include "GpuSupportRules.h" // (0.3.4) the GPU table and the APU defaults (pure, tests\034)
 #include <dlssnr/lmxxf/LmxxfBackend.h>
 #include <dlssnr/lmxxf/LmxxfTierPolicy.h> // (0.3.4) LmxxfTierSnapDefault (pure)
@@ -831,6 +832,8 @@ bool RuntimeChoiceNeeded()
 // stands down rather than pretending.
 static bool RuntimeGate()
 {
+    if (MgpuHost::BlockRenderCardNr()) // [mgpu] hook point: NR runs on the display card
+        return false;
     if (ChosenRuntime() != NeuralRuntime::Lmxxf || LmxxfReady())
         return true;
     static bool said = false;

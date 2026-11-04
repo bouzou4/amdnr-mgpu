@@ -253,6 +253,7 @@ class MenuCommon
         Image,
         Interface,
         Advanced,
+        MultiGpu, // [mgpu]
     };
     // Selects a tab of the main window on the next frame, e.g. an "Open Upscaling" button on the Neural tab
     // (AMDNR 0.3.4, T11g). Menu thread only.

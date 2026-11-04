@@ -1,4 +1,4 @@
-﻿// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include <dlssnr/amd/AmdBridge.h>
 #include <dlssnr/amd/RuntimeCaps.h> // ToggleNoticeRuntime: the Neural tab's runtime rule
@@ -48,6 +48,7 @@
 #include <misc/IdentifyGpu.h>
 #include <misc/REFrameworkCheck.h>
 #include <misc/AmdnrReport.h> // Save report (AMDNR 0.3.4, RenderSaveReportRow)
+#include <mgpu/MgpuHost.h> // [mgpu]
 #include <dlssnr/menu/NeuralUi.h> // AMDNR 0.3.4 menu look: the mock's widgets (Button, SectionHeader, ...)
 #include <hooks/Xell_Hooks.h>
 #include <low_latency/input/input_common.h>
@@ -3163,6 +3164,7 @@ void MenuCommon::RenderPerformanceOverlay(RenderMenuContext& ctx)
                 }
 
                 ImGui::TextUnformatted(secondLine.c_str());
+                MgpuHost::DrawOverlayLines(config->FpsOverlayHorizontal.value_or_default()); // [mgpu]
             }
 
             if (config->FpsOverlayType.value_or_default() >= FpsOverlay_DetailedGraph)
@@ -8323,6 +8325,15 @@ void MenuCommon::RenderMainMenuTable(RenderMenuContext& ctx)
         DlssNr::RenderMenu(ctx.config, ctx.menuResScale);
         if (neuralItemWidth)
             ImGui::PopItemWidth();
+        ImGui::EndTabItem();
+    }
+
+    // --- Multi-GPU [mgpu] ---------------------------------------------------------
+    if (Config::Instance()->MgpuEnabled.value_or_default() && beginTab("Multi-GPU", MenuTab::MultiGpu))
+    {
+        ImGui::PushItemWidth(itemWidth);
+        MgpuHost::DrawMenuTab(ctx.menuResScale);
+        ImGui::PopItemWidth();
         ImGui::EndTabItem();
     }
 
