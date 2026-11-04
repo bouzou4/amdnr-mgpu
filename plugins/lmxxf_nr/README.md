@@ -46,6 +46,8 @@ Presets (the first row of the menu) set only Model, Network size, Passes and his
 
 With multi-GPU the display card runs the network beside the game (1080 tier about 8 ms there), so the cost stays hidden while that card has headroom; Ultra at 4K (about 25 ms there, estimated) likely does not fit a 60 fps frame. Passes 2 / 3 are a stronger style, not a higher quality step, so no preset uses them.
 
+Multi-GPU, Satisfactory menu at 4K, NR every frame, preset switched live (`lmxxf_nr_settings.trigger`), means of 10 s windows: Quality 41.0 fps (24.4 ms, display card 57 % busy, network 13.6 ms); Ultra 21.9 fps (45.8 ms, display card 73 % busy, network 33.3 ms: the presenter waits for the answer each frame, so the network time is in the frame).
+
 Motion vectors for the history are the game's, from the upscale callbacks, at the size the game gives them (render or output size; the runtime samples them over the feed's UV range, nearest texel): before and after upscaling straight from the evaluate, terminal from a copy taken in the evaluate of the same frame and used at its present, multi-GPU over the ring. History is reset on the game's reset flag, after a frame that was not fed, and when the vector extent or the network size changes.
 
 ## How it runs
@@ -105,6 +107,8 @@ History on game frames (`tools/seq_metrics.py`, 7 sequences of 12 frames per run
 | Terminal, history on | -0.00055 | -0.00061 | 41.3 | 0.0223 |
 | Multi-GPU, history off | +0.00065 | +0.00099 | 38.3 | 0.0263 |
 | Multi-GPU, history on (6 sequences, a cut excluded) | -0.00056 | -0.00056 | 40.5 | 0.0224 |
+
+Full 1080 tier, multi-GPU, same menu, 12-frame dumps (`seq_metrics.py`, flk_static / flk_mc; the live meter in brackets): 1 pass with history -0.00062 / -0.00012 (-0.0006 / -0.0002 to -0.0014), 2 passes without history +0.00277 / +0.00293 (+0.0027 / +0.0019 to +0.0021), 2 passes with history (lmxxf-nr `temporal` 3ee91db6) +0.00052 / +0.00100 (+0.0006 / +0.0015 to +0.0024), edit_dis 0.036 / 0.077 / 0.057; network 12.2 ms (1 pass, history) and 16.5 ms (2 passes, history). CONTROL gameplay, Full 1080 2 passes without history (the play session): +0.0018 / +0.0055 once the pair spanning a network rebuild (+0.035) is left out.
 
 Without history the output changes more than its input from frame to frame (positive flicker); with history it changes less, on still and on motion-compensated pixels, and the edit on disoccluded pixels does not grow (no ghosting signal). Panning sequences (1-5 px/frame, 6-20 % of pixels moving): flk_mc +0.00095 / psnr_mc 35.8 off against -0.00026..-0.00060 / 37.5-44.1 on. The vectors' sign checks out on every sequence (warping with +mv beats -mv and no motion).
 
