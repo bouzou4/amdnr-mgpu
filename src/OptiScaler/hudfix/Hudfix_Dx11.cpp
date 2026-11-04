@@ -542,6 +542,8 @@ bool Hudfix_Dx11::PublishCaptureToFg(ID3D11DeviceContext* context, Dx11ResourceI
     {
         if (_sharedCapture[index].Dx12Resource == nullptr)
             return false;
+        if (_pluginHudless == nullptr)
+            LOG_INFO("Plugin HUD-less (DX11): first capture, frame {}", activeUpscaleFrame);
         _pluginHudless = _sharedCapture[index].Dx12Resource;
         _pluginHudlessFrame = activeUpscaleFrame;
         return true;

@@ -175,11 +175,17 @@ Dx11wDx12SC::Dx11wDx12SC(IDXGISwapChain* real, IDXGISwapChain4* fgSC, ID3D11Devi
         }
     }
 
-    if (_dx11Device != nullptr && State::Instance().activeFgInput == FGInput::Upscaler &&
+    // A plugin's HUD-less request needs the tracking without FG input too
+    const bool pluginHudless = PluginApi::WantsHudless();
+    if (_dx11Device != nullptr && (State::Instance().activeFgInput == FGInput::Upscaler || pluginHudless) &&
         !Config::Instance()->FGDisableHUDFix.value_or_default())
     {
         ResTrack_Dx11::HookDevice(_dx11Device);
     }
+    LOG_INFO("DX11 resource tracking: {}, FG input {}, plugin HUD-less {}",
+             _dx11Device != nullptr && (State::Instance().activeFgInput == FGInput::Upscaler || pluginHudless) &&
+                 !Config::Instance()->FGDisableHUDFix.value_or_default(),
+             (int) State::Instance().activeFgInput, pluginHudless);
 
     if (WithDx12::PrepareD3D12ForD3D11(_dx11Device, D3D_FEATURE_LEVEL_11_0))
     {
