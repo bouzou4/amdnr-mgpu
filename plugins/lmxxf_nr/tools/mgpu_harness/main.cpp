@@ -1,10 +1,13 @@
 // Multi-GPU harness: a minimal D3D12 "game" (borderless window on the primary monitor, moving bars, tearing
 // present). Put OptiScaler (with the plugin) beside it as dxgi.dll to exercise the device redirect and the proxy
 // swapchain without a game. Every swapchain call's result is printed; no input is read.
-//   mgpu_harness.exe [seconds] [--format sdr|pq|fp16] [--fse <at>] [--resize <at>] [--nullAdapter]
+//   mgpu_harness.exe [seconds] [--format sdr|pq|fp16] [--fse <at>] [--resize <at>] [--minimize <at>] [--cycles <n>]
+//                    [--minpause] [--nullAdapter]
 //   --format  pq: R10G10B10A2 + ST 2084, fp16: R16G16B16A16 float + scRGB (bars up to 4.0 = 320 nits)
-//   --fse     exclusive fullscreen from <at> s for 4 s (SetFullscreenState + ResizeBuffers both ways)
+//   --fse     exclusive fullscreen from <at> s for 4 s (SetFullscreenState + ResizeBuffers both ways), --fsehold: stays
 //   --resize  ResizeBuffers to half size at <at> s, back to full 4 s later (the window follows)
+//   --minimize  from <at> s: minimise (no activation) for 4 s, restore, ResizeBuffers at the same size after each
+//               step (as CONTROL does); --cycles repeats it every 10 s, --minpause stops presenting while minimised
 #include <windows.h>
 #include <d3dkmthk.h>
 #include <dxgi1_6.h>
@@ -49,8 +52,9 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l)
 
 int main(int argc, char** argv)
 {
-    double seconds = 10.0, fseAt = -1, resizeAt = -1;
-    bool nullAdapter = false;
+    double seconds = 10.0, fseAt = -1, resizeAt = -1, minAt = -1;
+    int cycles = 1;
+    bool nullAdapter = false, minPause = false, fseHold = false;
     const char* format = "sdr";
     for (int i = 1; i < argc; ++i)
     {
@@ -62,6 +66,14 @@ int main(int argc, char** argv)
             fseAt = atof(argv[++i]);
         else if (!strcmp(argv[i], "--resize") && i + 1 < argc)
             resizeAt = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--minimize") && i + 1 < argc)
+            minAt = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cycles") && i + 1 < argc)
+            cycles = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fsehold"))
+            fseHold = true;
+        else if (!strcmp(argv[i], "--minpause"))
+            minPause = true;
         else
             seconds = atof(argv[i]);
     }
@@ -216,7 +228,8 @@ int main(int argc, char** argv)
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&t0);
     UINT64 frames = 0, failed = 0;
-    int fseStep = 0, resizeStep = 0;
+    int fseStep = 0, resizeStep = 0, minStep = 0;
+    bool minimized = false;
     BOOL fs = FALSE;
     const float k = fp16 ? 4.0f : 1.0f; // scRGB: 1.0 = 80 nits
     for (;;)
@@ -237,7 +250,7 @@ int main(int argc, char** argv)
             printf("SetFullscreenState TRUE %08lx, now %d\n", hr, fs);
             resize(fullW, fullH, "after entering fullscreen");
         }
-        if (fseStep == 1 && el > fseAt + 4)
+        if (fseStep == 1 && !fseHold && el > fseAt + 4)
         {
             fseStep = 2;
             idle();
@@ -257,6 +270,22 @@ int main(int argc, char** argv)
             resizeStep = 2;
             SetWindowPos(hwnd, nullptr, 0, 0, fullW, fullH, SWP_NOZORDER | SWP_NOACTIVATE);
             resize(fullW, fullH, "full");
+        }
+        if (minAt >= 0 && minStep < 2 * cycles && el > minAt + (minStep / 2) * 10.0 + (minStep % 2) * 4.0)
+        {
+            minimized = (minStep % 2) == 0;
+            ShowWindow(hwnd, minimized ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE);
+            RECT rc {};
+            GetClientRect(hwnd, &rc);
+            printf("cycle %d: %s at %.2f s, client %ldx%ld, frame %llu\n", minStep / 2 + 1,
+                   minimized ? "minimised" : "restored", el, rc.right - rc.left, rc.bottom - rc.top, frames);
+            ++minStep;
+            resize(fullW, fullH, minimized ? "after minimise" : "after restore");
+        }
+        if (minimized && minPause)
+        {
+            Sleep(16);
+            continue;
         }
         UINT i = sc->GetCurrentBackBufferIndex();
         if (fence->GetCompletedValue() < fv[i])

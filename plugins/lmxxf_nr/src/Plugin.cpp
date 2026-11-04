@@ -58,6 +58,7 @@ NrSettings ReadSettings()
     s.temporal = g_api->GetBool(g_plugin, "Temporal", true);
     s.paperWhite = std::clamp(g_api->GetFloat(g_plugin, "HdrPaperWhite", 200.0f), 80.0f, 1000.0f);
     s.wholeFrameFallback = g_api->GetBool(g_plugin, "WholeFrameFallback", true);
+    s.meter = g_api->GetBool(g_plugin, "FlickerMeter", true);
     return s;
 }
 
@@ -220,11 +221,59 @@ void PerfTick(const OptiPresentFrame* f)
     ms.clear();
 }
 
+// Test rigs: <dumpDir>\\lmxxf_nr_settings.trigger, Key=Value lines (Preset, Model, NetworkSize, MultiPass, Temporal,
+// Style, FlickerMeter), applied live like the menu
+std::wstring g_dumpDir;
+void SettingsTrigger()
+{
+    static uint32_t n = 0;
+    if (g_dumpDir.empty() || n++ % 30 != 0)
+        return;
+    const std::wstring path = g_dumpDir + L"\\lmxxf_nr_settings.trigger";
+    FILE* f = _wfopen(path.c_str(), L"r");
+    if (f == nullptr)
+        return;
+    char line[128];
+    std::string applied;
+    while (fgets(line, sizeof(line), f))
+    {
+        char key[64] = {};
+        int v = 0;
+        if (sscanf(line, " %63[^=]=%d", key, &v) != 2)
+            continue;
+        const std::string k = key;
+        if (k == "Preset")
+            ApplyPreset(g_ui, PresetFromIni(v));
+        else if (k == "Model")
+            g_ui.model = std::clamp(v, 0, 1);
+        else if (k == "NetworkSize")
+            g_ui.size = (NetworkSize) std::clamp(v, 0, 2);
+        else if (k == "MultiPass")
+            g_ui.passes = std::clamp(v, 1, 3);
+        else if (k == "Temporal")
+            g_ui.temporal = v != 0;
+        else if (k == "Style")
+            g_ui.style = std::clamp(v, 0, 2);
+        else if (k == "FlickerMeter")
+            g_ui.meter = v != 0;
+        else
+            continue;
+        applied += (applied.empty() ? "" : ", ") + k + "=" + std::to_string(v);
+    }
+    fclose(f);
+    DeleteFileW(path.c_str());
+    ConfigureAll(g_ui);
+    Log(OptiLog_Info, "settings trigger: %s", applied.c_str());
+}
+
 void Present(OptiPresentFrame* frame, void*)
 {
     if (frame->phase == OptiPresent_AfterOverlay)
+    {
         FramePacing(frame);
-    PerfTick(frame);
+        PerfTick(frame);
+        SettingsTrigger();
+    }
     if (MgpuActive())
         return MgpuOnPresent(frame);
     EnsureRuntime();
@@ -256,7 +305,7 @@ void DrawTab(void*)
         presetOff[i] = why != nullptr;
         tip += std::string(r.name) + ": " + (r.model == 1 ? "Small" : "Full") + ", " + kSizes[(int) r.size] + ", " +
                std::to_string(r.passes) + (r.passes == 1 ? " pass" : " passes") +
-               (r.temporal && r.passes == 1 ? ", history on" : ", history off (more than one pass)") +
+               (r.temporal && r.passes <= 2 ? ", history on" : ", history off") +
                ".\n    One GPU: " + r.cost + (why ? std::string(".\n    Unavailable: ") + why : std::string()) + ".\n";
     }
     presetNames[kPresetCount] = "Custom";
@@ -326,8 +375,8 @@ void DrawTab(void*)
     g_api->ItemTooltip(!rt.Models() ? "This runtime has one model (no DLSS5_MULTI_PASS)"
                                     : "DLSS5_MULTI_PASS: the Full network runs N times per frame for a stronger style.\n"
                                       "Full model only: the runtime runs Small once (DLSS5_MULTI_PASS 0.5).\n"
-                                      "3 predicts its third pass unless DLSS5_MULTI_PASS_PREDICT=0 is set. 2 and 3 run\n"
-                                      "without network history (the runtime's history takes one pass).");
+                                      "3 predicts its third pass unless DLSS5_MULTI_PASS_PREDICT=0 is set. 2 keeps the network\n"
+                                      "history when the runtime takes it with 2 passes; 3 runs without it.");
     if (rt.Models() && g_ui.model != 0 && g_ui.passes > 1)
         g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "Passes apply to the Full model: pick Full to use them.");
 
@@ -397,6 +446,14 @@ void DrawTab(void*)
     if (!st.source.empty() && active.placement == Placement::Terminal)
         Text("Source: %s", st.source.c_str());
     Text("Network history: %s", st.temporal ? "on (motion vectors)" : rt.temporal == 0 ? "not taken by this runtime" : "off");
+    if (st.flkFrames > 0)
+    {
+        Text("Flicker: still %+.4f, moving %s (last %u frames)", st.flkStatic,
+             std::isnan(st.flkMc) ? "-" : std::format("{:+.4f}", st.flkMc).c_str(), st.flkFrames);
+        g_api->ItemTooltip("How much more the network's answer changes from frame to frame than its input does\n"
+                           "(tools/seq_metrics.py flk_static / flk_mc, display encoding). Above 0: NR adds flicker,\n"
+                           "below 0: it steadies the image. Moving needs this frame's answer (multi-GPU, NR every frame).");
+    }
     Text("Frames: %llu run, %llu skipped", (unsigned long long) st.framesRun, (unsigned long long) st.framesSkipped);
     if (!st.status.empty())
         g_api->TextDisabled(st.status.c_str());
@@ -424,8 +481,9 @@ bool OverlayText(char* buf, size_t size, void*)
     else if (st.bypassed)
         snprintf(buf, size, "bypassed (HDR range)");
     else if (st.networkMs > 0)
-        snprintf(buf, size, "%ux%u%s%s%s, %.1f ms (network %.1f)", st.feedWidth, st.feedHeight, model,
-                 st.temporal ? " T" : "", st.encoding >= 2 ? " HDR" : "", st.hipMs, st.networkMs);
+        snprintf(buf, size, "%ux%u%s%s%s, %.1f ms (network %.1f)%s", st.feedWidth, st.feedHeight, model,
+                 st.temporal ? " T" : "", st.encoding >= 2 ? " HDR" : "", st.hipMs, st.networkMs,
+                 st.flkFrames ? std::format(", flk {:+.4f}", std::isnan(st.flkMc) ? st.flkStatic : st.flkMc).c_str() : "");
     else
         snprintf(buf, size, "%ux%u%s%s%s, %.1f ms", st.feedWidth, st.feedHeight, model, st.temporal ? " T" : "",
                  st.encoding >= 2 ? " HDR" : "", st.hipMs);
@@ -498,6 +556,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
 
     const std::wstring dumpDir = g_paths.opti + L"\\lmxxf_nr_dumps";
     Engine().dumpDir = dumpDir;
+    g_dumpDir = dumpDir;
     const bool mgpu = MgpuInit(api, plugin, dumpDir);
 
     g_needsApi = OPTI_API_HAS(api, RegisterUpscaleCallbacks);

@@ -205,6 +205,8 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT _retireAfter = 0;
     bool _sizeHold = false; // window and swapchain sizes differ: no NR
     std::chrono::steady_clock::time_point _mismatchSince {};
+    HRESULT _lastPresentHr = S_OK;
+    std::atomic<bool> _occluded { false }; // minimised / occluded: the presenter drops frames
     std::atomic<int> _probeFrames { 0 }; // fenced removal checks after a (re)start
     std::atomic<UINT64> _dumpFrom { 0 }, _dumpTo { 0 }; // frame ids [from, to) to dump
 
