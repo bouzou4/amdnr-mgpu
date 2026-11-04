@@ -1,6 +1,6 @@
 # Multi-GPU Neural Rendering: design
 
-Status: design, nothing implemented yet. The branch is `mgpu/onboarding`.
+Status: design. The design branch is `mgpu/onboarding`; the build base (M2) is `mgpu/base`.
 
 This fork is a modified AMDNR. It is not the original AMDNR and is not endorsed by its author. The credit for AMDNR goes to 3zwr1 (https://github.com/3zwr1/AMD-NR---OptiScaler), and AMDNR's notice is kept in `Licenses/AMDNR_NOTICE.txt`.
 
@@ -138,7 +138,8 @@ Source references are relative to `main/AMDNR-source/`, the 0.3.4.2 source snaps
   - The tree compiles except for about 16 translation units.
   - The causes are the missing AMDNR-only headers, D3D12 declarations newer than Windows SDK 10.0.22621 (`D3D12_STATIC_SAMPLER_DESC1`, root signature 1.2), and the project's `v145` toolset.
   - With the VS 2022 compiler (`v143`), raw string literals over 16 KB also need rewriting.
-- **Consequence:** this fork cannot produce a working `OptiScaler.dll` yet. Milestone M2 below decides the base.
+- **Consequence:** the snapshot alone cannot produce a working `OptiScaler.dll`. Milestone M2 below decides the base.
+- **M2 (option b), branch `mgpu/base`:** upstream OptiScaler `c983a500` under `src/` as a git subtree, AMDNR's published sources ported on top, the gaps stubbed. It builds with VS 2022 (v143) and SDK 22621. What is recovered and what is stubbed: `docs/AMDNR_GAPS.md`.
 
 ## 3. Baseline (single card, inline)
 
