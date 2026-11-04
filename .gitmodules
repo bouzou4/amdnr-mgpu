@@ -1,0 +1,27 @@
+[submodule "src/external/simpleini"]
+	path = src/external/simpleini
+	url = https://github.com/brofield/simpleini
+[submodule "src/external/unordered_dense"]
+	path = src/external/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git
+[submodule "src/external/xess"]
+	path = src/external/xess
+	url = https://github.com/intel/xess.git
+[submodule "src/external/vulkan"]
+	path = src/external/vulkan
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "src/external/spdlog"]
+	path = src/external/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "src/external/FidelityFX-SDK"]
+	path = src/external/FidelityFX-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+[submodule "src/external/magic_enum"]
+	path = src/external/magic_enum
+	url = https://github.com/Neargye/magic_enum
+[submodule "src/external/FidelityFX-SDK-v2"]
+	path = src/external/FidelityFX-SDK-v2
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+[submodule "src/external/nvapi"]
+	path = src/external/nvapi
+	url = https://github.com/NVIDIA/nvapi.git
