@@ -75,7 +75,7 @@ void Text(const char* fmt, ...)
     g_api->Text(buf);
 }
 
-std::wstring g_extraDir, g_exeDir, g_optiDir;
+RuntimePaths g_paths;
 
 // Not from OptiPluginInit: that runs inside OptiScaler's DllMain
 void EnsureRuntime()
@@ -84,7 +84,7 @@ void EnsureRuntime()
     if (!tried)
     {
         tried = true;
-        Engine().LoadRuntime(g_extraDir, g_exeDir, g_optiDir);
+        Engine().LoadRuntime(g_paths);
     }
 }
 
@@ -102,6 +102,8 @@ void UpscaleAfter(OptiUpscaleFrame* frame, void*)
         return MgpuOnUpscale(frame);
     EnsureRuntime();
     Engine().OnUpscale(frame, true);
+    if (Engine().Settings().placement == Placement::Terminal)
+        Engine().CaptureMotion(frame);
 }
 
 void Present(OptiPresentFrame* frame, void*)
@@ -116,8 +118,9 @@ bool MgpuText(char* buf, size_t size, void*) { return MgpuOverlayText(buf, size)
 
 void DrawTab(void*)
 {
-    auto& rt = Engine().GetRuntime();
-    const NrStats st = (MgpuActive() ? DisplayEngine() : Engine()).Stats();
+    NrEngine& nr = MgpuActive() ? DisplayEngine() : Engine();
+    auto& rt = nr.GetRuntime();
+    const NrStats st = nr.Stats();
     const NrSettings active = Engine().Settings();
 
     g_api->Section("Neural Rendering");
@@ -135,25 +138,25 @@ void DrawTab(void*)
         g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "Terminal takes effect after a restart (Save first).");
 
     int32_t size = (int32_t) g_ui.size;
-    const bool sizeOff[] = { false, !rt.envFreeRes, !rt.envFreeRes };
+    const bool sizeOff[] = { false, !rt.FreeRes(), !rt.FreeRes() };
     if (g_api->Combo("Network size", &size, kSizes, 3, sizeOff))
         g_ui.size = (NetworkSize) size, changed = true;
-    g_api->ItemTooltip(rt.envFreeRes ? "1080 tier: the picture is fitted into 1920x1080.\n1440 and Native: "
-                                       "DLSS5_NETWORK_FREE_RES, cost 1.7x / up to 3.6x the 1080 tier."
-                                     : "This runtime has fixed tiers only (no DLSS5_NETWORK_FREE_RES).");
+    g_api->ItemTooltip(rt.FreeRes() ? "1080 tier: the picture is fitted into 1920x1080.\n1440 and Native: "
+                                      "DLSS5_NETWORK_FREE_RES, cost 1.7x / up to 3.6x the 1080 tier."
+                                    : "This runtime has fixed tiers only (no DLSS5_NETWORK_FREE_RES).");
 
-    g_api->Disabled(!rt.envMultiPass);
+    g_api->Disabled(!rt.Models());
     if (g_api->Combo("Model", &g_ui.model, kModels, 2, nullptr))
         changed = true;
     g_api->Disabled(false);
-    g_api->ItemTooltip(rt.envMultiPass ? "DLSS5_MULTI_PASS 1 (Full) or 0.5 (Small)"
-                                       : "This runtime does not read DLSS5_MULTI_PASS");
+    g_api->ItemTooltip(rt.Models() ? "Full: the 71-block model, Small: 31 blocks (DLSS5_MULTI_PASS 1 / 0.5)"
+                                   : "This runtime has one model (no DLSS5_MULTI_PASS)");
 
-    g_api->Disabled(!rt.envStyle);
+    g_api->Disabled(!rt.Styles());
     if (g_api->Combo("Style", &g_ui.style, kStyles, 3, nullptr))
         changed = true;
     g_api->Disabled(false);
-    g_api->ItemTooltip(rt.envStyle ? "DLSS5_STYLE, 0 matches NVIDIA's output" : "This runtime does not read DLSS5_STYLE");
+    g_api->ItemTooltip(rt.Styles() ? "DLSS5_STYLE, 0 matches NVIDIA's output" : "This runtime does not read DLSS5_STYLE");
 
     if (g_api->SliderFloat("Strength", &g_ui.strength, 0.0f, 2.0f, "%.2f"))
         changed = true;
@@ -183,8 +186,9 @@ void DrawTab(void*)
     else
     {
         Text("%ls", rt.dllPath.c_str());
-        Text("Layout: %s, %s function table, frame info %u bytes", rt.LayoutName(), rt.hasTimings ? "full" : "v1",
-             st.frameInfoSize);
+        Text("Layout: %s, %s function table, frame info %u bytes%s", rt.LayoutName(), rt.hasTimings ? "full" : "v1",
+             rt.temporalSize ? rt.temporalSize : st.frameInfoSize, rt.Native() ? ", lmxxf history ABI" : "");
+        Text("Assets: %ls", rt.assets.c_str());
     }
 
     g_api->Section("Multi-GPU");
@@ -212,11 +216,16 @@ bool OverlayText(char* buf, size_t size, void*)
     const NrSettings s = Engine().Settings();
     if (!s.enabled || !Engine().RuntimeLoaded())
         return false;
-    const NrStats st = (MgpuActive() ? DisplayEngine() : Engine()).Stats();
+    NrEngine& nr = MgpuActive() ? DisplayEngine() : Engine();
+    const NrStats st = nr.Stats();
+    const char* model = nr.GetRuntime().Models() ? (s.model == 1 ? " Small" : " Full") : "";
     if (st.state != "running")
         snprintf(buf, size, "%s", st.state.c_str());
+    else if (st.networkMs > 0)
+        snprintf(buf, size, "%ux%u%s%s, %.1f ms (network %.1f)", st.feedWidth, st.feedHeight, model,
+                 st.temporal ? " T" : "", st.hipMs, st.networkMs);
     else
-        snprintf(buf, size, "%ux%u %s, %.1f ms", st.feedWidth, st.feedHeight, s.model == 1 ? "Small" : "Full",
+        snprintf(buf, size, "%ux%u%s%s, %.1f ms", st.feedWidth, st.feedHeight, model, st.temporal ? " T" : "",
                  st.hipMs);
     return true;
 }
@@ -267,13 +276,19 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     HMODULE opti = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCWSTR) api, &opti);
-    char extra[MAX_PATH] = {};
-    api->GetString(plugin, "RuntimeDir", extra, sizeof(extra), "");
-    g_extraDir = std::filesystem::path(extra).wstring();
-    g_exeDir = ModuleDir(nullptr);
-    g_optiDir = ModuleDir(opti);
+    auto path = [&](const char* key)
+    {
+        char v[MAX_PATH] = {};
+        api->GetString(plugin, key, v, sizeof(v), "");
+        return std::filesystem::path(v).wstring();
+    };
+    g_paths.extra = path("RuntimeDir");
+    g_paths.modules = path("ModulesDir");
+    g_paths.weights = path("WeightsDir");
+    g_paths.exe = ModuleDir(nullptr);
+    g_paths.opti = ModuleDir(opti);
 
-    const std::wstring dumpDir = g_optiDir + L"\\lmxxf_nr_dumps";
+    const std::wstring dumpDir = g_paths.opti + L"\\lmxxf_nr_dumps";
     Engine().dumpDir = dumpDir;
     const bool mgpu = MgpuInit(api, plugin, dumpDir);
 
@@ -307,4 +322,4 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     return TRUE;
 }
 
-void MgpuLoadRuntime(NrEngine& e) { e.LoadRuntime(g_extraDir, g_exeDir, g_optiDir); }
+void MgpuLoadRuntime(NrEngine& e) { e.LoadRuntime(g_paths); }

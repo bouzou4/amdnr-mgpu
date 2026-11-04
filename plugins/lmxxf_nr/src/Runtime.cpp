@@ -63,12 +63,13 @@ bool BinaryHas(const std::vector<char>& image, const char* text)
 }
 } // namespace
 
-bool Runtime::Load(const std::wstring& extraDir, const std::wstring& exeDir, const std::wstring& optiDir)
+bool Runtime::Load(const RuntimePaths& paths)
 {
+    const std::wstring& exeDir = paths.exe;
     std::vector<fs::path> dirs;
-    if (!extraDir.empty())
-        dirs.emplace_back(extraDir);
-    for (const auto& d : { exeDir, optiDir })
+    if (!paths.extra.empty())
+        dirs.emplace_back(paths.extra);
+    for (const auto& d : { exeDir, paths.opti })
     {
         if (!d.empty())
         {
@@ -83,15 +84,27 @@ bool Runtime::Load(const std::wstring& extraDir, const std::wstring& exeDir, con
         if (!IsFile(dll))
             continue;
 
-        // Assets: lmxxf's package layout first, then a pak beside the dll
+        // Assets: ModulesDir, lmxxf's package layout, a module folder beside the dll, then a pak beside the dll
         std::wstring found;
         Layout foundLayout = Layout::None;
+        if (!paths.modules.empty() && IsFile(fs::path(paths.modules) / L"SHA256SUMS"))
+        {
+            found = paths.modules;
+            foundLayout = Layout::LmxxfBuild;
+        }
         for (const auto& root : { dir, dir.parent_path(), fs::path(exeDir) })
         {
-            if (FindPackageAssets(root, &found))
-            {
-                foundLayout = Layout::LmxxfPackage;
+            if (foundLayout != Layout::None)
                 break;
+            if (FindPackageAssets(root, &found))
+                foundLayout = Layout::LmxxfPackage;
+        }
+        for (const auto& sub : { dir / L"modules", dir / L"HIP" })
+        {
+            if (foundLayout == Layout::None && IsFile(sub / L"SHA256SUMS"))
+            {
+                found = sub.wstring();
+                foundLayout = Layout::LmxxfBuild;
             }
         }
         if (foundLayout == Layout::None && IsFile(dir / L"LmxxfNrRuntime.pak"))
@@ -101,9 +114,14 @@ bool Runtime::Load(const std::wstring& extraDir, const std::wstring& exeDir, con
         }
         if (foundLayout == Layout::None)
         {
-            error = "LmxxfNrRuntime.dll found but no assets (DLSS5-AMD\\native-game-tiled-assets or LmxxfNrRuntime.pak)";
+            error = "LmxxfNrRuntime.dll found but no assets (ModulesDir, DLSS5-AMD\\native-game-tiled-assets, modules\\ "
+                    "or LmxxfNrRuntime.pak)";
             continue;
         }
+
+        // Read by the runtime when the session finds no weights beside its modules
+        if (!paths.weights.empty() && foundLayout != Layout::RuntimePak)
+            SetEnvironmentVariableW(L"LMXXF_WEIGHTS_DIR", paths.weights.c_str());
 
         module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (module == nullptr)
@@ -202,6 +220,8 @@ const char* Runtime::LayoutName() const
     {
     case Layout::LmxxfPackage:
         return "lmxxf package";
+    case Layout::LmxxfBuild:
+        return "lmxxf build + modules";
     case Layout::RuntimePak:
         return "runtime + pak";
     default:

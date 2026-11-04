@@ -147,17 +147,17 @@ NrEngine& DisplayEngine()
     return engine;
 }
 
-bool NrEngine::LoadRuntime(const std::wstring& extraDir, const std::wstring& exeDir, const std::wstring& optiDir)
+bool NrEngine::LoadRuntime(const RuntimePaths& paths)
 {
     std::lock_guard lock(_mutex);
-    if (_rt.Load(extraDir, exeDir, optiDir))
+    if (_rt.Load(paths))
     {
         Log(OptiLog_Info,
-            "runtime %ls (%s, %zu exports, %s table %u bytes, max input %ux%u, hip_ready %u); env: free_res %d, style %d, "
-            "multi_pass %d",
-            _rt.dllPath.c_str(), _rt.LayoutName(), _rt.exports, _rt.hasTimings ? "full" : "v1", _rt.tableSize,
-            _rt.caps.max_input_width, _rt.caps.max_input_height, _rt.caps.hip_ready, _rt.envFreeRes, _rt.envStyle,
-            _rt.envMultiPass);
+            "runtime %ls (%s, assets %ls, %zu exports, %s table %u bytes, max input %ux%u, hip_ready %u, history %u, "
+            "native %d); env: free_res %d, style %d, multi_pass %d",
+            _rt.dllPath.c_str(), _rt.LayoutName(), _rt.assets.c_str(), _rt.exports, _rt.hasTimings ? "full" : "v1",
+            _rt.tableSize, _rt.caps.max_input_width, _rt.caps.max_input_height, _rt.caps.hip_ready,
+            _rt.caps.history_supported, _rt.Native(), _rt.envFreeRes, _rt.envStyle, _rt.envMultiPass);
         return true;
     }
     _stats.state = "no runtime";
@@ -170,7 +170,9 @@ void NrEngine::Configure(const NrSettings& s)
 {
     std::lock_guard lock(_mutex);
     _settings = s;
-    _dirty = s.size != _active.size || s.model != _active.model || s.style != _active.style;
+    // A history session drops adaptive ViT reuse: toggling history rebuilds it off the render thread
+    _dirty = s.size != _active.size || s.model != _active.model || s.style != _active.style ||
+             (_rt.Native() && s.temporal != _active.temporal);
 }
 
 NrSettings NrEngine::Settings()
@@ -417,7 +419,7 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
     fi.color_height = _feedH;
     fi.color = _feed.Get();
     fi.color_state = kRead;
-    fi.flags = 0;
+    fi.flags = _rt.Native() && _settings.model == 0 ? LMXXF_NR_FRAME_FLAG_FULL_NETWORK_EXT : 0;
     fi.transfer_strength = 1.0f;
     fi.color_strength = 1.0f;
     fi.model_scale = 1.0f;
@@ -439,6 +441,7 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
     _job.struct_size = sizeof(_job);
 
     // Motion-fed history: the temporal layout, sizes with and without the exposure tail
+    _stats.temporal = false;
     if (_settings.temporal && _rt.temporal != 0 && _motion.res != nullptr)
     {
         LmxxfNrFrameInfoTemporalExt t {};
@@ -458,7 +461,7 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
         t.exposure_scale = fi.exposure_scale;
         for (uint32_t size : { (uint32_t) sizeof(t), 120u })
         {
-            if (_rt.temporalSize != 0 && size != _rt.temporalSize)
+            if ((_rt.temporalSize != 0 && size != _rt.temporalSize) || (_rt.Native() && size != sizeof(t)))
                 continue;
             t.struct_size = size;
             const int32_t trc = _rt.api.PrepareFrame(_ctx, reinterpret_cast<const LmxxfNrFrameInfo*>(&t), &_job);
@@ -483,7 +486,6 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
         {
             Log(OptiLog_Info, "runtime takes no motion-fed history (%s): single-frame NR", _rt.LastError().c_str());
             _rt.temporal = 0;
-            _stats.temporal = false;
         }
         _job = {};
         _job.struct_size = sizeof(_job);
@@ -569,6 +571,15 @@ bool NrEngine::WarmUp()
     _ownAlloc->Reset();
     _ownList->Reset(_ownAlloc.Get(), nullptr);
     _motion = {};
+    if (_settings.temporal && _rt.Native())
+    {
+        // Builds the history network now rather than at the first frame with vectors (values unused on a reset)
+        _motion.res = _feed.Get();
+        _motion.w = _feedW;
+        _motion.h = _feedH;
+        _motion.reset = true;
+    }
+    _lastFedUpscale = 0;
     if (!PrepareJob(_ownList.Get(), nullptr))
     {
         _ownList->Close();
@@ -584,7 +595,9 @@ bool NrEngine::WarmUp()
     WaitIdle();
     DrainJob();
     WaitIdle();
-    Log(OptiLog_Info, "network ready for %ux%u in %lu ms", _feedW, _feedH, GetTickCount() - t0);
+    _motion = {};
+    Log(OptiLog_Info, "network ready for %ux%u in %lu ms (%s, history %d)", _feedW, _feedH, GetTickCount() - t0,
+        _rt.Native() ? (_settings.model == 0 ? "Full" : "Small") : "runtime's model", (int) _stats.temporal);
     return true;
 }
 
@@ -646,6 +659,7 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
 void NrEngine::ReadTimings()
 {
     FinishDump();
+    SeqPoll();
     if (_readback && _tsFreq > 0)
     {
         const uint64_t done = _hipFence->GetCompletedValue();
@@ -783,6 +797,12 @@ void NrEngine::Consume(ID3D12GraphicsCommandList* list, uint64_t* wait, ID3D12Re
             *wait = _jobHipValue;
             if (_feedValid)
                 *enh = static_cast<ID3D12Resource*>(_job.private_output);
+            if (*enh != nullptr && _jobSeq >= 0 && _jobSeq < (int32_t) _seq.size())
+            {
+                // Read on this list after the wait for the network (see OnExecute / SubmitOwn)
+                SeqCopy(list, *enh, kRead, _seq[_jobSeq].enh);
+                _seqWait = 0;
+            }
         }
         else
         {
@@ -801,12 +821,25 @@ void NrEngine::Consume(ID3D12GraphicsCommandList* list, uint64_t* wait, ID3D12Re
 void NrEngine::Produce(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* frame, uint64_t wait)
 {
     const bool produced = PrepareJob(list, frame);
+    _jobSeq = -1;
+    _lastFedUpscale = produced && _motion.res != nullptr ? _motionUpscale : 0;
     if (produced)
     {
         _jobState = Job::Recorded;
         _feedValid = true;
         _stats.framesRun++;
         _failures = 0;
+        if (_seqActive && _seqNext < _seq.size())
+        {
+            auto& slot = _seq[_seqNext];
+            _jobSeq = int32_t(_seqNext++);
+            slot.frame = _frameId;
+            slot.motion = _motion;
+            slot.temporal = _stats.temporal;
+            SeqCopy(list, _feed.Get(), kRead, slot.fed);
+            if (_motion.res != nullptr)
+                SeqCopy(list, _motion.res, _motion.state, slot.mv);
+        }
         if (_stats.framesRun % 600 == 0)
         {
             char status[512] = {};
@@ -937,20 +970,15 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
             f->colorOverride = target;
     }
 
-    // Motion vectors of this frame for a temporal runtime, scaled to feed pixels
+    // Motion vectors of this frame for a temporal runtime, as they are (render or output size)
     _motion = {};
     if (mv != nullptr)
     {
         const bool lowResMv = !(f->flags & OptiUpscale_DisplayResMV);
-        const float spaceW = float(lowResMv ? f->renderWidth : f->outputWidth);
-        const float spaceH = float(lowResMv ? f->renderHeight : f->outputHeight);
-        _motion.res = mv;
-        _motion.state = Readable(D3D12_RESOURCE_STATES(f->motionVectorsState)) ? D3D12_RESOURCE_STATES(f->motionVectorsState) : kRead;
-        _motion.w = (uint32_t) spaceW;
-        _motion.h = (uint32_t) spaceH;
-        _motion.scaleX = f->mvScaleX * float(_feedW) / spaceW;
-        _motion.scaleY = f->mvScaleY * float(_feedH) / spaceH;
-        _motion.reset = (f->flags & OptiUpscale_Reset) != 0;
+        LogMotion(f);
+        SetMotion(mv, mvMove ? kRead : mvState, lowResMv ? f->renderWidth : f->outputWidth,
+                  lowResMv ? f->renderHeight : f->outputHeight, f->mvScaleX, f->mvScaleY, f->frameId,
+                  (f->flags & OptiUpscale_Reset) != 0);
     }
 
     // Feed this frame: the source before any edit
@@ -974,6 +1002,79 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         Barrier(list, color, kRead, colorState);
     if (mvMove)
         Barrier(list, mv, kRead, mvState);
+}
+
+// History is dropped on a cut, after a frame that was not fed and when the vector extent changes
+bool NrEngine::HistoryBreak(uint64_t upscaleId, uint32_t mvW, uint32_t mvH, bool reset)
+{
+    const bool gap = _lastFedUpscale == 0 || upscaleId != _lastFedUpscale + 1;
+    const bool resized = mvW != _lastMvW || mvH != _lastMvH;
+    _lastMvW = mvW;
+    _lastMvH = mvH;
+    return reset || gap || resized;
+}
+
+// w x h: the vectors' extent (render or output size), sx/sy: vector -> pixels of that extent
+void NrEngine::SetMotion(ID3D12Resource* mv, D3D12_RESOURCE_STATES state, uint32_t w, uint32_t h, float sx, float sy,
+                         uint64_t upscaleId, bool reset)
+{
+    _motion = {};
+    _motionUpscale = 0;
+    if (mv == nullptr || w == 0 || h == 0)
+        return;
+    // The runtime samples them over the feed's UV range: pixels of that extent -> feed pixels
+    _motion.res = mv;
+    _motion.state = state;
+    _motion.w = w;
+    _motion.h = h;
+    _motion.scaleX = sx * float(_feedW) / float(w);
+    _motion.scaleY = sy * float(_feedH) / float(h);
+    _motion.reset = upscaleId != 0 ? HistoryBreak(upscaleId, w, h, reset) : reset;
+    _motionUpscale = upscaleId;
+}
+
+void NrEngine::LogMotion(const OptiUpscaleFrame* f)
+{
+    const uint32_t flags = f->flags & (OptiUpscale_JitteredMV | OptiUpscale_DisplayResMV);
+    if (flags == _loggedMvFlags)
+        return;
+    _loggedMvFlags = flags;
+    const auto d = static_cast<ID3D12Resource*>(f->motionVectors)->GetDesc();
+    Log(OptiLog_Info, "motion vectors %llux%u fmt %d, %s size, scale %.3f %.3f, jitter %.3f %.3f%s", d.Width, d.Height,
+        (int) d.Format, (flags & OptiUpscale_DisplayResMV) ? "output" : "render", f->mvScaleX, f->mvScaleY, f->jitterX,
+        f->jitterY, (flags & OptiUpscale_JitteredMV) ? ", jittered (history expects unjittered vectors)" : "");
+}
+
+// Terminal: this evaluate's vectors, copied on the game's list; the present of the same frame takes them
+void NrEngine::CaptureMotion(OptiUpscaleFrame* f)
+{
+    auto* mv = static_cast<ID3D12Resource*>(f->motionVectors);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(f->commandList);
+    std::lock_guard lock(_mutex);
+    _mvCap = {};
+    if (mv == nullptr || list == nullptr || _state != State::Ready || f->device != _device.Get() ||
+        !_settings.temporal || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+    LogMotion(f);
+    const auto md = mv->GetDesc();
+    if (!_mvCopy || _mvCopy->GetDesc().Width != md.Width || _mvCopy->GetDesc().Height != md.Height ||
+        _mvCopy->GetDesc().Format != ViewFormat(md.Format))
+        _mvCopy = Texture(_device.Get(), (uint32_t) md.Width, md.Height, ViewFormat(md.Format), false, kRead);
+    if (!_mvCopy)
+        return;
+    const auto st = D3D12_RESOURCE_STATES(f->motionVectorsState);
+    Barrier(list, mv, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(list, _mvCopy.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyResource(_mvCopy.Get(), mv);
+    Barrier(list, _mvCopy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+    Barrier(list, mv, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
+    const bool display = (f->flags & OptiUpscale_DisplayResMV) != 0;
+    _mvCap.frameId = f->frameId;
+    _mvCap.w = display ? f->outputWidth : f->renderWidth;
+    _mvCap.h = display ? f->outputHeight : f->renderHeight;
+    _mvCap.scaleX = f->mvScaleX;
+    _mvCap.scaleY = f->mvScaleY;
+    _mvCap.reset = (f->flags & OptiUpscale_Reset) != 0;
 }
 
 // Terminal placement: NR on the HUD-less colour, its edit added to the back buffer outside the UI, recorded into
@@ -1063,8 +1164,10 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud);
     }
 
-    // Feed the HUD-less colour, linearised (no motion vectors at present time)
+    // Feed the HUD-less colour, linearised, with the vectors of the evaluate of this frame
     _motion = {};
+    if (_mvCopy && _mvCap.frameId != 0 && _mvCap.frameId == f->upscaleFrameId)
+        SetMotion(_mvCopy.Get(), kRead, _mvCap.w, _mvCap.h, _mvCap.scaleX, _mvCap.scaleY, _mvCap.frameId, _mvCap.reset);
     {
         const auto hd = hud->GetDesc();
         ShaderConstants c {};
@@ -1083,6 +1186,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     Barrier(list, hud, kRead, hudState);
 
     Produce(list, nullptr, wait);
+    _mvCap = {};
     lock.unlock();
     SubmitOwn(queue, slot, list, wait);
 }
@@ -1117,6 +1221,7 @@ ID3D12GraphicsCommandList* NrEngine::NextOwnList(uint32_t* slot)
 void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12GraphicsCommandList* list, uint64_t wait)
 {
     list->Close();
+    _ownQueue = queue;
     ID3D12CommandList* l[] = { list };
     if (_pendingList.load() == list)
     {
@@ -1233,6 +1338,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         _motion.scaleY = in.mvScaleY * float(_feedH) / float(in.motionH);
         _motion.reset = in.reset;
     }
+    _motionUpscale = 0;
 
     uint32_t slot = 0;
     bool wrote = false;
@@ -1314,6 +1420,128 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
     _dumpGameValue = 0;
     _dumpOwnValue = _presentCounter; // own lists: done once the present fence reaches it
     Log(OptiLog_Info, "dump recorded (%ls)", name.c_str());
+}
+
+void NrEngine::SeqCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES state, SeqImage& img)
+{
+    img.desc = res->GetDesc();
+    UINT rows = 0;
+    UINT64 total = 0;
+    _device->GetCopyableFootprints(&img.desc, 0, 1, 0, &img.fp, &rows, &img.rowBytes, &total);
+    D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC b {};
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    b.Width = total;
+    b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+    b.SampleDesc.Count = 1;
+    b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    img.buf.Reset();
+    if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&img.buf))))
+        return;
+    D3D12_TEXTURE_COPY_LOCATION dst { img.buf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    dst.PlacedFootprint = img.fp;
+    D3D12_TEXTURE_COPY_LOCATION src { res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    src.SubresourceIndex = 0;
+    Barrier(list, res, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Barrier(list, res, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+}
+
+void NrEngine::SeqPoll()
+{
+    if (dumpDir.empty())
+        return;
+    if (!_seqActive)
+    {
+        const std::wstring trigger = dumpDir + L"\\lmxxf_nr_seq.trigger";
+        if ((_frameId % 8) != 0 || GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return;
+        int n = 0;
+        if (FILE* t = _wfopen(trigger.c_str(), L"rb"))
+        {
+            if (fscanf(t, "%d", &n) != 1)
+                n = 0;
+            fclose(t);
+        }
+        DeleteFileW(trigger.c_str());
+        _seq.clear();
+        _seq.resize(n >= 2 ? std::min(n, 48) : 12);
+        _seqNext = 0;
+        _seqWait = 0;
+        _jobSeq = -1;
+        _seqActive = true;
+        Log(OptiLog_Info, "sequence dump of %zu frames started (%ls)", _seq.size(), name.c_str());
+        return;
+    }
+    if (_seqNext < _seq.size() || ++_seqWait < 4)
+        return;
+    SeqWrite();
+}
+
+void NrEngine::SeqWrite()
+{
+    // Every list holding a copy ran before these signals
+    ComPtr<ID3D12Fence> fence;
+    _device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    uint64_t v = 0;
+    for (ID3D12CommandQueue* q : { _gameQueue.Get(), _ownQueue })
+    {
+        if (q == nullptr || !fence)
+            continue;
+        q->Signal(fence.Get(), ++v);
+        fence->SetEventOnCompletion(v, _event);
+        WaitForSingleObject(_event, 5000);
+    }
+
+    const std::wstring dir = dumpDir + L"\\seq_" + name + L"_" + std::to_wstring(GetTickCount64());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    auto write = [&](SeqImage& img, const std::wstring& file) -> bool
+    {
+        uint8_t* p = nullptr;
+        if (!img.buf || FAILED(img.buf->Map(0, nullptr, (void**) &p)))
+            return false;
+        if (FILE* out = _wfopen((dir + L"\\" + file).c_str(), L"wb"))
+        {
+            for (UINT y = 0; y < img.desc.Height; ++y)
+                fwrite(p + img.fp.Offset + UINT64(y) * img.fp.Footprint.RowPitch, 1, (size_t) img.rowBytes, out);
+            fclose(out);
+        }
+        D3D12_RANGE none { 0, 0 };
+        img.buf->Unmap(0, &none);
+        return true;
+    };
+    std::string json = "{\"feed\":[" + std::to_string(_feedW) + "," + std::to_string(_feedH) + "],\"frames\":[\n";
+    char line[512];
+    for (size_t k = 0; k < _seq.size(); ++k)
+    {
+        auto& s = _seq[k];
+        wchar_t idx[8];
+        swprintf(idx, 8, L"%02zu", k);
+        const bool fed = write(s.fed, std::wstring(L"fed_") + idx + L".raw");
+        const bool mv = write(s.mv, std::wstring(L"mv_") + idx + L".raw");
+        const bool enh = write(s.enh, std::wstring(L"enh_") + idx + L".raw");
+        snprintf(line, sizeof(line),
+                 "%s{\"frame\":%llu,\"fed\":%s,\"fedSize\":[%llu,%u],\"fedFormat\":%d,\"enh\":%s,\"enhSize\":[%llu,%u],"
+                 "\"enhFormat\":%d,\"mv\":%s,\"mvSize\":[%llu,%u],\"mvFormat\":%d,\"mvUsed\":[%u,%u],"
+                 "\"mvScale\":[%.6f,%.6f],\"reset\":%d,\"temporal\":%d}\n",
+                 k ? "," : "", (unsigned long long) s.frame, fed ? "true" : "false", s.fed.desc.Width, s.fed.desc.Height,
+                 (int) s.fed.desc.Format, enh ? "true" : "false", s.enh.desc.Width, s.enh.desc.Height,
+                 (int) s.enh.desc.Format, mv ? "true" : "false", s.mv.desc.Width, s.mv.desc.Height,
+                 (int) s.mv.desc.Format, s.motion.w, s.motion.h, s.motion.scaleX, s.motion.scaleY, (int) s.motion.reset,
+                 (int) s.temporal);
+        json += line;
+    }
+    json += "]}\n";
+    if (FILE* out = _wfopen((dir + L"\\seq.json").c_str(), L"wb"))
+    {
+        fwrite(json.data(), 1, json.size(), out);
+        fclose(out);
+    }
+    Log(OptiLog_Info, "sequence dump of %zu frames written to %ls", _seq.size(), dir.c_str());
+    _seq.clear();
+    _seqActive = false;
+    _jobSeq = -1;
 }
 
 void NrEngine::FinishDump()

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "Runtime.h"
 #include "Shaders.h"
@@ -71,9 +72,11 @@ class NrEngine
     NrStats Stats();
     Runtime& GetRuntime() { return _rt; }
     bool RuntimeLoaded() const { return _rt.module != nullptr; }
-    bool LoadRuntime(const std::wstring& extraDir, const std::wstring& exeDir, const std::wstring& optiDir);
+    bool LoadRuntime(const RuntimePaths& paths);
 
     void OnUpscale(OptiUpscaleFrame* frame, bool after);
+    // Terminal: keeps this frame's motion vectors for the HUD-less NR at present
+    void CaptureMotion(OptiUpscaleFrame* frame);
     void OnPresent(OptiPresentFrame* frame);
 
     // NR on a device of our own (the display card): src is read, the result written to dst. waitAnswer runs the
@@ -216,6 +219,50 @@ class NrEngine
         bool reset = false;
     } _motion;
     bool _feedValid = false; // _feed holds what the enqueued job was fed
+    // History continuity: the last fed frame's upscale id and vector extent
+    uint64_t _lastFedUpscale = 0;
+    uint32_t _lastMvW = 0, _lastMvH = 0;
+    uint32_t _loggedMvFlags = ~0u;
+    uint64_t _motionUpscale = 0; // upscale frame of _motion
+    void LogMotion(const OptiUpscaleFrame* f);
+    bool HistoryBreak(uint64_t upscaleId, uint32_t mvW, uint32_t mvH, bool reset);
+    void SetMotion(ID3D12Resource* mv, D3D12_RESOURCE_STATES state, uint32_t w, uint32_t h, float scaleX, float scaleY,
+                   uint64_t upscaleId, bool reset);
+    // Terminal: the vectors of the last evaluate, copied on the game's list
+    ComPtr<ID3D12Resource> _mvCopy;
+    struct
+    {
+        uint64_t frameId = 0;
+        uint32_t w = 0, h = 0;
+        float scaleX = 1, scaleY = 1;
+        bool reset = false;
+    } _mvCap;
+
+    // Sequence dump on <dumpDir>\lmxxf_nr_seq.trigger (frame count inside, default 12): per job its input, its
+    // vectors and its answer, read back once the last answer was recorded
+    struct SeqImage
+    {
+        ComPtr<ID3D12Resource> buf;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+        D3D12_RESOURCE_DESC desc {};
+        UINT64 rowBytes = 0;
+    };
+    struct SeqSlot
+    {
+        SeqImage fed, mv, enh;
+        MotionIn motion;
+        uint64_t frame = 0;
+        bool temporal = false;
+    };
+    std::vector<SeqSlot> _seq;
+    uint32_t _seqNext = 0;
+    int32_t _jobSeq = -1;     // slot of the job in flight
+    uint32_t _seqWait = 0;    // frames since the last answer was recorded
+    bool _seqActive = false;
+    ID3D12CommandQueue* _ownQueue = nullptr; // where our own lists last ran
+    void SeqPoll();
+    void SeqCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES state, SeqImage& img);
+    void SeqWrite();
 
     // Timestamps around EnqueueHip on the session queue
     static constexpr uint32_t kTimingSlots = 8;

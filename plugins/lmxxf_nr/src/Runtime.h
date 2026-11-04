@@ -9,6 +9,14 @@
 
 #include "../third_party/lmxxf/LmxxfNrApi.h"
 
+// Where the runtime and its assets are looked for
+struct RuntimePaths
+{
+    std::wstring extra, exe, opti; // RuntimeDir setting, the game's exe folder, the OptiScaler folder
+    std::wstring modules;          // ModulesDir setting: a HIP module folder with SHA256SUMS
+    std::wstring weights;          // WeightsDir setting: tiled weights, passed as LMXXF_WEIGHTS_DIR
+};
+
 // The user-installed LmxxfNrRuntime.dll, through lmxxf's C ABI v1
 struct Runtime
 {
@@ -16,6 +24,7 @@ struct Runtime
     {
         None,
         LmxxfPackage, // DLSS5-AMD\native-game-tiled-assets (lmxxf's own package)
+        LmxxfBuild,   // a runtime build with a module folder (ModulesDir, or modules\ / HIP\ beside the dll)
         RuntimePak,   // LmxxfNrRuntime.pak beside the dll (a repackaged runtime, compatibility path)
     };
 
@@ -31,8 +40,15 @@ struct Runtime
     LmxxfNrCapabilities caps {};
     std::string error;
 
-    // Finds and loads the runtime. dirs: semicolon separated folders tried first (the RuntimeDir setting)
-    bool Load(const std::wstring& extraDir, const std::wstring& exeDir, const std::wstring& optiDir);
+    // Finds and loads the runtime: RuntimeDir first, then the game and OptiScaler folders
+    bool Load(const RuntimePaths& paths);
+
+    // lmxxf's own ABI with motion-fed history: sole export, full table, history_supported. Gets the temporal
+    // frame info with exposure, the full network flag and the DLSS5_* settings it reads.
+    bool Native() const { return module != nullptr && exports == 1 && hasTimings && caps.history_supported == 1; }
+    bool FreeRes() const { return envFreeRes; }
+    bool Styles() const { return envStyle; }
+    bool Models() const { return envMultiPass || Native(); }
 
     // The frame info sizes lmxxf's header defines, newest first
     static constexpr uint32_t kFrameInfoSizes[] = { sizeof(LmxxfNrFrameInfo), LMXXF_NR_FRAME_INFO_V1_SIZE, 64u };
@@ -50,6 +66,7 @@ struct Runtime
 // Motion-fed network history: not in lmxxf's published header. The layout of the lmxxf temporal build and of
 // runtimes that share its offsets (the first 80 bytes are LmxxfNrFrameInfo); used only when PrepareFrame takes it.
 #define LMXXF_NR_FRAME_FLAG_TEMPORAL_EXT (1u << 3)
+#define LMXXF_NR_FRAME_FLAG_FULL_NETWORK_EXT (1u << 5) // the 71-block model instead of Small
 struct LmxxfNrFrameInfoTemporalExt
 {
     uint32_t struct_size;
