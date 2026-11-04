@@ -119,6 +119,13 @@ extern "C"
     // before runs ahead of the upscaler, after runs once it has recorded into frame->commandList
     typedef void (*OptiUpscaleFn)(OptiUpscaleFrame* frame, void* userData);
 
+    // Overlay text (RegisterOverlayText) -------------------------------------------------------------------
+
+    // Writes the value shown after the line's label into buffer (zero terminated, truncated to bufferSize).
+    // Return false to hide the line this frame. Runs on the render thread while the overlay draws: keep it quick,
+    // no D3D / Vulkan calls.
+    typedef bool (*OptiOverlayTextFn)(char* buffer, size_t bufferSize, void* userData);
+
     typedef struct OptiPluginApi
     {
         uint32_t size;    // sizeof(OptiPluginApi) of the running OptiScaler
@@ -210,6 +217,12 @@ extern "C"
         // state the game had set on commandList before the evaluate. Does nothing when the game config has root
         // signature restore off, or outside of an upscale callback.
         void (*RestoreCommandListState)(void* commandList);
+
+        // Overlay text, added after version 1 (check with OPTI_API_HAS) ---------------------------------------
+
+        // Adds a line "label: value" to the FPS overlay, below OptiScaler's rows, in the Detailed and fuller
+        // overlay types and in Custom. One line per call, in registration order.
+        bool (*RegisterOverlayText)(OptiPlugin* plugin, const char* label, OptiOverlayTextFn fn, void* userData);
 
     } OptiPluginApi;
 

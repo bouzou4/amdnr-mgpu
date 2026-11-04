@@ -3072,6 +3072,19 @@ void MenuCommon::RenderPerformanceOverlay(RenderMenuContext& ctx)
                 }
             }
 
+            // Plugin lines, below OptiScaler's rows
+            if (overlayType >= FpsOverlay_Detailed)
+            {
+                int pluginRow = OverlayRow_COUNT;
+
+                for (auto& pluginLine : PluginApi::GetOverlayLines())
+                {
+                    lines.push_back(OverlayLine().Label(pluginLine.label + ": ").Value(
+                        ("plugin" + std::to_string(pluginRow)).c_str(), std::move(pluginLine.value)));
+                    lines.back().row = pluginRow++;
+                }
+            }
+
             ImFont* font = ImGui::GetFont();
             const float basePx = ImGui::GetFontSize();
             const float labelPx = std::round(basePx * config->FpsOverlayLabelScale.value_or_default());

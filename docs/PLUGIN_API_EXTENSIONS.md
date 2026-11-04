@@ -51,3 +51,22 @@ void (*RestoreCommandListState)(void* commandList);
 
 - The game's queue is needed (a runtime that submits work after the game's list, here lmxxf's `EnqueueHip`), so `commandQueue` is in the frame. It is the queue the swapchain was created with; the plugin still detours `ExecuteCommandLists` to learn when the recorded list is submitted. A host-side "list submitted" notification would remove that last self-hook and is the natural follow-up.
 - Neural Rendering cannot finish inside one evaluate: its input has to be submitted before the network can run, so the result is applied to the next frame. The callback API doesn't need to know; it is a plugin-side pipeline (see `plugins/lmxxf_nr/README.md`).
+
+## 3. Overlay text lines
+
+**Why.** A plugin that runs per frame work (a neural pass, a second GPU) has numbers the player wants to see while playing, next to the frame time: the pass's GPU time, its size, a fallback state. With API v1 they can only live in the menu tab, which is closed while playing.
+
+**ABI.**
+
+```c
+typedef bool (*OptiOverlayTextFn)(char* buffer, size_t bufferSize, void* userData);
+bool (*RegisterOverlayText)(OptiPlugin* plugin, const char* label, OptiOverlayTextFn fn, void* userData);
+```
+
+**Behaviour.**
+
+- One line per registration, "label: value", drawn by the FPS overlay below OptiScaler's own rows, with the overlay's fonts, colours, label / value styles and digit padding. Shown in the Detailed type and fuller ones and in Custom; the JustFPS and Simple types stay as they are.
+- The callback fills `buffer` (256 bytes) and returns false to hide its line for that frame (for example while the plugin's feature is off). It runs on the render thread while the overlay draws, under SEH: a crash removes that line.
+- Registrations made in `OptiPluginInit` are dropped when it returns false.
+
+**What the plugin taught.** A text callback is enough for the NR and multi-GPU stats; graphs (frame time style) would need `PlotLines` (assessment PR 4) and are left out. A Custom-overlay row key per plugin line (so users can place them) is a possible follow-up.

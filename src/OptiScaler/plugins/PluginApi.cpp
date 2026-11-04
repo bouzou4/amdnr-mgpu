@@ -509,6 +509,49 @@ void Api_RestoreCommandListState(void* commandList)
         D3D12Hooks::RestoreRoot(static_cast<ID3D12GraphicsCommandList*>(commandList));
 }
 
+struct OverlayText
+{
+    OptiPlugin* plugin;
+    std::string label;
+    OptiOverlayTextFn fn;
+    void* userData;
+    bool faulted = false;
+};
+
+std::vector<std::shared_ptr<OverlayText>> _overlayTexts;
+
+bool CallOverlayText(OptiOverlayTextFn fn, char* buffer, size_t bufferSize, void* userData, bool* shown)
+{
+    __try
+    {
+        *shown = fn(buffer, bufferSize, userData);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool Api_RegisterOverlayText(OptiPlugin* plugin, const char* label, OptiOverlayTextFn fn, void* userData)
+{
+    if (plugin == nullptr || label == nullptr || fn == nullptr)
+        return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (plugin->initState == OptiPlugin::InitState::Declined)
+        return false;
+
+    auto entry = std::make_shared<OverlayText>();
+    *entry = { plugin, label, fn, userData };
+    _overlayTexts.push_back(std::move(entry));
+
+    LOG_INFO("[{}] Registered overlay text: {}", plugin->name, label);
+
+    return true;
+}
+
 const OptiPluginApi _api = {
     .size = sizeof(OptiPluginApi),
     .version = OPTI_PLUGIN_API_VERSION,
@@ -552,6 +595,8 @@ const OptiPluginApi _api = {
 
     .RegisterUpscaleCallbacks = Api_RegisterUpscaleCallbacks,
     .RestoreCommandListState = Api_RestoreCommandListState,
+
+    .RegisterOverlayText = Api_RegisterOverlayText,
 };
 } // namespace
 
@@ -625,6 +670,7 @@ void PluginApi::InitPlugin(HMODULE module, PFN_OptiPluginInit init, const std::s
     {
         std::erase_if(_upscaleCallbacks, [plugin](const auto& c) { return c->plugin == plugin; });
         _hasUpscaleCallbacks = !_upscaleCallbacks.empty();
+        std::erase_if(_overlayTexts, [plugin](const auto& t) { return t->plugin == plugin; });
     }
 }
 
@@ -739,4 +785,41 @@ void PluginApi::RunUpscaleCallbacks(bool after, OptiUpscaleFrame* frame)
             c->faulted = true;
         }
     }
+}
+
+std::vector<PluginApi::OverlayLine> PluginApi::GetOverlayLines()
+{
+    std::vector<std::shared_ptr<OverlayText>> texts;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (const auto& t : _overlayTexts)
+        {
+            if (!t->faulted && t->plugin->initState == OptiPlugin::InitState::Accepted)
+                texts.push_back(t);
+        }
+    }
+
+    std::vector<OverlayLine> lines;
+    char buffer[256];
+
+    for (const auto& t : texts)
+    {
+        buffer[0] = '\0';
+        bool shown = false;
+
+        if (!CallOverlayText(t->fn, buffer, sizeof(buffer), t->userData, &shown))
+        {
+            LOG_ERROR("[{}] Crashed in overlay text {}, removing it", t->plugin->name, t->label);
+            t->faulted = true;
+            continue;
+        }
+
+        if (shown)
+        {
+            buffer[sizeof(buffer) - 1] = '\0';
+            lines.push_back({ t->label, buffer });
+        }
+    }
+
+    return lines;
 }

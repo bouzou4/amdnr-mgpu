@@ -30,4 +30,13 @@ class PluginApi
     // Upscale callbacks of the plugins, around a D3D12 evaluate
     static bool HasUpscaleCallbacks();
     static void RunUpscaleCallbacks(bool after, OptiUpscaleFrame* frame);
+
+    struct OverlayLine
+    {
+        std::string label;
+        std::string value;
+    };
+
+    // The plugins' overlay lines that are shown this frame
+    static std::vector<OverlayLine> GetOverlayLines();
 };
