@@ -168,6 +168,14 @@ extern "C"
 
     typedef void (*OptiPresentFn)(OptiPresentFrame* frame, void* userData);
 
+    // Adapters and devices (RegisterAdapterOverride) -------------------------------------------------------
+
+    // Called in OptiScaler's D3D12CreateDevice hook for every device creation except OptiScaler's own and the
+    // plugins' unhooked ones. requestedAdapter is the caller's IUnknown* adapter (may be NULL = default), caller
+    // the return address of the call. Return an IUnknown* adapter to create the device on instead (the plugin keeps
+    // it alive), or NULL to keep the request. An overridden device counts as the game's device, on any GPU.
+    typedef void* (*OptiAdapterOverrideFn)(void* requestedAdapter, void* caller, void* userData);
+
     typedef struct OptiPluginApi
     {
         uint32_t size;    // sizeof(OptiPluginApi) of the running OptiScaler
@@ -271,6 +279,18 @@ extern "C"
         // Calls fn twice per D3D12 present on the presenting thread, phase BeforeOverlay then AfterOverlay.
         // requests: OptiPresentRequest bits. One registration per plugin, a second one replaces the first.
         bool (*RegisterPresentCallback)(OptiPlugin* plugin, OptiPresentFn fn, uint32_t requests, void* userData);
+
+        // Adapters and devices, added after version 1 (check with OPTI_API_HAS) --------------------------------
+
+        // One override per process; register in OptiPluginInit, before the game creates its device.
+        bool (*RegisterAdapterOverride)(OptiPlugin* plugin, OptiAdapterOverrideFn fn, void* userData);
+        // D3D12CreateDevice that OptiScaler neither redirects nor takes as the game's device (HRESULT)
+        int32_t (*CreateD3D12DeviceUnhooked)(void* adapter, int32_t minimumFeatureLevel, const void* riid,
+                                             void** device);
+        // CreateDXGIFactory1 of the system DXGI, without OptiScaler's spoofing and wrapping (HRESULT)
+        int32_t (*CreateDxgiFactoryUnhooked)(const void* riid, void** factory);
+        // Runs fn on this thread with OptiScaler's GPU spoofing off (real vendor ids and adapter names)
+        void (*RunUnspoofed)(void (*fn)(void* userData), void* userData);
 
     } OptiPluginApi;
 

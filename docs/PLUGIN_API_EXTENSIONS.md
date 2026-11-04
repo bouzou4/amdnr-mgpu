@@ -9,7 +9,7 @@ Versioning for all of them: the new functions are appended to the end of `OptiPl
 | 1 | Upscale callbacks + command list state restore | `RegisterUpscaleCallbacks`, `RestoreCommandListState` | built, used by the plugin |
 | 3 | Overlay text lines | `RegisterOverlayText` | built, used by the plugin |
 | 2 | Present callback + HUD-less colour without frame generation | `RegisterPresentCallback` | built, used by the plugin |
-| 5 | Adapter override + unhooked device creation | see 5 | see 5 |
+| 5 | Adapter override + unhooked device creation | `RegisterAdapterOverride`, `CreateD3D12DeviceUnhooked`, `CreateDxgiFactoryUnhooked`, `RunUnspoofed` | built, used by the plugin's multi-GPU mode |
 | 6 | Swapchain provider | see 6 | see 6 |
 
 ## 1. Upscale callbacks and command list state restore
@@ -106,3 +106,27 @@ bool (*RegisterPresentCallback)(OptiPlugin* plugin, OptiPresentFn fn, uint32_t r
 - Pairing matters: the multi-GPU prototype took the pick when HUDfix found it, while the game was already recording the next frame, and paired back buffers with the wrong frame's HUD-less colour (74.9 % to 100 % of pixels "differing" in Satisfactory, up to 209 gate trips per run). Handing the pick over at the present of the frame it was captured in removes that by construction.
 - Depth and motion vectors at present time are not included: they are the upscaler's inputs, which the upscale callbacks (1) already give, on the game's command list, in the frame they belong to.
 - Not covered: D3D11 swapchains, and frame generation on (a plugin presenting after FG would need FG to hand over its output).
+
+## 5. Adapter override and unhooked device creation
+
+**Why.** A plugin that moves the game to another GPU (render on one card, present on the other) has to decide the adapter where OptiScaler's `D3D12CreateDevice` hook runs: a detour of its own outside it would make OptiScaler capture whatever device the plugin creates for itself, and OptiScaler drops a device created on a card that is not the primary GPU (`nonPrimaryGpu`), which is exactly the render card. The plugin also needs devices and DXGI factories of its own that OptiScaler neither captures, redirects nor spoofs.
+
+**ABI.**
+
+```c
+typedef void* (*OptiAdapterOverrideFn)(void* requestedAdapter, void* caller, void* userData);
+bool    (*RegisterAdapterOverride)(OptiPlugin* plugin, OptiAdapterOverrideFn fn, void* userData);
+int32_t (*CreateD3D12DeviceUnhooked)(void* adapter, int32_t minimumFeatureLevel, const void* riid, void** device);
+int32_t (*CreateDxgiFactoryUnhooked)(const void* riid, void** factory);
+void    (*RunUnspoofed)(void (*fn)(void* userData), void* userData);
+```
+
+**Behaviour.**
+
+- `RegisterAdapterOverride`: one per process (the first plugin keeps it), registered in `OptiPluginInit`. Called at the top of `hkD3D12CreateDevice` and of the `ID3D12DeviceFactory::CreateDevice` hook, for every creation except feature-level-1_0_CORE probes and unhooked ones, with the caller's return address so the plugin can leave DXGI's, D3D12's and OptiScaler's own devices alone. A returned adapter replaces the requested one (the plugin keeps it alive), and the device is then the game's device whatever GPU it is on: the `nonPrimaryGpu` rejection is skipped for it.
+- `CreateD3D12DeviceUnhooked`: the real `D3D12CreateDevice` through a thread-local pass-through in both hooks: no override, no capture as the game's device.
+- `CreateDxgiFactoryUnhooked`: the system DXGI's `CreateDXGIFactory1` (OptiScaler's proxy original), no factory wrapping.
+- `RunUnspoofed`: runs a function with OptiScaler's GPU spoofing off for the thread (`ScopedSkipSpoofingThread`), for adapter enumeration with real vendor ids and names.
+- SEH guarded; a crashing override is removed.
+
+**What the plugin taught.** The caller filter (DXGI, D3D12, D3D12Core, D3D11, DXCore, OptiScaler, the plugin) is necessary: redirecting DXGI's own internal device hung the cross-adapter present in the multi-GPU prototype. It is passed to the plugin rather than applied by the host, because which callers matter is the plugin's policy.

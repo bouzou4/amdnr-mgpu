@@ -5,6 +5,8 @@
 #include "Config.h"
 #include "menu/menu_common.h"
 #include "hooks/D3D12_Hooks.h"
+#include "proxies/D3D12_Proxy.h"
+#include "proxies/Dxgi_Proxy.h"
 
 #include <imgui/imgui_internal.h>
 
@@ -609,6 +611,79 @@ bool Api_RegisterPresentCallback(OptiPlugin* plugin, OptiPresentFn fn, uint32_t 
     return true;
 }
 
+struct AdapterOverride
+{
+    OptiPlugin* plugin = nullptr;
+    OptiAdapterOverrideFn fn = nullptr;
+    void* userData = nullptr;
+};
+
+AdapterOverride _adapterOverride;
+thread_local bool _unhookedDeviceCreate = false;
+
+bool Api_RegisterAdapterOverride(OptiPlugin* plugin, OptiAdapterOverrideFn fn, void* userData)
+{
+    if (plugin == nullptr || fn == nullptr)
+        return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (plugin->initState == OptiPlugin::InitState::Declined ||
+        (_adapterOverride.plugin != nullptr && _adapterOverride.plugin != plugin))
+        return false;
+
+    _adapterOverride = { plugin, fn, userData };
+    LOG_INFO("[{}] Registered the adapter override", plugin->name);
+    return true;
+}
+
+int32_t Api_CreateD3D12DeviceUnhooked(void* adapter, int32_t minimumFeatureLevel, const void* riid, void** device)
+{
+    auto create = D3d12Proxy::D3D12CreateDevice_Hooked();
+    if (create == nullptr || riid == nullptr || device == nullptr)
+        return E_INVALIDARG;
+
+    // OptiScaler's D3D12CreateDevice hooks pass the call straight through
+    _unhookedDeviceCreate = true;
+    const HRESULT result =
+        create((IUnknown*) adapter, (D3D_FEATURE_LEVEL) minimumFeatureLevel, *static_cast<const IID*>(riid), device);
+    _unhookedDeviceCreate = false;
+    return result;
+}
+
+int32_t Api_CreateDxgiFactoryUnhooked(const void* riid, void** factory)
+{
+    if (riid == nullptr || factory == nullptr)
+        return E_INVALIDARG;
+
+    DxgiProxy::Init();
+    if (auto create = DxgiProxy::CreateDxgiFactory1_())
+        return create(*static_cast<const IID*>(riid), (IDXGIFactory1**) factory);
+
+    return E_NOINTERFACE;
+}
+
+void Api_RunUnspoofed(void (*fn)(void* userData), void* userData)
+{
+    if (fn == nullptr)
+        return;
+
+    ScopedSkipSpoofingThread skipSpoofing {};
+    fn(userData);
+}
+
+bool CallAdapterOverride(OptiAdapterOverrideFn fn, void* requested, void* caller, void* userData, void** result)
+{
+    __try
+    {
+        *result = fn(requested, caller, userData);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 const OptiPluginApi _api = {
     .size = sizeof(OptiPluginApi),
     .version = OPTI_PLUGIN_API_VERSION,
@@ -656,6 +731,11 @@ const OptiPluginApi _api = {
     .RegisterOverlayText = Api_RegisterOverlayText,
 
     .RegisterPresentCallback = Api_RegisterPresentCallback,
+
+    .RegisterAdapterOverride = Api_RegisterAdapterOverride,
+    .CreateD3D12DeviceUnhooked = Api_CreateD3D12DeviceUnhooked,
+    .CreateDxgiFactoryUnhooked = Api_CreateDxgiFactoryUnhooked,
+    .RunUnspoofed = Api_RunUnspoofed,
 };
 } // namespace
 
@@ -732,6 +812,8 @@ void PluginApi::InitPlugin(HMODULE module, PFN_OptiPluginInit init, const std::s
         std::erase_if(_overlayTexts, [plugin](const auto& t) { return t->plugin == plugin; });
         std::erase_if(_presentCallbacks, [plugin](const auto& c) { return c->plugin == plugin; });
         UpdatePresentRequests();
+        if (_adapterOverride.plugin == plugin)
+            _adapterOverride = {};
     }
 }
 
@@ -915,5 +997,33 @@ void PluginApi::RunPresentCallbacks(OptiPresentFrame* frame)
             c->faulted = true;
         }
     }
+}
+
+bool PluginApi::UnhookedDeviceCreate() { return _unhookedDeviceCreate; }
+
+IUnknown* PluginApi::OverrideAdapter(IUnknown* requested, void* caller)
+{
+    AdapterOverride o;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        o = _adapterOverride;
+    }
+
+    if (o.fn == nullptr || o.plugin->initState != OptiPlugin::InitState::Accepted)
+        return nullptr;
+
+    void* adapter = nullptr;
+    if (!CallAdapterOverride(o.fn, requested, caller, o.userData, &adapter))
+    {
+        LOG_ERROR("[{}] Crashed in its adapter override, removing it", o.plugin->name);
+        std::lock_guard<std::mutex> lock(_mutex);
+        _adapterOverride = {};
+        return nullptr;
+    }
+
+    if (adapter != nullptr && adapter != requested)
+        LOG_INFO("[{}] Device adapter {:X} -> {:X}", o.plugin->name, (size_t) requested, (size_t) adapter);
+
+    return static_cast<IUnknown*>(adapter);
 }
 

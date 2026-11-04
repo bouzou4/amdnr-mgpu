@@ -1457,6 +1457,20 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
         debugController->Release();
     }
 #endif
+    // Plugins' own devices pass through untouched; a plugin may move the game's device to another adapter
+    if (PluginApi::UnhookedDeviceCreate())
+        return o_D3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+
+    bool pluginAdapter = false;
+    if (MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
+    {
+        if (auto adapter = PluginApi::OverrideAdapter(pAdapter, _ReturnAddress()); adapter != nullptr)
+        {
+            pAdapter = adapter;
+            pluginAdapter = true;
+        }
+    }
+
     IdentifyGpu::updateD3d12Capabilities(o_D3D12CreateDevice);
 
     DXGI_ADAPTER_DESC desc {};
@@ -1474,8 +1488,8 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
             auto primaryGpu = IdentifyGpu::getPrimaryGpu();
             if (!IsEqualLUID(desc.AdapterLuid, primaryGpu.luid))
             {
-                LOG_WARN("D3D12Device created with non-primary GPU");
-                nonPrimaryGpu = true;
+                LOG_WARN("D3D12Device created with non-primary GPU{}", pluginAdapter ? " (plugin adapter override)" : "");
+                nonPrimaryGpu = !pluginAdapter;
             }
         }
     }
@@ -1599,10 +1613,16 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
     LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel,
               Util::WhoIsTheCaller(_ReturnAddress()));
 
-    if (_creatingD3D12Device)
+    if (_creatingD3D12Device || PluginApi::UnhookedDeviceCreate())
     {
-        LOG_DEBUG("Calling from hkD3D12CreateDevice, calling original CreateDevice");
+        LOG_DEBUG("Calling from hkD3D12CreateDevice or a plugin, calling original CreateDevice");
         return o_CreateDevice(pFactory, pAdapter, MinimumFeatureLevel, riid, ppDevice);
+    }
+
+    if (MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
+    {
+        if (auto adapter = PluginApi::OverrideAdapter(pAdapter, _ReturnAddress()); adapter != nullptr)
+            pAdapter = adapter;
     }
 
 #ifdef ENABLE_DEBUG_LAYER_DX12

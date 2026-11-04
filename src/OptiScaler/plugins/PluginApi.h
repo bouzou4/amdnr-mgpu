@@ -46,4 +46,8 @@ class PluginApi
     static uint64_t LastUpscaleFrameId();
     static void RunPresentCallbacks(OptiPresentFrame* frame);
 
+    // Adapter override and unhooked device creation (D3D12CreateDevice hooks)
+    static bool UnhookedDeviceCreate();
+    static IUnknown* OverrideAdapter(IUnknown* requested, void* caller);
+
 };
