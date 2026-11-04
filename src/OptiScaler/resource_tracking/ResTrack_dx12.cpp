@@ -17,6 +17,7 @@
 #include <magic_enum_utility.hpp>
 #include <include/d3dx/d3dx12.h>
 #include <detours/detours.h>
+#include <mgpu/MgpuHost.h> // [mgpu]
 
 #ifndef STDMETHODCALLTYPE
 #include <Unknwn.h> // or <objbase.h> to get STDMETHODCALLTYPE
@@ -422,6 +423,10 @@ void ResTrack_Dx12::FillResourceInfo(ID3D12Resource* resource, ResourceInfo* inf
 
 bool ResTrack_Dx12::IsHudFixActive()
 {
+    // [mgpu] hook point: the multi-GPU HUD-less mode tracks without frame generation
+    if (MgpuHost::HudlessSink())
+        return !Hudfix_Dx12::SkipHudlessChecks() && Hudfix_Dx12::IsResourceCheckActive();
+
     if (!Config::Instance()->FGEnabled.value_or_default() || !Config::Instance()->FGHUDFix.value_or_default())
     {
         LOG_TRACK(

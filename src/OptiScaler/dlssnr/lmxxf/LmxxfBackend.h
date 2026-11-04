@@ -107,5 +107,8 @@ class Backend final : public AmdPreSr::NeuralBackend
     UINT64 RecordedFrames() const override;
     void NoteLine(const std::string&) override;
     bool Stopped() const override;
+    // [mgpu] CPU wait for the job in flight (no-motion carry), so the display card's presenter consumes a fresh
+    // answer every frame. False on timeout or when nothing is in flight.
+    bool WaitAnswer(unsigned timeoutMs);
 };
 } // namespace Lmxxf

@@ -547,6 +547,9 @@ bool Config::Reload(std::filesystem::path iniPath)
             MgpuMode.set_from_config(readString("Mgpu", "Mode", true));
             MgpuPresenter.set_from_config(readBool("Mgpu", "Presenter"));
             MgpuFallback.set_from_config(readString("Mgpu", "Fallback", true));
+            MgpuNrEveryFrame.set_from_config(readBool("Mgpu", "NrEveryFrame"));
+            MgpuTemporal.set_from_config(readBool("Mgpu", "Temporal"));
+            MgpuUiGate.set_from_config(readFloat("Mgpu", "UiGate"));
             AmdSpinDraw.set_from_config(readInt("DlssNr", "AmdSpinDraw"));
             AmdVkLateCopyWait.set_from_config(readBool("DlssNr", "AmdVkLateCopyWait"));
             // Competitor-audit fixes (0.3.3.2 rebuild): kill switches, never saved
@@ -1740,6 +1743,9 @@ bool Config::SaveIni()
     ini.SetValue("Mgpu", "Mode", Instance()->MgpuMode.value_for_config_or("auto").c_str());
     ini.SetValue("Mgpu", "Presenter", GetBoolValue(Instance()->MgpuPresenter.value_for_config()).c_str());
     ini.SetValue("Mgpu", "Fallback", Instance()->MgpuFallback.value_for_config_or("auto").c_str());
+    ini.SetValue("Mgpu", "NrEveryFrame", GetBoolValue(Instance()->MgpuNrEveryFrame.value_for_config()).c_str());
+    ini.SetValue("Mgpu", "Temporal", GetBoolValue(Instance()->MgpuTemporal.value_for_config()).c_str());
+    ini.SetValue("Mgpu", "UiGate", GetFloatValue(Instance()->MgpuUiGate.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdSpinDraw", GetIntValue(Instance()->AmdSpinDraw.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdVkLateCopyWait", GetBoolValue(Instance()->AmdVkLateCopyWait.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdNeuralListRecovery", GetBoolValue(Instance()->AmdNeuralListRecovery.value_for_config()).c_str());

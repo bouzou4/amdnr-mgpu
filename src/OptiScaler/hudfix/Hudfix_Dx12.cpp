@@ -7,6 +7,7 @@
 #include <Config.h>
 
 #include <framegen/IFGFeature_Dx12.h>
+#include <mgpu/MgpuHost.h> // [mgpu]
 
 inline static int GetFormatGroup(DXGI_FORMAT format)
 {
@@ -521,6 +522,10 @@ bool Hudfix_Dx12::IsResourceCheckActive()
         return false;
     }
 
+    // [mgpu] hook point: the multi-GPU HUD-less mode takes the pick without frame generation
+    if (MgpuHost::HudlessSink())
+        return State::Instance().currentFeature != nullptr;
+
     if (!Config::Instance()->FGEnabled.value_or_default() || !Config::Instance()->FGHUDFix.value_or_default())
     {
         // LOG_TRACK(
@@ -550,7 +555,7 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
 {
     auto& s = State::Instance();
 
-    if (s.currentFG == nullptr)
+    if (s.currentFG == nullptr && !MgpuHost::HudlessSink()) // [mgpu]
         return false;
 
     if (!IsResourceCheckActive())
@@ -780,6 +785,9 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
         // needs conversion?
         if (!CompareResourceFormats(resource->format, s.currentSwapchainDesc.BufferDesc.Format))
         {
+            if (fg == nullptr) // [mgpu] no FG list to convert on: the multi-GPU sink takes same-format picks only
+                break;
+
             if (_formatTransfer[fIndex] == nullptr ||
                 !_formatTransfer[fIndex]->IsFormatCompatible(s.currentSwapchainDesc.BufferDesc.Format))
             {
@@ -872,6 +880,8 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
 
                 fg->SetResource(&setResource);
             }
+            else if (MgpuHost::HudlessSink()) // [mgpu] hook point: the pick goes to the display card
+                MgpuHost::HudlessCaptured(cmdList, _captureBuffer[fIndex], D3D12_RESOURCE_STATE_COPY_DEST);
         }
 
         if (s.fgCaptureResources)

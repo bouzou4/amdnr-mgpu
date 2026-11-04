@@ -1061,6 +1061,9 @@ class Config
     CustomOptional<std::string> MgpuMode { std::string("whole-frame") }; // whole-frame | hudless
     CustomOptional<bool> MgpuPresenter { true };          // false: Windows cross-adapter present (M3 test)
     CustomOptional<std::string> MgpuFallback { std::string("inline") }; // inline | off
+    CustomOptional<bool> MgpuNrEveryFrame { false }; // presenter waits for each network answer
+    CustomOptional<bool> MgpuTemporal { false };     // motion vectors to the display card, network history on
+    CustomOptional<float> MgpuUiGate { 15.f };       // HUD-less sanity gate, % of pixels the UI may cover
 
     // DLSS
     CustomOptional<bool> DLSSEnabled { true };

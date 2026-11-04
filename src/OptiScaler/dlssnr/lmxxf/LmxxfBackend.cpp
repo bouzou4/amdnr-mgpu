@@ -4272,6 +4272,21 @@ void Backend::NoteLine(const std::string& line)
     std::ofstream out(p->directory / L"lmxxf_backend.log", std::ios::app);
     out << GetTickCount64() << " " << line << '\n';
 }
+bool Backend::WaitAnswer(unsigned timeoutMs) // [mgpu]
+{
+    std::lock_guard guard(p->lock);
+    if (!p->ctx || !p->inFlight || !p->api.OutputReady)
+        return false;
+    const ULONGLONG start = GetTickCount64();
+    uint32_t ready = 0u;
+    while (p->api.OutputReady(p->ctx, p->job.handle, &ready) == LMXXF_NR_OK && ready == 0u)
+    {
+        if (GetTickCount64() - start >= timeoutMs)
+            return false;
+        Sleep(0);
+    }
+    return true;
+}
 bool Backend::Stopped() const
 {
     // Refused or failed to load/create (failed), or the runtime session poisoned by a fatal error

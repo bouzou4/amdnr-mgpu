@@ -24,6 +24,7 @@
 #include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
+#include <mgpu/MgpuHost.h> // [mgpu]
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static std::unordered_map<unsigned int, NVSDK_NGX_Feature> HandleToFeature;
@@ -1064,7 +1065,10 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
         DlssNr::AmdBridge::Restore(InParameters);
 
         if (evalSuccess)
+        {
             DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, state.currentCommandQueue, rrFeature);
+            MgpuHost::UpscaleEvaluated(InCmdList, InParameters, feature); // [mgpu] hook point: vectors + HUD-less pick
+        }
         else
             DlssNr::AmdBridge::UpscalerSkipped();
     }
