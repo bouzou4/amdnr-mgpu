@@ -843,6 +843,37 @@ void ProxySwapChain::PresenterLoop()
             }
         }
 
+        // Minimised or occluded (an exclusive fullscreen left by DXGI): nothing goes to the real back buffers until a
+        // test present says the window shows again. A present on them then hung the display card (DEVICE_HUNG).
+        if (_occluded || IsIconic(_hwnd))
+        {
+            const HRESULT t = IsIconic(_hwnd) ? DXGI_STATUS_OCCLUDED : _real->Present(0, DXGI_PRESENT_TEST);
+            if (t == DXGI_STATUS_OCCLUDED)
+            {
+                if (!_occluded)
+                    Log(0, std::format("window minimised or occluded at frame {}: frames dropped until it shows", g));
+                _occluded = true;
+                _dq->Wait(_filledD.Get(), g);
+                _dq->Signal(_releasedD.Get(), g);
+                _dq->Signal(_dFence.Get(), ++_dValue);
+                slotDisplayValue[s] = _dValue;
+                slotCounted[s] = false;
+                if (env.nrIdle)
+                    env.nrIdle("window minimised or occluded");
+                lk.lock();
+                _consumed = g;
+                lk.unlock();
+                _cv.notify_all();
+                if (_waitable)
+                    ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(released, 8), nullptr);
+                continue;
+            }
+            if (_occluded)
+                Log(0, std::format("window shows again at frame {} (test present {:X}): presenting", g, (uint32_t) t));
+            _occluded = false;
+            _nrReset = true;
+        }
+
         // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
         WaitFence(_dFence.Get(), slotDisplayValue[s], 500);
         double ingestMs = -1;
@@ -988,7 +1019,14 @@ void ProxySwapChain::PresenterLoop()
                 std::lock_guard sg(StatsMutex());
                 MutableStats().nrSource = whole ? "whole frame, UI included (no HUD-less colour)" : "HUD-less colour";
             }
-            if (!sizeHold && env.nrWanted && env.nrWanted() && env.nrFrame && (!_wantHud || useHud || whole))
+            const bool nrOn = env.nrWanted && env.nrWanted() && env.nrFrame;
+            const char* idle = sizeHold ? "NR held: window and swapchain sizes differ"
+                               : !nrOn  ? "NR off"
+                               : _wantHud && !useHud && !whole ? (_gateOn ? "HUD-less gate" : "no HUD-less colour this frame")
+                                                               : nullptr;
+            if (idle && env.nrIdle)
+                env.nrIdle(idle);
+            if (!idle)
             {
                 NrInput in;
                 const auto now = std::chrono::steady_clock::now();
@@ -1076,7 +1114,14 @@ void ProxySwapChain::PresenterLoop()
             if (sync == 0 && _tearing && !fs && !_tearingOff)
                 pf |= DXGI_PRESENT_ALLOW_TEARING;
             pfUsed = pf;
+            const auto tp = std::chrono::steady_clock::now();
             hr = _real->Present(sync, pf);
+            const double presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+            if (presentMs > 250 || hr != _lastPresentHr)
+                Log(presentMs > 250 ? 1 : 0, std::format("real Present {:X} in {:.0f} ms (frame {})", (uint32_t) hr, presentMs, g));
+            _lastPresentHr = hr;
+            if (hr == DXGI_STATUS_OCCLUDED)
+                _occluded = true;
             if (hr == DXGI_ERROR_INVALID_CALL && (pf & DXGI_PRESENT_ALLOW_TEARING))
             {
                 // DXGI still in (or leaving) exclusive fullscreen: no tearing until the next mode change
@@ -1176,7 +1221,7 @@ void ProxySwapChain::PresenterLoop()
 HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
 {
     if (flags & DXGI_PRESENT_TEST)
-        return S_OK;
+        return _occluded && !_lost ? DXGI_STATUS_OCCLUDED : S_OK;
     const auto& env = CurrentEnv();
     if (env.onPresent)
         env.onPresent();
@@ -1207,6 +1252,25 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             _dumpFrom = next + 1;
             _dumpTo = next + 1 + n;
             Log(0, std::format("dumping frames {}..{}", next + 1, next + n));
+        }
+        // Robustness test: minimise without activation for N s (default 4), then restore
+        const std::wstring mt = env.dumpDir + L"\\mgpu_minimize.trigger";
+        if (GetFileAttributesW(mt.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            int secs = 4;
+            if (FILE* fp = _wfopen(mt.c_str(), L"r"))
+            {
+                if (fscanf(fp, "%d", &secs) != 1 || secs < 1 || secs > 60)
+                    secs = 4;
+                fclose(fp);
+            }
+            DeleteFileW(mt.c_str());
+            Log(1, std::format("test: minimising the window for {} s at frame {}", secs, next));
+            ShowWindowAsync(_hwnd, SW_SHOWMINNOACTIVE);
+            std::thread([h = _hwnd, secs] {
+                Sleep(DWORD(secs) * 1000);
+                ShowWindowAsync(h, SW_SHOWNOACTIVATE);
+            }).detach();
         }
     }
     if (next >= _dumpFrom && next < _dumpTo)
@@ -1328,8 +1392,15 @@ HRESULT ProxySwapChain::EnterFallback()
     _lost = true;
     ReleaseBuffers(true);
     {
+        // releasing a swapchain in exclusive fullscreen raises an exception in DXGI (the game crashed)
         std::lock_guard g(_scMutex);
+        BOOL fs = FALSE;
+        if (SUCCEEDED(_real->GetFullscreenState(&fs, nullptr)) && fs)
+            Log(1, std::format("leaving exclusive fullscreen before the fallback: {:X}",
+                               (uint32_t) _real->SetFullscreenState(FALSE, nullptr)));
         _real.Reset();
+        _fsCached = FALSE;
+        _fsDesc.Windowed = TRUE;
     }
     DXGI_SWAP_CHAIN_DESC1 d = _gameDesc;
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -1364,6 +1435,8 @@ HRESULT ProxySwapChain::EnterFallback()
 
 HRESULT ProxySwapChain::PresentFallback(UINT sync, UINT flags)
 {
+    if (CurrentEnv().nrIdle)
+        CurrentEnv().nrIdle("display card lost: single-GPU fallback, NR off");
     const UINT i = _bbIndex;
     HRESULT hr;
     {
@@ -1380,8 +1453,13 @@ HRESULT ProxySwapChain::PresentFallback(UINT sync, UINT flags)
             pf |= DXGI_PRESENT_ALLOW_TEARING;
         hr = _real->Present(sync, pf);
     }
-    if (FAILED(hr))
-        Log(2, std::format("fallback Present failed {:X}", (uint32_t) hr));
+    if (hr != _lastPresentHr)
+        Log(FAILED(hr) ? 2 : 0, std::format("fallback Present {:X}, window {}", (uint32_t) hr,
+                                            IsIconic(_hwnd) ? "minimised" : "shown"));
+    _lastPresentHr = hr;
+    // a cross-adapter swapchain can report occluded while its window shows; games throttle on it
+    if (hr == DXGI_STATUS_OCCLUDED && !IsIconic(_hwnd))
+        hr = S_OK;
     {
         std::lock_guard cg(_capM);
         _bbIndex = (i + 1) % _gameCount;

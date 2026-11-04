@@ -191,6 +191,17 @@ NrStats NrEngine::Stats()
     s.hipMs = Median(_hipSamples, _hipCount);
     s.networkMs = Median(_netSamples, _netCount);
     s.frameInfoSize = _frameInfoSize;
+    auto mean = [](const float* v, uint32_t n)
+    {
+        const uint32_t k = std::min(n, kMeterWindow);
+        double sum = 0;
+        for (uint32_t i = 0; i < k; i++)
+            sum += v[i];
+        return k ? float(sum / k) : NAN;
+    };
+    s.flkStatic = mean(_flkStatic, _flkStaticN);
+    s.flkMc = mean(_flkMc, _flkMcN);
+    s.flkFrames = std::min(_flkStaticN, kMeterWindow);
     if (_ctx != nullptr && _rt.api.GetStatus != nullptr && _state == State::Ready)
     {
         char buf[512] = {};
@@ -354,6 +365,15 @@ bool NrEngine::CreatePipelines()
     pd.CS = { stats->GetBufferPointer(), stats->GetBufferSize() };
     if (FAILED(_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_psoStats))))
         return Fail("pipeline creation failed"), false;
+    ComPtr<ID3DBlob> meter;
+    if (SUCCEEDED(compile(kMeterSource, sizeof(kMeterSource) - 1, "lmxxf_nr_meter", nullptr, nullptr, "Meter", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &meter, &err)))
+    {
+        pd.CS = { meter->GetBufferPointer(), meter->GetBufferSize() };
+        _device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_psoMeter));
+    }
+    if (!_psoMeter)
+        Log(OptiLog_Warn, "flicker meter shader failed: %s", err ? (const char*) err->GetBufferPointer() : "?");
 
     D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSlots * kSlotDescriptors,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
@@ -422,6 +442,7 @@ bool NrEngine::CreateSession()
     if (rc != LMXXF_NR_OK)
         return Fail("PrepareSession failed: " + std::to_string(rc) + " " + _rt.LastError()), false;
     _frameInfoSize = 0;
+    _sessionFull = false;
     return true;
 }
 
@@ -442,8 +463,11 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
     // FULL_NETWORK pins the runtime to one Full pass; 2-3 passes are DLSS5_MULTI_PASS without the flag
     const bool full = _rt.Native() && ((_settings.model == 0 && _settings.Passes() == 1) || _forceFull);
     fi.flags = full ? LMXXF_NR_FRAME_FLAG_FULL_NETWORK_EXT : 0;
+    // a FULL frame then one without it in the same session releases the pin
     if (full)
-        g_fullSent = true;
+        g_fullSent = _sessionFull = true;
+    else if (_sessionFull)
+        g_fullSent = _sessionFull = false;
     fi.transfer_strength = 1.0f;
     fi.color_strength = 1.0f;
     fi.model_scale = 1.0f;
@@ -478,6 +502,8 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
         t.motion_scale_x = _motion.scaleX;
         t.motion_scale_y = _motion.scaleY;
         t.history_reset = (_motion.reset || _extentReset) ? 1 : 0;
+        if (t.history_reset)
+            _resetFrame = _frameId;
         _extentReset = false;
         t.passes = 1;
         t.exposure = fi.exposure;
@@ -686,6 +712,8 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
         _stats.error.clear();
         _stats.feedWidth = _feedW;
         _stats.feedHeight = _feedH;
+        _readyFrame = _frameId;
+        _meterPrevValid = false;
         _state = State::Ready;
     }
     _mutex.unlock();
@@ -695,6 +723,7 @@ void NrEngine::ReadTimings()
 {
     FinishDump();
     SeqPoll();
+    MeterRead();
     if (_readback && _tsFreq > 0)
     {
         const uint64_t done = _hipFence->GetCompletedValue();
@@ -778,6 +807,10 @@ bool NrEngine::Begin(ID3D12Device* device, ID3D12CommandQueue* queue, uint32_t s
     // Ready: a new network size or new runtime settings rebuild off the render thread
     if (dirty || feedW != _feedW || feedH != _feedH)
     {
+        {
+            std::lock_guard lock(_mutex);
+            SeqRestart("the network is being rebuilt");
+        }
         _state = State::Preparing;
         if (_worker.joinable())
             _worker.join();
@@ -817,7 +850,7 @@ void NrEngine::OnUpscale(OptiUpscaleFrame* f, bool after)
         return;
 
     if (!Begin(static_cast<ID3D12Device*>(f->device), static_cast<ID3D12CommandQueue*>(f->commandQueue), srcW, srcH))
-        return;
+        return SeqIdle(_state == State::Failed ? "NR failed" : "the network is being built");
 
     std::lock_guard lock(_mutex);
     if (_state != State::Ready)
@@ -868,6 +901,10 @@ void NrEngine::Produce(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* 
 {
     const bool produced = PrepareJob(list, frame);
     _jobSeq = -1;
+    if (produced && _seqActive && _seqNext > 0 && _resetFrame == _frameId)
+        SeqRestart("history reset");
+    _jobMotion = _motion;
+    _jobReset = _motion.reset || _resetFrame == _frameId;
     _lastFedUpscale = produced && _motion.res != nullptr ? _motionUpscale : 0;
     if (produced)
     {
@@ -896,6 +933,19 @@ void NrEngine::Produce(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* 
                 name.c_str(), Median(_hipSamples, _hipCount), Median(_netSamples, _netCount),
                 (unsigned long long) _stats.framesRun, (unsigned long long) _stats.framesSkipped, _stats.srcWidth,
                 _stats.srcHeight, _feedW, _feedH, (int) _stats.temporal, hip ? hip : "-");
+        }
+        if (_stats.framesRun % 180 == 0 && (_flkStaticN || _flkMcN))
+        {
+            {
+                double fs = 0, fm = 0;
+                const uint32_t ns = std::min(_flkStaticN, kMeterWindow), nm = std::min(_flkMcN, kMeterWindow);
+                for (uint32_t i = 0; i < ns; i++)
+                    fs += _flkStatic[i];
+                for (uint32_t i = 0; i < nm; i++)
+                    fm += _flkMc[i];
+                Log(OptiLog_Info, "flicker (%ls): still %+.5f, moving %+.5f (answer minus input change, last %u / %u frames)",
+                    name.c_str(), ns ? fs / ns : 0.0, nm ? fm / nm : 0.0, ns, nm);
+            }
         }
     }
     else
@@ -1274,7 +1324,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     const uint32_t w = (uint32_t) bd.Width, h = bd.Height;
 
     if (!Begin(static_cast<ID3D12Device*>(f->device), queue, w, h))
-        return;
+        return SeqIdle(_state == State::Failed ? "NR failed" : "the network is being built");
 
     std::unique_lock lock(_mutex);
     if (_state != State::Ready)
@@ -1341,6 +1391,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         list->CopyResource(bb, _termOut.Get());
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
         MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud);
+        Meter(list, enh, false);
     }
 
     // Feed the HUD-less colour, linearised, with the vectors of the evaluate of this frame
@@ -1462,7 +1513,10 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     const auto sd = in.src->GetDesc();
     const uint32_t w = (uint32_t) sd.Width, h = sd.Height;
     if (!Begin(device, queue, w, h))
+    {
+        SeqIdle(_state == State::Failed ? "NR failed" : "the network is being built");
         return false;
+    }
 
     std::unique_lock lock(_mutex);
     if (_state != State::Ready || !EnsureCopies(sd))
@@ -1573,6 +1627,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         if (enh != nullptr)
         {
             apply(list, enh, false);
+            Meter(list, enh, true);
             wrote = true;
         }
         lock.unlock();
@@ -1592,6 +1647,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         apply(list, enh, true);
         wrote = true;
     }
+    Meter(list, enh, false); // the vectors are this frame's, not the answer's
     feed(list);
     Produce(list, nullptr, wait);
     lock.unlock();
@@ -1631,6 +1687,118 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
     Log(OptiLog_Info, "dump recorded (%ls)", name.c_str());
 }
 
+void NrEngine::Meter(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, bool jobMotionValid)
+{
+    if (!_settings.meter || !_psoMeter || enh == nullptr || !_feed || !_presentFence)
+        return;
+    const auto ed = enh->GetDesc();
+    if (ed.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || ed.Width < _feedW || ed.Height < _feedH)
+        return;
+    if (!_meterPrev || _meterPrev->GetDesc().Width != 2ull * _feedW || _meterPrev->GetDesc().Height != _feedH)
+    {
+        _meterPrev = Texture(_device.Get(), 2 * _feedW, _feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, false, kRead);
+        _meterPrevValid = false;
+    }
+    if (!_meterAcc)
+    {
+        _meterAcc = Texture(_device.Get(), 8, 1, DXGI_FORMAT_R32_UINT, true, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_RESOURCE_DESC b {};
+        b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        b.Width = 256;
+        b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+        b.SampleDesc.Count = 1;
+        b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES up { D3D12_HEAP_TYPE_UPLOAD }, rp { D3D12_HEAP_TYPE_READBACK };
+        _device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                         IID_PPV_ARGS(&_meterZero));
+        b.Width = 256 * kMeterSlots;
+        _device->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                         IID_PPV_ARGS(&_meterReadback));
+        void* z = nullptr;
+        if (_meterZero && SUCCEEDED(_meterZero->Map(0, nullptr, &z)))
+            memset(z, 0, 256), _meterZero->Unmap(0, nullptr);
+    }
+    if (!_meterPrev || !_meterAcc || !_meterZero || !_meterReadback)
+        return;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+    fp.Footprint = { DXGI_FORMAT_R32_UINT, 8, 1, 1, 256 };
+    D3D12_TEXTURE_COPY_LOCATION acc { _meterAcc.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    const uint32_t slot = _meterNext % kMeterSlots;
+    if (_meterPrevValid && !_jobReset && _meterValue[slot] == 0)
+    {
+        D3D12_TEXTURE_COPY_LOCATION zero { _meterZero.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        zero.PlacedFootprint = fp;
+        list->CopyTextureRegion(&acc, 0, 0, 0, &zero, nullptr);
+        Barrier(list, _meterAcc.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ShaderConstants c {};
+        c.sizeX = _feedW;
+        c.sizeY = _feedH;
+        ID3D12Resource* mv = jobMotionValid ? _jobMotion.res : nullptr;
+        if (mv != nullptr && _jobMotion.w > 0 && _jobMotion.h > 0)
+        {
+            c.useMv = 1;
+            c.srcUvScaleX = float(_jobMotion.w);
+            c.srcUvScaleY = float(_jobMotion.h);
+            c.mvToUvX = _jobMotion.scaleX;
+            c.mvToUvY = _jobMotion.scaleY;
+            if (_jobMotion.state != kRead)
+                Barrier(list, mv, _jobMotion.state, kRead);
+        }
+        ID3D12Resource* srv[4] = { _feed.Get(), enh, _meterPrev.Get(), c.useMv ? mv : nullptr };
+        const DXGI_FORMAT fmt[4] = { DXGI_FORMAT_R16G16B16A16_FLOAT, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                     c.useMv ? mv->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT };
+        Dispatch(list, _psoMeter.Get(), c, srv, fmt, _meterAcc.Get(), DXGI_FORMAT_R32_UINT, _feedW, _feedH);
+        if (c.useMv && _jobMotion.state != kRead)
+            Barrier(list, mv, kRead, _jobMotion.state);
+        Barrier(list, _meterAcc.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION rb { _meterReadback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        rb.PlacedFootprint = fp;
+        rb.PlacedFootprint.Offset = 256ull * slot;
+        list->CopyTextureRegion(&rb, 0, 0, 0, &acc, nullptr);
+        Barrier(list, _meterAcc.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        _meterValue[slot] = _presentCounter; // this own list's present fence value
+        _meterNext++;
+    }
+    // this pair is the next one's previous
+    const D3D12_BOX box { 0, 0, 0, _feedW, _feedH, 1 };
+    D3D12_TEXTURE_COPY_LOCATION prev { _meterPrev.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION fed { _feed.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION out { enh, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    Barrier(list, _meterPrev.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+    Barrier(list, _feed.Get(), kRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(list, enh, kRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyTextureRegion(&prev, 0, 0, 0, &fed, &box);
+    list->CopyTextureRegion(&prev, _feedW, 0, 0, &out, &box);
+    Barrier(list, enh, D3D12_RESOURCE_STATE_COPY_SOURCE, kRead);
+    Barrier(list, _feed.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, kRead);
+    Barrier(list, _meterPrev.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+    _meterPrevValid = true;
+}
+
+void NrEngine::MeterRead()
+{
+    if (!_meterReadback || !_presentFence)
+        return;
+    const uint64_t done = _presentFence->GetCompletedValue();
+    for (uint32_t i = 0; i < kMeterSlots; i++)
+    {
+        if (_meterValue[i] == 0 || _meterValue[i] > done)
+            continue;
+        _meterValue[i] = 0;
+        const uint32_t* a = nullptr;
+        D3D12_RANGE r { 256ull * i, 256ull * i + 24 };
+        if (FAILED(_meterReadback->Map(0, &r, (void**) &a)))
+            continue;
+        const uint32_t* v = a + 64 * i;
+        if (v[0] >= 1000)
+            _flkStatic[_flkStaticN++ % kMeterWindow] = float((double(v[1]) - double(v[2])) / (kMeterScale * v[0]));
+        if (v[3] >= 1000)
+            _flkMc[_flkMcN++ % kMeterWindow] = float((double(v[4]) - double(v[5])) / (kMeterScale * v[3]));
+        D3D12_RANGE none { 0, 0 };
+        _meterReadback->Unmap(0, &none);
+    }
+}
+
 void NrEngine::SeqCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES state, SeqImage& img)
 {
     img.desc = res->GetDesc();
@@ -1663,19 +1831,33 @@ void NrEngine::SeqPoll()
         return;
     if (!_seqActive)
     {
-        const std::wstring trigger = dumpDir + L"\\lmxxf_nr_seq.trigger";
-        if ((_frameId % 8) != 0 || GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
+        if ((_frameId % 8) != 0)
             return;
-        int n = 0;
-        if (FILE* t = _wfopen(trigger.c_str(), L"rb"))
+        if (_seqPending == 0)
         {
-            if (fscanf(t, "%d", &n) != 1)
-                n = 0;
-            fclose(t);
+            const std::wstring trigger = dumpDir + L"\\lmxxf_nr_seq.trigger";
+            if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
+                return;
+            int n = 0;
+            if (FILE* t = _wfopen(trigger.c_str(), L"rb"))
+            {
+                if (fscanf(t, "%d", &n) != 1)
+                    n = 0;
+                fclose(t);
+            }
+            DeleteFileW(trigger.c_str());
+            _seqPending = n >= 2 ? std::min(n, 48) : 12;
         }
-        DeleteFileW(trigger.c_str());
+        // a sequence never spans a session rebuild or a history reset
+        if (_dirty)
+            return SeqIdle("settings changed, the network is about to be rebuilt");
+        if (_frameId < _readyFrame + kSeqSettle)
+            return SeqIdle("network rebuilt, waiting for it to settle");
+        if (_frameId < _resetFrame + kSeqSettle)
+            return SeqIdle("history reset, waiting for it to settle");
         _seq.clear();
-        _seq.resize(n >= 2 ? std::min(n, 48) : 12);
+        _seq.resize(_seqPending);
+        _seqPending = 0;
         _seqNext = 0;
         _seqWait = 0;
         _jobSeq = -1;
@@ -1686,6 +1868,31 @@ void NrEngine::SeqPoll()
     if (_seqNext < _seq.size() || ++_seqWait < 4)
         return;
     SeqWrite();
+}
+
+void NrEngine::SeqIdle(const char* why)
+{
+    if (dumpDir.empty())
+        return;
+    const bool pending = _seqPending != 0 || _seqActive ||
+                         GetFileAttributesW((dumpDir + L"\\lmxxf_nr_seq.trigger").c_str()) != INVALID_FILE_ATTRIBUTES;
+    const DWORD now = GetTickCount();
+    if (!pending || (now - _seqIdleTick < 10000 && _seqIdleWhy == why))
+        return;
+    _seqIdleTick = now;
+    _seqIdleWhy = why;
+    Log(OptiLog_Info, "sequence dump pending (%ls): %s", name.c_str(), why);
+}
+
+void NrEngine::SeqRestart(const char* why)
+{
+    if (!_seqActive)
+        return;
+    _seqPending = (uint32_t) _seq.size();
+    _seq.clear();
+    _seqActive = false;
+    _jobSeq = -1;
+    Log(OptiLog_Info, "sequence dump restarted (%ls): %s", name.c_str(), why);
 }
 
 void NrEngine::SeqWrite()

@@ -215,3 +215,84 @@ struct ShaderConstants
     float expoMul;
 };
 static_assert(sizeof(ShaderConstants) == 80);
+
+// Flicker meter, tools/seq_metrics.py on the GPU: per pixel of the feed, the change of the network's answer against
+// the change of its input (display encoding), on still pixels and on visible moving pixels (warped with the vectors).
+// Acc: still count, still |dO|, still |dI|, moving count, moving |dO|, moving |dI| (sums x kMeterScale, per group)
+inline constexpr float kMeterScale = 1024.0f;
+inline constexpr const char kMeterSource[] = R"(
+Texture2D<float4> Fed : register(t0);
+Texture2D<float4> Enh : register(t1);
+Texture2D<float4> Prev : register(t2); // last pair: fed in [0, W), answer in [W, 2W)
+Texture2D<float4> Mv : register(t3);
+RWTexture2D<uint> Acc : register(u0);
+cbuffer C : register(b0)
+{
+    uint2 Size;
+    float2 MvExtent; // active size of the vectors
+    float2 Unused0;
+    float2 MvScale;  // raw vector -> feed pixels toward the previous frame
+    float2 Unused1, Unused2;
+    float Unused3;
+    uint UseMv;
+};
+float3 E(float3 c) { return pow(saturate(c), 1.0 / 2.2); }
+float Max3(float3 v) { return max(v.x, max(v.y, v.z)); }
+float Mean3(float3 v) { return (v.x + v.y + v.z) / 3.0; }
+float3 P(int2 p, uint side) { return E(Prev.Load(int3(p + int2(side * Size.x, 0), 0)).rgb); }
+float3 Warp(float2 q, uint side)
+{
+    q = clamp(q, 0, float2(Size) - 1);
+    int2 a = int2(floor(q));
+    int2 b = min(a + 1, int2(Size) - 1);
+    float2 f = q - a;
+    return lerp(lerp(P(a, side), P(int2(b.x, a.y), side), f.x), lerp(P(int2(a.x, b.y), side), P(b, side), f.x), f.y);
+}
+groupshared float gs[6][64];
+[numthreads(8, 8, 1)]
+void Meter(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    float v[6] = { 0, 0, 0, 0, 0, 0 };
+    if (id.x < Size.x && id.y < Size.y)
+    {
+        int2 p = int2(id.xy);
+        float3 I = E(Fed.Load(int3(p, 0)).rgb), O = E(Enh.Load(int3(p, 0)).rgb);
+        float3 Ip = P(p, 0), Op = P(p, 1);
+        float2 d = 0;
+        if (UseMv)
+        {
+            uint2 t = min(uint2((float2(p) + 0.5) * MvExtent / float2(Size)), uint2(MvExtent) - 1);
+            d = Mv.Load(int3(t, 0)).xy * MvScale;
+        }
+        float mag = length(d);
+        if (mag < 0.25 && Max3(abs(I - Ip)) < 0.06)
+        {
+            v[0] = 1; v[1] = Mean3(abs(O - Op)); v[2] = Mean3(abs(I - Ip));
+        }
+        float2 q = float2(p) + d;
+        if (UseMv && mag >= 0.5 && all(q >= 0) && all(q <= float2(Size) - 1))
+        {
+            float3 wI = Warp(q, 0);
+            if (Max3(abs(I - wI)) < 0.06)
+            {
+                v[3] = 1; v[4] = Mean3(abs(O - Warp(q, 1))); v[5] = Mean3(abs(I - wI));
+            }
+        }
+    }
+    [unroll] for (uint k = 0; k < 6; k++)
+        gs[k][gi] = v[k];
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 32; s > 0; s >>= 1)
+    {
+        if (gi < s)
+            [unroll] for (uint k = 0; k < 6; k++)
+                gs[k][gi] += gs[k][gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi < 6)
+    {
+        uint o;
+        InterlockedAdd(Acc[uint2(gi, 0)], uint(gs[gi][0] * (gi == 0 || gi == 3 ? 1.0 : 1024.0) + 0.5), o);
+    }
+}
+)";

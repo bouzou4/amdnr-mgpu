@@ -254,6 +254,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     e.nrFrame = NrFrame;
     e.nrSettle = [] { DisplayEngine().SettleOwn(); };
     e.nrQuiesce = [] { DisplayEngine().Quiesce(); };
+    e.nrIdle = [](const char* why) { DisplayEngine().SeqIdle(why); };
     e.nrWanted = [] { return Engine().Settings().enabled; };
     e.nrStatus = []
     {

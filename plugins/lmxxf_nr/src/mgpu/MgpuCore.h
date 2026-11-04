@@ -68,6 +68,7 @@ struct Env
     std::function<bool()> nrWanted;
     std::function<void()> nrSettle; // before the present of a frame nrFrame ran on
     std::function<void()> nrQuiesce; // NR's queued work is done: the resources it was given may be freed
+    std::function<void(const char*)> nrIdle; // no NR this frame, and why (sequence dump requests log it)
     std::function<std::string()> nrStatus;
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it

@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -51,6 +52,7 @@ struct NrSettings
     bool serialize = false; // the game queue waits for the network right away (measuring, like inline NR)
     float paperWhite = 200.0f; // HDR output: nits the network's 1.0 maps to
     bool wholeFrameFallback = true; // terminal without a HUD-less colour: NR on the whole frame, UI included
+    bool meter = true; // flicker meter on the network's answers (own-list placements)
 };
 
 struct NrStats
@@ -73,6 +75,9 @@ struct NrStats
     bool bypassed = false;   // the guard tripped: the edit is not applied
     std::string status; // GetStatus
     std::string source; // terminal: what the network is fed and where the edit goes
+    // Flicker meter, seq_metrics units: answer change minus input change, mean of the last frames (NAN: none)
+    float flkStatic = NAN, flkMc = NAN;
+    uint32_t flkFrames = 0;
 };
 
 // One lmxxf session on the game's device, driven from the upscale callbacks
@@ -109,6 +114,7 @@ class NrEngine
     };
     bool RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in);
     void SettleOwn(); // before presenting a RunOwn frame: its network answer is done
+    void SeqIdle(const char* why); // no NR this frame: logs why a requested sequence dump waits (rate-limited)
     void Quiesce();   // CPU wait for all queued network work: its inputs may be freed after
     // Leaves the session alone: the game card's engine while the display card runs NR
     void SetSuspended(bool s) { _suspended = s; }
@@ -249,6 +255,7 @@ class NrEngine
     uint32_t _histSrcW = 0, _histSrcH = 0; // source extent the history was built on
     bool _extentReset = false;
     bool _forceFull = false; // warm-up job that moves the runtime's model pin, see WarmUp
+    bool _sessionFull = false; // this session's last frame had FULL_NETWORK
     uint32_t _loggedMvFlags = ~0u;
     uint64_t _motionUpscale = 0; // upscale frame of _motion
     void LogMotion(const OptiUpscaleFrame* f);
@@ -287,7 +294,26 @@ class NrEngine
     uint32_t _seqWait = 0;    // frames since the last answer was recorded
     bool _seqActive = false;
     ID3D12CommandQueue* _ownQueue = nullptr; // where our own lists last ran
+    // Flicker meter (kMeterSource): one dispatch per consumed answer on our own lists, read back frames later
+    static constexpr uint32_t kMeterSlots = 4, kMeterWindow = 60;
+    ComPtr<ID3D12PipelineState> _psoMeter;
+    ComPtr<ID3D12Resource> _meterPrev, _meterAcc, _meterZero, _meterReadback;
+    uint64_t _meterValue[kMeterSlots] = {};
+    uint32_t _meterNext = 0;
+    bool _meterPrevValid = false;
+    float _flkStatic[kMeterWindow] = {}, _flkMc[kMeterWindow] = {};
+    uint32_t _flkStaticN = 0, _flkMcN = 0;
+    MotionIn _jobMotion; // of the job in flight
+    bool _jobReset = false;
+    void Meter(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, bool jobMotionValid);
+    void MeterRead();
     void SeqPoll();
+    void SeqRestart(const char* why);
+    static constexpr uint64_t kSeqSettle = 30; // jobs after a rebuild or a history reset before a sequence starts
+    uint32_t _seqPending = 0; // frames of a requested sequence not started yet
+    uint64_t _readyFrame = 0, _resetFrame = 0;
+    DWORD _seqIdleTick = 0;
+    const char* _seqIdleWhy = nullptr;
     void SeqCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES state, SeqImage& img);
     void SeqWrite();
 
