@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 #include <chrono>
+#include <deque>
 
 namespace Mgpu
 {
@@ -87,7 +88,17 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     void StartPresenter();
     void StopPresenter();
     void PresenterLoop();
+    struct Job
+    {
+        UINT64 g = 0, gameValue = 0;
+        UINT i = 0, sync = 0, flags = 0;
+        std::chrono::steady_clock::time_point t;
+    };
+    void SenderLoop();
+    void Send(const Job& j);
     void DrainRender();
+    HRESULT CreatePerf();
+    void EnsureDummy(unsigned mb, int dst, bool onGame);
     HRESULT DoPresent(UINT sync, UINT flags);
 
     static constexpr UINT K = 3; // ring slots
@@ -136,7 +147,10 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     // ring state, guarded by _m
     std::mutex _m;
     std::condition_variable _cv;
-    UINT64 _scheduled = 0, _consumed = 0;
+    UINT64 _scheduled = 0, _consumed = 0; // sent (sender thread), presented
+    std::atomic<UINT64> _queued { 0 };     // handed to the sender by the game's Present
+    std::deque<Job> _jobs;
+    std::thread _sender;
     UINT64 _picked[K] {}; // last frame the display card took from each slot
     UINT _sync[K] {}, _flags[K] {};
     std::chrono::steady_clock::time_point _tSched[K];
@@ -155,18 +169,33 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     bool _wantHud = false, _wantMv = false;
     std::mutex _capM;
     std::vector<ComPtr<ID3D12Resource>> _hudR, _mvR, _graveR;
-    std::vector<UINT64> _hudTag, _mvTag; // frame id each staging holds
+    std::vector<UINT64> _hudTag, _mvTag, _diffTag; // frame id each staging (and its tile flags) holds
+    class TileDiff* _diff = nullptr;
     std::vector<Guides> _mvConst;
     UINT64 _hudOffset = 0, _mvOffset = 0, _mvCap = 0;
     ComPtr<ID3D12CommandAllocator> _rxAlloc[K];
     ComPtr<ID3D12GraphicsCommandList> _rxList[K];
+    struct TileRun
+    {
+        UINT x, y, w, h;
+        UINT64 offset;
+    };
     struct SlotMeta
     {
         bool hud = false, mv = false;
+        bool tiles = false; // hud holds only the runs, the rest of the HUD-less colour is the back buffer
+        std::vector<TileRun> runs;
         Guides g;
         D3D12_RESOURCE_DESC mvDesc {};
     } _meta[K];
     bool _loggedHudFmt = false, _loggedMvFmt = false;
+
+    // perf experiments
+    ComPtr<ID3D12Resource> _dummySrc, _dummyDst;
+    ComPtr<ID3D12Heap> _dummyHeap;
+    ComPtr<ID3D12CommandAllocator> _dummyAlloc[K], _rgAlloc[K];
+    ComPtr<ID3D12GraphicsCommandList> _dummyList[K], _rgList[K];
+    UINT64 _dummyKey = 0;
 
     // display card
     ComPtr<ID3D12Resource> _hudD, _mvD, _nrD, _bbD, _compD;

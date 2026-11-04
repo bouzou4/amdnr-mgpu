@@ -8,6 +8,7 @@
 #include <string>
 #include <cstdint>
 #include <mutex>
+#include <atomic>
 
 namespace Mgpu
 {
@@ -24,6 +25,12 @@ struct Settings
     double uiGate = 0.90;      // HUD-less: above this share of differing pixels the pair is wrong: no NR that frame
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
     bool dred = false;         // DRED breadcrumbs and page faults on the display device (diagnostics)
+    // Perf experiments (MgpuPerf*): skip bits 1 frame send, 2 extras send, 4 HUD-less capture, 8 vector capture
+    unsigned perfSkip = 0;
+    unsigned perfDummyMB = 0; // extra bytes copied per frame on the send queue
+    int perfDummyDst = 0;     // 0 shared (system memory), 1 render card VRAM
+    bool perfSendOnGame = false; // send on the game's queue instead of a copy queue
+    int perfCopyPrio = 1;     // send queue priority: 0 normal, 1 high
 };
 
 // Once per device: removed reason and, with DRED on, the page fault and the last breadcrumbs
@@ -97,6 +104,7 @@ struct Stats
     std::string nrStatus;
     uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0;
     double uiShare = -1; // share of pixels the UI composite took from the back buffer, last measured
+    double hudTileShare = -1; // share of HUD-less tiles sent (they differ from the back buffer)
 };
 
 void Configure(const Settings& s, const Env& e);
@@ -128,6 +136,16 @@ bool WantHudless();
 void CaptureGuides(ID3D12GraphicsCommandList* cl, const Guides& g);
 void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state);
 Stats GetStats();
+
+// Perf experiment knobs, switchable while running (perf.txt in the dump folder)
+struct PerfKnobs
+{
+    std::atomic<unsigned> skip { 0 }, dummyMB { 0 };
+    std::atomic<int> dummyDst { 0 };
+    std::atomic<bool> onGame { false };
+    std::atomic<unsigned> lead { 0 }; // 0: MaxFramesAhead
+};
+PerfKnobs& Perf();
 
 // internal
 void Log(int level, const std::string& s);
