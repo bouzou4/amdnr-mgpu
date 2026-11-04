@@ -1,0 +1,12 @@
+add_library(sl_tap SHARED sl_tap.cpp)
+set(FFX_INC ${PROJECT_SOURCE_DIR}/third_party/ffx/Kits/FidelityFX)
+target_include_directories(sl_tap PRIVATE ${PROJECT_SOURCE_DIR}/third_party/streamline/include
+  ${FFX_INC}/api/include ${FFX_INC}/framegeneration/include ${FFX_INC}/upscalers/include)
+target_compile_definitions(sl_tap PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(sl_tap PRIVATE d3d12 dxgi gdi32)
+add_executable(sl_tap_launch launch.cpp)
+target_compile_definitions(sl_tap_launch PRIVATE _CRT_SECURE_NO_WARNINGS)
+if(MSVC)
+  target_compile_options(sl_tap PRIVATE /W3 /permissive- /utf-8 /wd4996)
+  target_compile_options(sl_tap_launch PRIVATE /W3 /permissive- /utf-8)
+endif()

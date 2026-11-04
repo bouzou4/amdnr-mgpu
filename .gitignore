@@ -1,0 +1,17 @@
+# Local captures, downloads, build trees and reference clones
+data/
+
+# Build output
+mgpu/tools/build/
+mgpu/tools/third_party/
+x64/
+.vs/
+
+# Never commit runtimes, weights or third-party binaries
+*.dll
+*.exe
+*.pak
+*.bin
+*.hsaco
+*weights*
+nvngx_*

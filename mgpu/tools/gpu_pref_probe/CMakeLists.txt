@@ -1,0 +1,5 @@
+add_executable(gpu_pref_probe main.cpp)
+target_link_libraries(gpu_pref_probe PRIVATE d3d12 d3d11 dxgi gdi32)
+if(MSVC)
+  target_compile_options(gpu_pref_probe PRIVATE /W3 /permissive- /utf-8)
+endif()
