@@ -25,6 +25,13 @@ struct Slot
     VkSemaphore done = VK_NULL_HANDLE;
 };
 
+struct Shared
+{
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    ID3D12Resource* res = nullptr;
+};
+
 struct Bridge
 {
     VkDevice device = VK_NULL_HANDLE;
@@ -40,9 +47,9 @@ struct Bridge
     bool ready = false;
     bool failed = false;
     uint32_t family = UINT32_MAX;
-    VkImage sharedImage = VK_NULL_HANDLE;
-    VkDeviceMemory sharedMemory = VK_NULL_HANDLE;
-    ID3D12Resource* sharedResource = nullptr;
+    Shared frame;
+    Shared hudless;
+    uint64_t hudlessFrame = 0; // present frameId the HUD-less copy belongs to
     ID3D12Device* d3d = nullptr;
     ID3D12CommandQueue* queue = nullptr;
     ID3D12Fence* fence = nullptr;
@@ -117,21 +124,23 @@ void Release()
         vkDestroyCommandPool(b.device, b.pool, nullptr);
     if (b.timeline != VK_NULL_HANDLE)
         vkDestroySemaphore(b.device, b.timeline, nullptr);
-    if (b.sharedImage != VK_NULL_HANDLE)
-        vkDestroyImage(b.device, b.sharedImage, nullptr);
-    if (b.sharedMemory != VK_NULL_HANDLE)
-        vkFreeMemory(b.device, b.sharedMemory, nullptr);
-    if (b.sharedResource != nullptr)
-        b.sharedResource->Release();
+    for (auto* sh : { &b.frame, &b.hudless })
+    {
+        if (sh->image != VK_NULL_HANDLE)
+            vkDestroyImage(b.device, sh->image, nullptr);
+        if (sh->memory != VK_NULL_HANDLE)
+            vkFreeMemory(b.device, sh->memory, nullptr);
+        if (sh->res != nullptr)
+            sh->res->Release();
+        *sh = {};
+    }
+    b.hudlessFrame = 0;
     if (b.fence != nullptr)
         b.fence->Release();
     if (b.queue != nullptr)
         b.queue->Release();
     b.pool = VK_NULL_HANDLE;
     b.timeline = VK_NULL_HANDLE;
-    b.sharedImage = VK_NULL_HANDLE;
-    b.sharedMemory = VK_NULL_HANDLE;
-    b.sharedResource = nullptr;
     b.fence = nullptr;
     b.queue = nullptr;
     b.d3d = nullptr;
@@ -195,20 +204,9 @@ bool CreateD3D12()
     return true;
 }
 
-bool CreateShared()
+bool MakeShared(Shared& out, const wchar_t* name, DXGI_FORMAT dxgi, PFN_vkGetMemoryWin32HandlePropertiesKHR getMemProps)
 {
     auto& b = _b;
-    auto getMemProps = (PFN_vkGetMemoryWin32HandlePropertiesKHR) vkGetDeviceProcAddr(
-        b.device, "vkGetMemoryWin32HandlePropertiesKHR");
-    auto importSem =
-        (PFN_vkImportSemaphoreWin32HandleKHR) vkGetDeviceProcAddr(b.device, "vkImportSemaphoreWin32HandleKHR");
-    if (getMemProps == nullptr || importSem == nullptr)
-        return Fail("external memory / semaphore functions missing");
-
-    const DXGI_FORMAT dxgi = ToDxgi(b.format);
-    if (dxgi == DXGI_FORMAT_UNKNOWN)
-        return Fail("unsupported swapchain format");
-
     // The shared image (D3D12 owns the memory)
     D3D12_HEAP_PROPERTIES hp {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -222,12 +220,12 @@ bool CreateShared()
     rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
     if (b.d3d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                       IID_PPV_ARGS(&b.sharedResource)) != S_OK)
+                                       IID_PPV_ARGS(&out.res)) != S_OK)
         return Fail("CreateCommittedResource");
-    b.sharedResource->SetName(L"OptiScaler Vulkan present image");
+    out.res->SetName(name);
 
     HANDLE h = nullptr;
-    if (b.d3d->CreateSharedHandle(b.sharedResource, nullptr, GENERIC_ALL, nullptr, &h) != S_OK)
+    if (b.d3d->CreateSharedHandle(out.res, nullptr, GENERIC_ALL, nullptr, &h) != S_OK)
         return Fail("CreateSharedHandle (image)");
 
     VkExternalMemoryImageCreateInfo ext { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
@@ -243,14 +241,14 @@ bool CreateShared()
     ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkCreateImage(b.device, &ici, nullptr, &b.sharedImage) != VK_SUCCESS)
+    if (vkCreateImage(b.device, &ici, nullptr, &out.image) != VK_SUCCESS)
     {
         CloseHandle(h);
         return Fail("vkCreateImage");
     }
 
     VkMemoryRequirements req {};
-    vkGetImageMemoryRequirements(b.device, b.sharedImage, &req);
+    vkGetImageMemoryRequirements(b.device, out.image, &req);
     VkMemoryWin32HandlePropertiesKHR hprops { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
     if (getMemProps(b.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, h, &hprops) != VK_SUCCESS)
     {
@@ -272,19 +270,39 @@ bool CreateShared()
     }
 
     VkMemoryDedicatedAllocateInfo dedicated { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
-    dedicated.image = b.sharedImage;
+    dedicated.image = out.image;
     VkImportMemoryWin32HandleInfoKHR import { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR, &dedicated };
     import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
     import.handle = h;
     VkMemoryAllocateInfo mai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import };
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
-    const bool memOk = vkAllocateMemory(b.device, &mai, nullptr, &b.sharedMemory) == VK_SUCCESS;
+    const bool memOk = vkAllocateMemory(b.device, &mai, nullptr, &out.memory) == VK_SUCCESS;
     CloseHandle(h);
     if (!memOk)
         return Fail("vkAllocateMemory (import)");
-    if (vkBindImageMemory(b.device, b.sharedImage, b.sharedMemory, 0) != VK_SUCCESS)
+    if (vkBindImageMemory(b.device, out.image, out.memory, 0) != VK_SUCCESS)
         return Fail("vkBindImageMemory");
+    return true;
+}
+
+bool CreateShared()
+{
+    auto& b = _b;
+    auto getMemProps = (PFN_vkGetMemoryWin32HandlePropertiesKHR) vkGetDeviceProcAddr(
+        b.device, "vkGetMemoryWin32HandlePropertiesKHR");
+    auto importSem =
+        (PFN_vkImportSemaphoreWin32HandleKHR) vkGetDeviceProcAddr(b.device, "vkImportSemaphoreWin32HandleKHR");
+    if (getMemProps == nullptr || importSem == nullptr)
+        return Fail("external memory / semaphore functions missing");
+
+    const DXGI_FORMAT dxgi = ToDxgi(b.format);
+    if (dxgi == DXGI_FORMAT_UNKNOWN)
+        return Fail("unsupported swapchain format");
+
+    if (!MakeShared(b.frame, L"OptiScaler Vulkan present image", dxgi, getMemProps) ||
+        !MakeShared(b.hudless, L"OptiScaler Vulkan present HUD-less", dxgi, getMemProps))
+        return false;
 
     // One timeline both ways: Vulkan signals odd values (copied in), D3D12 even ones (callbacks done)
     HANDLE fh = nullptr;
@@ -371,7 +389,7 @@ void FillFrame(OptiPresentFrame& f)
     f.device = b.d3d;
     f.queue = b.queue;
     f.swapchain = nullptr;
-    f.backBuffer = b.sharedResource;
+    f.backBuffer = b.frame.res;
     f.backBufferState = D3D12_RESOURCE_STATE_COMMON;
     f.colorSpace = ToDxgiColorSpace(b.colorSpace);
     f.width = b.extent.width;
@@ -380,10 +398,59 @@ void FillFrame(OptiPresentFrame& f)
     f.frameGeneration = OptiFrameGen_Off;
     f.frameId = ++b.frames;
     f.upscaleFrameId = PluginApi::LastUpscaleFrameId();
+    if (b.hudlessFrame == f.frameId)
+    {
+        f.hudless = b.hudless.res;
+        f.hudlessState = D3D12_RESOURCE_STATE_COMMON;
+        f.hudlessSource = OptiHudless_Hudfix;
+    }
 }
 } // namespace
 
 bool VkPresentDx12::Wanted() { return PluginApi::WantsBridgedPresents(); }
+
+bool VkPresentDx12::HudlessSink(VkExtent2D* extent, VkFormat* format)
+{
+    if (!Wanted())
+        return false;
+    std::lock_guard lock(_mutex);
+    if (!_b.ready || _b.failed)
+        return false;
+    if (extent != nullptr)
+        *extent = _b.extent;
+    if (format != nullptr)
+        *format = _b.format;
+    return true;
+}
+
+bool VkPresentDx12::CaptureHudless(VkCommandBuffer cb, VkImage image, VkImageLayout layout)
+{
+    std::lock_guard lock(_mutex);
+    auto& b = _b;
+    if (!b.ready || b.failed || b.hudless.image == VK_NULL_HANDLE)
+        return false;
+
+    VkImageMemoryBarrier in[2] = {
+        Barrier(image, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT),
+        Barrier(b.hudless.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                VK_ACCESS_TRANSFER_WRITE_BIT),
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 2, in);
+    Copy(cb, image, b.hudless.image, b.extent);
+    VkImageMemoryBarrier out[2] = {
+        Barrier(image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT),
+        Barrier(b.hudless.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT),
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 2, out);
+    // belongs to the next present
+    b.hudlessFrame = b.frames + 1;
+    return true;
+}
 
 void VkPresentDx12::AdjustSwapchainInfo(VkPhysicalDevice pd, VkSwapchainCreateInfoKHR* info)
 {
@@ -467,13 +534,13 @@ void VkPresentDx12::QueuePresent(VkQueue queue, VkPresentInfoKHR* info)
     VkImageMemoryBarrier in[2] = {
         Barrier(image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT),
-        Barrier(b.sharedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+        Barrier(b.frame.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
                 VK_ACCESS_TRANSFER_WRITE_BIT),
     };
     vkCmdPipelineBarrier(s.toDx12, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
                          0, nullptr, 2, in);
-    Copy(s.toDx12, image, b.sharedImage, b.extent);
-    auto toGeneral = Barrier(b.sharedImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+    Copy(s.toDx12, image, b.frame.image, b.extent);
+    auto toGeneral = Barrier(b.frame.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     vkCmdPipelineBarrier(s.toDx12, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                          0, nullptr, 1, &toGeneral);
@@ -516,14 +583,14 @@ void VkPresentDx12::QueuePresent(VkQueue queue, VkPresentInfoKHR* info)
     // 3. shared image -> swapchain image, then the present waits on s.done
     vkBeginCommandBuffer(s.back, &bi);
     VkImageMemoryBarrier out[2] = {
-        Barrier(b.sharedImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        Barrier(b.frame.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
         Barrier(image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT),
     };
     vkCmdPipelineBarrier(s.back, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 2, out);
-    Copy(s.back, b.sharedImage, image, b.extent);
+    Copy(s.back, b.frame.image, image, b.extent);
     auto toPresent = Barrier(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                              VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     vkCmdPipelineBarrier(s.back, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,

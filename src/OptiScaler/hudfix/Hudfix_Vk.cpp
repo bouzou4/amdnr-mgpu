@@ -7,6 +7,7 @@
 #include <hooks/Hook_Utils.h>
 #include <hooks/Vulkan_Hooks.h>
 #include <framegen/IFGFeature_Vk.h>
+#include <with_dx12/vk_present_dx12.h>
 
 #include <detours/detours.h>
 #include <ankerl/unordered_dense.h>
@@ -198,7 +199,7 @@ static bool IsSearching()
         return false;
     }
 
-    return IsFGRunning();
+    return IsFGRunning() || VkPresentDx12::HudlessSink(nullptr, nullptr);
 }
 
 static ComputeBindings* FindComputeBindings(VkCommandBuffer cmdBuffer, bool create);
@@ -244,15 +245,26 @@ void Hudfix_Vk::CheckImage(VkCommandBuffer cmdBuffer, VkImage image, VkFormat fo
         return;
     }
 
-    auto fg = State::Instance().currentVkFG;
-    auto swapchainExtent = fg->SwapchainExtent();
+    // Without FG the pick goes to the plugin present callbacks (VkPresentDx12)
+    auto fg = IsFGRunning() ? State::Instance().currentVkFG : nullptr;
+    VkExtent2D swapchainExtent {};
+    VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
+    if (fg != nullptr)
+    {
+        swapchainExtent = fg->SwapchainExtent();
+        swapchainFormat = fg->SwapchainFormat();
+    }
+    else if (!VkPresentDx12::HudlessSink(&swapchainExtent, &swapchainFormat))
+    {
+        return;
+    }
 
     if (extent.width != swapchainExtent.width || extent.height != swapchainExtent.height)
         return;
 
-    // The FG copy blits other formats to the swapchain's
-    if (!Config::Instance()->FGHUDFixExtended.value_or_default() &&
-        IFGFeature_Vk::WithoutSrgb(format) != IFGFeature_Vk::WithoutSrgb(fg->SwapchainFormat()))
+    // The FG copy blits other formats to the swapchain's, the plugin copy needs the same format
+    if ((fg == nullptr || !Config::Instance()->FGHUDFixExtended.value_or_default()) &&
+        IFGFeature_Vk::WithoutSrgb(format) != IFGFeature_Vk::WithoutSrgb(swapchainFormat))
     {
         return;
     }
@@ -269,6 +281,14 @@ void Hudfix_Vk::CheckImage(VkCommandBuffer cmdBuffer, VkImage image, VkFormat fo
 
     if (_candidateCount < Config::Instance()->FGHUDLimit.value_or_default())
         return;
+
+    if (fg == nullptr)
+    {
+        if (VkPresentDx12::CaptureHudless(cmdBuffer, image, layout))
+            LOG_DEBUG("Plugin hudless: {:X}, frame: {}, candidate: {}", (size_t) image, frame, _candidateCount);
+        _searchDoneFrame.store(frame, std::memory_order_release);
+        return;
+    }
 
     auto resource = CopiedResource(FG_ResourceType::HudlessColor, cmdBuffer, image, format, extent, layout);
 
@@ -691,10 +711,20 @@ VALIDATE_HOOK(hkCreateImage, PFN_vkCreateImage)
 static VkResult hkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo,
                               const VkAllocationCallbacks* pAllocator, VkImage* pImage)
 {
-    auto result = o_CreateImage(device, pCreateInfo, pAllocator, pImage);
-
     // Hudless candidates are rendered to or written by compute shaders
     const VkImageUsageFlags candidateUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+    // The plugin hudless copy reads the pick with a transfer
+    VkImageCreateInfo local;
+    if (pCreateInfo != nullptr && (pCreateInfo->usage & candidateUsage) && pCreateInfo->imageType == VK_IMAGE_TYPE_2D &&
+        !(pCreateInfo->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && VkPresentDx12::Wanted())
+    {
+        local = *pCreateInfo;
+        local.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        pCreateInfo = &local;
+    }
+
+    auto result = o_CreateImage(device, pCreateInfo, pAllocator, pImage);
 
     if (result == VK_SUCCESS && pCreateInfo->imageType == VK_IMAGE_TYPE_2D &&
         pCreateInfo->samples == VK_SAMPLE_COUNT_1_BIT && (pCreateInfo->usage & candidateUsage))

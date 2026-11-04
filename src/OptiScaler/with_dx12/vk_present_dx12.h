@@ -13,6 +13,10 @@ void AdjustSwapchainInfo(VkPhysicalDevice pd, VkSwapchainCreateInfoKHR* info);
 void SwapchainCreated(VkDevice device, VkPhysicalDevice pd, VkSwapchainKHR swapchain,
                       const VkSwapchainCreateInfoKHR* info);
 void SwapchainDestroyed(VkDevice device, VkSwapchainKHR swapchain);
+// HUD-less pick without FG (Hudfix_Vk): the swapchain's size and format once the bridge runs
+bool HudlessSink(VkExtent2D* extent, VkFormat* format);
+// Records the pick's copy into the shared HUD-less image, outside a render pass
+bool CaptureHudless(VkCommandBuffer cb, VkImage image, VkImageLayout layout);
 // Replaces the present's wait semaphores with the one the copy back signals
 void QueuePresent(VkQueue queue, VkPresentInfoKHR* info);
 } // namespace VkPresentDx12

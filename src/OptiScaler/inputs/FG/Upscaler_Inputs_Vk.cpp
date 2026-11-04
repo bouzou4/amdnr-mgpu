@@ -6,6 +6,7 @@
 #include <Config.h>
 #include <MathUtils.h>
 #include <hudfix/Hudfix_Vk.h>
+#include <with_dx12/vk_present_dx12.h>
 #include <hooks/VulkanwDx12_Hooks.h>
 
 #include <nvsdk_ngx_vk.h>
@@ -99,7 +100,8 @@ void UpscalerInputsVk::UpscaleEnd(VkCommandBuffer cmdBuffer, const NVSDK_NGX_Res
 {
     auto& state = State::Instance();
 
-    if (state.currentVkFG == nullptr || state.activeFgInput != FGInput::Upscaler)
+    const bool pluginHudless = VkPresentDx12::HudlessSink(nullptr, nullptr);
+    if (!pluginHudless && (state.currentVkFG == nullptr || state.activeFgInput != FGInput::Upscaler))
         return;
 
     Hudfix_Vk::UpscaleEnd(cmdBuffer);
