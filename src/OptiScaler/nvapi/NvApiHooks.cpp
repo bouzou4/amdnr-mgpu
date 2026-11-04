@@ -200,12 +200,6 @@ NvAPI_Status __stdcall NvApiHooks::hkNvAPI_DRS_GetSetting(NvDRSSessionHandle hSe
 
 void* __stdcall NvApiHooks::hkNvAPI_QueryInterface(unsigned int InterfaceId)
 {
-    // Native Reflex, flip metering, architecture/capability queries and driver
-    // presets belong to the external FG owner in this mode. Returning null for
-    // a Reflex query would disable it, so forward to the real function table.
-    if (State::Instance().externalFrameGeneration)
-        return o_NvAPI_QueryInterface ? o_NvAPI_QueryInterface(InterfaceId) : nullptr;
-
     // Frame generation reports its multiplier through Reflex Sync, OptiScaler's own FG output reports its own
     if (InterfaceId == GET_ID(NvAPI_D3D_SetReflexSync))
     {

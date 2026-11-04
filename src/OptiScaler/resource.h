@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 //{{NO_DEPENDENCIES}}
 // Microsoft Visual C++ generated include file.
 // Used by OptiScaler.rc
@@ -19,14 +18,10 @@
 #define STRINGIZE_(s) #s
 #define STRINGIZE(s) STRINGIZE_(s)
 
-#define VER_MAJOR_VERSION 11
+#define VER_MAJOR_VERSION 10
 #define VER_MINOR_VERSION 0
 #define VER_HOTFIX_VERSION 0
 #define VER_BUILD_NUMBER 1
-// The AMD neural-rendering build's own version, shown first in the menu title and the log
-// header: "AMD-NR v0.3.0 / OptiScaler v11.0.0 (build stamp)". The stamp stays: it is how a
-// tester's screenshot is matched to a build (there is no git here).
-#define AMDNR_VERSION_STR "0.3.4.2"
 
 #define VER_DEV_RELEASE
 // #define VER_PRE_RELEASE
@@ -58,5 +53,5 @@
     STRINGIZE(VER_MAJOR_VERSION) "." STRINGIZE(VER_MINOR_VERSION) "." STRINGIZE(VER_HOTFIX_VERSION) "-final (" VER_BUILD_COMMIT ")"
 #endif // VER_PRE_RELEASE
 
-#define VER_PRODUCT_NAME "AMD-NR v" AMDNR_VERSION_STR " / OptiScaler v" OPTI_VERSION " (" VER_BUILD_DATE ")"
+#define VER_PRODUCT_NAME "OptiScaler v" VER_PRODUCT_VERSION_STR
 #endif // OPTISCALER_BUILD_METADATA

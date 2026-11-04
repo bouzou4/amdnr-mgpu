@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "SysUtils.h"
 
@@ -9,18 +8,9 @@
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
-#include <d3d12.h>
-#include <wrl/client.h>
-#include <array>
-#include <cstdint>
-#include <string>
-#include <vector>
 #include "include/sl.param/parameters.h"
 
 #include "Hook_Utils.h"
-#include "RrHardwareGate.h"
-
-struct NVSDK_NGX_Parameter;
 
 struct Adapter
 {
@@ -65,157 +55,6 @@ struct SystemCapsSl15
     bool hwSchedulingEnabled {};
 };
 
-enum class RRTaggedSignal : uint32_t
-{
-    NormalRoughness,
-    Emissive,
-    SpecularMotionVectors,
-    ReflectionMotionVectors,
-    SpecularHitDistance,
-    SpecularRayDirectionHitDistance,
-    // The title's own already-linearised view depth, when it publishes one. Distinct
-    // from the depth the NGX parameters carry, which may be hardware depth that the
-    // title expects its consumer to linearise.
-    LinearDepth,
-    DiffuseNoisy,
-    DiffuseDenoised,
-    SpecularNoisy,
-    SpecularDenoised,
-    ShadowNoisy,
-    ShadowDenoised,
-    AmbientOcclusionNoisy,
-    AmbientOcclusionDenoised,
-    ShadowHint,
-    ReflectionHint,
-    Count
-};
-
-enum class RRTagSource : uint32_t
-{
-    SetTag,
-    SetTagForFrame,
-    EvaluateFeature
-};
-
-struct RRTaggedResourceDiagnostic
-{
-    bool observed = false;
-    bool present = false;
-    bool usesExtent = false;
-    std::string debugName;
-    void* resourceAddress = nullptr;
-    uint64_t nativeWidth = 0;
-    uint32_t nativeHeight = 0;
-    uint32_t effectiveWidth = 0;
-    uint32_t effectiveHeight = 0;
-    uint32_t extentLeft = 0;
-    uint32_t extentTop = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
-    D3D12_RESOURCE_FLAGS resourceFlags = D3D12_RESOURCE_FLAG_NONE;
-    uint32_t mipLevels = 0;
-    uint32_t arraySize = 0;
-    uint32_t sampleCount = 0;
-    uint32_t state = UINT32_MAX;
-    sl::ResourceLifecycle lifecycle = sl::ResourceLifecycle::eOnlyValidNow;
-    uint32_t frameIndex = UINT32_MAX;
-    uint32_t viewport = UINT32_MAX;
-    RRTagSource source = RRTagSource::SetTag;
-    uint64_t updateCount = 0;
-};
-
-struct RRSignalTagDiagnostics
-{
-    std::array<RRTaggedResourceDiagnostic, static_cast<size_t>(RRTaggedSignal::Count)> resources {};
-    uint64_t generation = 0;
-};
-
-struct RRTaggedD3D12ResourceSnapshot
-{
-    RRTaggedResourceDiagnostic diagnostic {};
-    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-};
-
-struct RRD3D12SignalTagSnapshot
-{
-    std::array<RRTaggedD3D12ResourceSnapshot,
-               static_cast<size_t>(RRTaggedSignal::Count)> resources {};
-    uint64_t generation = 0;
-    uint32_t activeEvaluationFrame = UINT32_MAX;
-    uint32_t activeEvaluationViewport = UINT32_MAX;
-};
-
-struct SLConstantsSnapshot
-{
-    sl::Constants constants {};
-    uint32_t frameIndex = UINT32_MAX;
-    uint32_t viewport = UINT32_MAX;
-};
-
-// SAT-P0-3 (AMDNR 0.3.4): how the title uses slSetConstants, for FSR Ray Regeneration's [RR_CAM] streamline line.
-struct SLSetConstantsDiagnostics
-{
-    bool hooked = false;               // hkslSetConstants attached (Streamline 2)
-    bool sl1Hooked = false;            // hkslSetConstants_sl1 attached (Streamline 1)
-    uint64_t calls = 0;                // Streamline 2 calls this session
-    uint64_t sl1Calls = 0;             // Streamline 1 calls this session
-    uint64_t lastPresent = UINT64_MAX; // State::frameCount at the last Streamline 2 call (UINT64_MAX: none)
-};
-
-// SAT-P1 (AMDNR 0.3.4, [FSR-RR] FfxDenoiserNgxDirectSLConstants, default off): Streamline constants a title set
-// for the frame an NGX-direct Ray Reconstruction evaluate belongs to, found by their jitter.
-struct SLConstantsJitterMatch
-{
-    sl::Constants constants {};
-    uint32_t frameIndex = UINT32_MAX;
-    uint32_t viewport = UINT32_MAX;
-    uint64_t agePresents = 0;  // presents since the matched slSetConstants call
-    float jitterDelta = 0.0f;  // largest component difference to the NGX jitter
-    bool signFlipped = false;  // matched against the negated NGX jitter
-};
-
-struct SLTaggedResourceInventoryEntry
-{
-    sl::BufferType type = UINT32_MAX;
-    RRTaggedResourceDiagnostic resource {};
-};
-
-struct SLTagInventoryDiagnostics
-{
-    std::vector<SLTaggedResourceInventoryEntry> resources;
-    uint64_t generation = 0;
-};
-
-enum class RRNGXPointerKind : uint32_t
-{
-    OpaquePointer,
-    D3D11Resource,
-    D3D12Resource
-};
-
-struct RRNGXPointerDiagnostic
-{
-    std::string name;
-    RRNGXPointerKind kind = RRNGXPointerKind::OpaquePointer;
-    bool present = false;
-    void* address = nullptr;
-    uint64_t nativeWidth = 0;
-    uint32_t nativeHeight = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
-    D3D12_RESOURCE_FLAGS resourceFlags = D3D12_RESOURCE_FLAG_NONE;
-    uint32_t mipLevels = 0;
-    uint32_t arraySize = 0;
-    uint32_t sampleCount = 0;
-    uint64_t updateCount = 0;
-};
-
-struct RRNGXPointerDiagnostics
-{
-    bool tableInspectable = false;
-    std::vector<RRNGXPointerDiagnostic> parameters;
-    uint64_t generation = 0;
-};
 enum class BufferType : uint64_t
 {
     Depth = 0,
@@ -318,19 +157,6 @@ class StreamlineHooks
     static inline std::mutex mutexHookDlss;
     static inline HMODULE hookedDlssModule = nullptr; // most recently hooked live copy
 
-    // sl.dlss_d - Ray Reconstruction. Hooked only so its plugin load sees a spoofed
-    // architecture when FSR Ray Regeneration can serve the title; see rrCanServe().
-    static void unhookDlssd();
-    static void hookDlssd(HMODULE slDlssd);
-    static bool isDlssdHooked();
-    static bool rrCanServe();
-    // (AMDNR 0.3.4, owner decision a) RDNA 4; RDNA 3 / 3.5 (RX 7000, the RDNA 3 APUs) while the ini leaves [FSR-RR]
-    // FfxDenoiserAllowPreRdna4 unset; an ini true = any non-NVIDIA card, an ini false = RDNA 4 only (RrHardwareGate.h).
-    static bool rrHardwareAllowed();
-    // The same answer with its reason, for the menu (the opt-in checkbox shows what applies, not the raw key) and logs.
-    // Never cached: GpuUnknown until the primary GPU can be read.
-    static RrGate::Decision rrHardwareDecision();
-
     static void unhookDlssg();
     static void hookDlssg(HMODULE slDlssg);
     static inline std::mutex mutexHookDlssg;
@@ -363,43 +189,10 @@ class StreamlineHooks
     static bool isInterposerHooked();
     static bool isDlssHooked();
     static bool isDlssgHooked();
-    static bool isSetConstantsHooked();
     static bool isLocalDlssgHooked();
     static bool isCommonHooked();
     static bool isPclHooked();
     static bool isReflexHooked();
-
-    static RRSignalTagDiagnostics getRRSignalTagDiagnostics();
-    static Microsoft::WRL::ComPtr<ID3D12Resource> getRRTaggedD3D12Resource(RRTaggedSignal signal);
-    static RRD3D12SignalTagSnapshot getRRD3D12SignalTagSnapshot();
-    static SLConstantsSnapshot getSLConstantsSnapshot();
-    static SLSetConstantsDiagnostics getSetConstantsDiagnostics();
-    // SAT-P1: the newest of the last four slSetConstants calls (recorded only while [FSR-RR]
-    // FfxDenoiserNgxDirectSLConstants=true) whose jitter equals the NGX jitter (either sign, within 1e-3 px, a
-    // non-zero jitter) and that is at most maxAgePresents presents old. False when none matches.
-    static bool findSLConstantsForJitter(float ngxJitterX, float ngxJitterY, uint64_t maxAgePresents,
-                                         SLConstantsJitterMatch& out);
-    static void resetRRSignalTagDiagnostics();
-    // B9 (AMDNR 0.3.4): each FSR_RR feature registers here while it lives. When the last one goes, the RR tag
-    // references are released at the end of the next outermost slEvaluateFeature, and only if no FSR_RR feature
-    // is alive by then; never on the destroy path itself (a title that re-creates RR inside slEvaluateFeature
-    // has already tagged that frame's inputs for the new feature).
-    static void rrTagConsumerAdded();
-    static void rrTagConsumerRemoved();
-    static void logRRSignalTagDiagnostics(uint32_t renderWidth, uint32_t renderHeight);
-    static const char* getRRTaggedSignalName(RRTaggedSignal signal);
-    static const char* getRRCheckerboardAssessment(RRTaggedSignal signal,
-                                                   const RRTaggedResourceDiagnostic& diagnostic,
-                                                   uint32_t renderWidth, uint32_t renderHeight);
-    static bool isRRPreferredTagFormat(RRTaggedSignal signal, DXGI_FORMAT format);
-    static const char* getRRPreferredTagFormat(RRTaggedSignal signal);
-    static SLTagInventoryDiagnostics getSLTagInventoryDiagnostics();
-    static const char* getSLBufferTypeName(sl::BufferType type);
-    static void logSLTagInventoryDiagnostics(uint32_t renderWidth, uint32_t renderHeight);
-    static RRNGXPointerDiagnostics getRRNGXPointerDiagnostics();
-    static void probeRRNGXPointerParameters(const NVSDK_NGX_Parameter& parameters);
-    static void logRRNGXPointerDiagnostics();
-    static void resetRRInputInventoryDiagnostics();
 
   private:
     enum class SlPlugin : size_t
@@ -451,18 +244,6 @@ class StreamlineHooks
     inline static sl::RenderAPI renderApi = sl::RenderAPI::eCount;
     inline static std::mutex setConstantsMutex {};
 
-    static std::mutex rrSignalTagMutex;
-    static RRSignalTagDiagnostics rrSignalTagDiagnostics;
-    static std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,
-                      static_cast<size_t>(RRTaggedSignal::Count)> rrTaggedD3D12Resources;
-    static SLTagInventoryDiagnostics slTagInventoryDiagnostics;
-    static RRNGXPointerDiagnostics rrNGXPointerDiagnostics;
-
-    static void probeRRResourceTag(const sl::ResourceTag& tag, uint32_t frameIndex,
-                                   uint32_t viewport, RRTagSource source);
-    static void probeSLResourceTag(const sl::ResourceTag& tag, uint32_t frameIndex,
-                                   uint32_t viewport, RRTagSource source);
-
     // System caps
     inline static SystemCaps* systemCaps = nullptr;
     inline static SystemCapsSl15* systemCapsSl15 = nullptr;
@@ -470,10 +251,6 @@ class StreamlineHooks
     static uint32_t getSystemCapsArch(SystemCaps* altSystemCaps = nullptr);
     static void setArch(uint32_t arch, SystemCaps* altSystemCaps = nullptr);
     static void spoofArch(uint32_t currentArch, sl::Feature feature, SystemCaps* altSystemCaps = nullptr);
-    // [SLINIT] diagnostics (0.3.3): what SystemCaps says around a plugin's load, and the adapter
-    // list IdentifyGpu already holds. Log only while the game's slInit runs; read memory only.
-    static void logSystemCapsForSlInit(const char* plugin, const char* stage, SystemCaps* altSystemCaps = nullptr);
-    static void logCachedGpusForSlInit();
 
     // Interposer
     inline static decltype(&slInit) o_slInit = nullptr;
@@ -541,12 +318,6 @@ class StreamlineHooks
     static bool hkdlss_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON, const char** pluginJSON);
     static sl::Result hkslDLSSGetOptimalSettings(const sl::DLSSOptions& options, sl::DLSSOptimalSettings& settings);
     static void* hkdlss_slGetPluginFunction(PFN_slGetPluginFunction original, const char* functionName, void* caller);
-
-    // DLSS_D (Ray Reconstruction)
-    inline static PFN_slGetPluginFunction o_dlssd_slGetPluginFunction = nullptr;
-    inline static PFN_slOnPluginLoad o_dlssd_slOnPluginLoad = nullptr;
-    static bool hkdlssd_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON, const char** pluginJSON);
-    static void* hkdlssd_slGetPluginFunction(const char* functionName);
 
     // DLSSG
     inline static PFN_slOnPluginLoad o_dlssg_slOnPluginLoad = nullptr;
@@ -624,8 +395,6 @@ class StreamlineHooks
     VALIDATE_MEMBER_HOOK(hkslGetNativeInterface, decltype(&slGetNativeInterface))
     VALIDATE_MEMBER_HOOK(hkslSetD3DDevice, decltype(&slSetD3DDevice))
     VALIDATE_MEMBER_HOOK(hkdlss_slOnPluginLoad, PFN_slOnPluginLoad)
-    VALIDATE_MEMBER_HOOK(hkdlssd_slOnPluginLoad, PFN_slOnPluginLoad)
-    VALIDATE_MEMBER_HOOK(hkdlssd_slGetPluginFunction, PFN_slGetPluginFunction)
     VALIDATE_MEMBER_HOOK(hkslDLSSGetOptimalSettings, decltype(&slDLSSGetOptimalSettings))
     VALIDATE_MEMBER_HOOK(hkdlssg_slOnPluginLoad, PFN_slOnPluginLoad)
     VALIDATE_MEMBER_HOOK(hkslSetConstants, decltype(&slSetConstants))

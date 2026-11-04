@@ -1,8 +1,4 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
-
-#include <dlssnr/DlssNr_ExposureScan.h>
-
 #include "ResTrack_dx12.h"
 
 #include <Config.h>
@@ -688,11 +684,6 @@ void ResTrack_Dx12::hkCreateUnorderedAccessView(ID3D12Device* This, ID3D12Resour
             }
         }
     }
-
-    // Every unordered access view the game makes passes through here, which is the one place a
-    // buffer shaped like an exposure can be spotted without knowing anything about the game. Silent
-    // and cheap for everything that does not match, and inert unless the scan is switched on.
-    DlssNr::ExposureScan::NoteUav(pResource, pDesc);
 
     o_CreateUnorderedAccessView(This, pResource, pCounterResource, pDesc, DestDescriptor);
 
@@ -2867,41 +2858,3 @@ void ResTrack_Dx12::ClearPossibleHudless()
         }
     }
 }
-
-// ---- Ray Regeneration resource inspector: declared, deliberately inert -------------
-//
-// See the block comment in ResTrack_dx12.h for why. In short: the real implementation
-// costs per-draw hooks in every game to serve titles that publish no RR tags, and the
-// tag-driven path does not need it. Everything here answers "nothing found" so the
-// caller takes the same branch it would take on a title the inspector had nothing to say
-// about - which is the branch that works.
-
-static bool _rrInspectorEnabled = false;
-
-void ResTrack_Dx12::SetRRResourceInspectorEnabled(bool enabled)
-{
-    if (enabled && !_rrInspectorEnabled)
-        LOG_WARN("RR resource inspector requested, but this build does not implement it; "
-                 "Ray Regeneration will use the Streamline-tagged resources only.");
-
-    // Recorded rather than ignored, so IsRRResourceInspectorEnabled() cannot report a
-    // state nobody asked for. It still returns false below - asking for the inspector
-    // does not conjure one.
-    _rrInspectorEnabled = enabled;
-}
-
-bool ResTrack_Dx12::IsRRResourceInspectorEnabled() { return false; }
-
-void ResTrack_Dx12::NotifyRRResourceInspectorFrame(uint64_t) {}
-
-void ResTrack_Dx12::RefreshRRResourceCandidates(uint32_t, uint32_t) {}
-
-uint32_t ResTrack_Dx12::GetRRResourceChannel() { return 0; }
-
-float ResTrack_Dx12::GetRRResourceViewScale() { return 1.0f; }
-
-// Contract note: the real one returns an AddRef'd resource. Returning null is the
-// documented "no safe candidate" answer, so the caller's release path is unchanged.
-ID3D12Resource* ResTrack_Dx12::AcquireRRResourceCandidate() { return nullptr; }
-
-void ResTrack_Dx12::LogRRScalarResourceCandidates(uint32_t, uint32_t) {}

@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "SysUtils.h"
 
@@ -77,13 +76,6 @@ class IFeature
 
     float _sharpness = 0; // Used by the feature itself, might get spoofed to 0 when RCAS is used
     std::optional<float> _actualSharpness = std::nullopt;
-    // AMDNR 0.3.4.1: GetSharpness returned the feature's own default (DefaultSharpnessWhenTitleSendsNone) because
-    // the title sent no sharpness and [Sharpness] OverrideSharpness is off. Read by the menu and [RR_POST].
-    bool _sharpnessIsFeatureDefault = false;
-    // AMDNR 0.3.4.1: set by IFeature_Dx12::Evaluate's RCAS setup when it zeroes the NGX sharpness so the upscaler
-    // does not sharpen twice (reset at the top of each Evaluate). While set, GetSharpness does not put the feature's
-    // default back into the upscaler: RCAS already runs with it.
-    bool _sharpnessHandedToRcas = false;
     bool _hasColor = false;
     bool _hasDepth = false;
     bool _hasMV = false;
@@ -150,12 +142,6 @@ class IFeature
             return _actualSharpness.value();
         return _sharpness;
     }
-    // AMDNR 0.3.4.1: the sharpness in use is the feature's own default (the title sends none), see GetSharpness.
-    bool SharpnessIsFeatureDefault() const { return _sharpnessIsFeatureDefault; }
-    // AMDNR 0.3.4.1: the sharpness GetSharpness uses (the menu reads it too) when the title sends none (NGX
-    // sharpness 0 or missing) and [Sharpness] OverrideSharpness is off. 0 = the title's 0 stands (every upscaler
-    // but FSR Ray Regeneration).
-    virtual float DefaultSharpnessWhenTitleSendsNone() const { return 0.0f; }
     virtual bool HasColor() { return _hasColor; }
     virtual bool HasDepth() { return _hasDepth; }
     virtual bool HasMV() { return _hasMV; }

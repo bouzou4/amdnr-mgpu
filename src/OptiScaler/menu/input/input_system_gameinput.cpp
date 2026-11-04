@@ -1,5 +1,3 @@
-// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -20,9 +18,6 @@ HMODULE GetAlreadyLoadedModule(const wchar_t* moduleName) { return GetModuleHand
 
 void UpdateGameInputIntegration()
 {
-    if (DiagSkipHookGroup(DiagHookGroup::GameInput))
-        return;
-
     // A module may be mapped before its DllMain has completed
     HMODULE gameInputModule = GetAlreadyLoadedModule(GameInputModuleName);
     HMODULE windowsGamingInputModule = GetAlreadyLoadedModule(WindowsGamingInputModuleName);

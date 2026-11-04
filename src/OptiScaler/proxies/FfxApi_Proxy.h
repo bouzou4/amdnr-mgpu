@@ -63,16 +63,6 @@ struct CustomFfxModule
     State::FfxVersionList versions;
 };
 
-// AMDNR gap stub (docs/AMDNR_GAPS.md): the denoiser ABI generations AMDNR's menu names.
-enum class FfxDenoiserApiGeneration
-{
-    NotLoaded,
-    Unknown,
-    V1_1,
-    V1_2,
-    Unsupported
-};
-
 class FfxApiProxy
 {
   private:
@@ -236,11 +226,6 @@ class FfxApiProxy
 
         return result;
     }
-
-    // AMDNR gap stub (docs/AMDNR_GAPS.md): FSR Ray Regeneration is not in the published source, so no
-    // denoiser provider is ever reported and RR requests fall back to FSR.
-    static bool IsDenoiserApiImplementedDx12() { return false; }
-    static FfxDenoiserApiGeneration DenoiserApiGenerationDx12() { return FfxDenoiserApiGeneration::Unsupported; }
 
     static bool IsDenoiserReady(bool sendNotification = true)
     {

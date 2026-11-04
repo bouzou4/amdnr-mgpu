@@ -1,5 +1,3 @@
-// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -10,109 +8,7 @@
 
 namespace OptiInput
 {
-namespace
-{
-// AMDNR 0.3.4.2 (Assetto Corsa menu): the edge bookkeeping behind KeyPressLatch.h / EdgeReplay.h and the diagnostics.
-InputEventSource ToEventSource(InputMessageSource source)
-{
-    return source == InputMessageSource::WndProc ? InputEventSource::WndProc : InputEventSource::Queue;
-}
-
-bool IsMessageEventSource(InputEventSource source)
-{
-    return source == InputEventSource::Queue || source == InputEventSource::WndProc || source == InputEventSource::Raw;
-}
-
-// A press edge: counted, and kept as this frame's press when it is the freshest one since the last EndFrame (a real
-// press wins over an autorepeat, then the later event time). Call before setting Pressed. true = it is kept.
-bool RecordPressEdgeLocked(ButtonState& button, DWORD time, InputEventSource source, bool repeat)
-{
-    button.PressCount++;
-
-    const bool keep = !button.Pressed || (button.PressRepeat && !repeat) ||
-                      (button.PressRepeat == repeat && !MenuInput::TickBefore(time, button.PressTimeMs));
-    if (!keep)
-        return false;
-
-    button.PressTimeMs = time;
-    button.PressSource = source;
-    button.PressRepeat = repeat;
-    return true;
-}
-
-void CountDownForDiagLocked(bool mouse, DWORD time, InputEventSource source)
-{
-    MenuInputDiagCounters& diag = _state.DiagWindow;
-    (mouse ? diag.MouseDowns : diag.KeyDowns)[static_cast<std::size_t>(source)]++;
-
-    if (IsMessageEventSource(source))
-    {
-        const DWORD now = GetTickCount();
-        const std::uint32_t age = MenuInput::TickBefore(now, time) ? 0u : now - time;
-        if (age > diag.MaxMsgAgeMs)
-            diag.MaxMsgAgeMs = age;
-    }
-}
-
-// Every edge of the menu key goes into a small ring that MenuCommon::UpdateManualInput drains each frame (the press
-// latch judges each press on its own, and the log shows each edge with its source and age).
-void RecordMenuKeyEdgeLocked(int vk, bool down, DWORD time, InputEventSource source, bool repeat)
-{
-    if (vk <= 0 || vk != _state.MenuKeyVk)
-        return;
-
-    KeyEdgeRecord record {};
-    record.Down = down;
-    record.Source = source;
-    record.Repeat = repeat;
-    record.EventMs = time;
-    record.SeenMs = GetTickCount();
-    record.PolledDown = _state.Keys[vk].PolledDown;
-    record.MenuVisible = _state.MenuVisible;
-
-    if (_state.MenuKeyEdgeCount == _state.MenuKeyEdges.size())
-    {
-        _state.MenuKeyEdgeHead = (_state.MenuKeyEdgeHead + 1) % _state.MenuKeyEdges.size();
-        _state.MenuKeyEdgeCount--;
-        _state.MenuKeyEdgesDropped++;
-    }
-
-    _state.MenuKeyEdges[(_state.MenuKeyEdgeHead + _state.MenuKeyEdgeCount) % _state.MenuKeyEdges.size()] = record;
-    _state.MenuKeyEdgeCount++;
-}
-
-} // namespace
-
-bool IsHeldKeyLocked(int vk)
-{
-    if (_state.HeldKeyVk <= 0 || vk != _state.HeldKeyVk)
-        return false;
-
-    // Two windows (MenuInput::HoldStillActive): the key was still down when the menu closed, so the hold waits for
-    // its release, or it already read up and the hold waits only for the one late down/up pair the game may still
-    // deliver for that press.
-    if (!MenuInput::HoldStillActive(_state.HeldKeyAwaitingLatePair, GetTickCount(), _state.HeldKeyLastDownMs))
-    {
-        EndKeyHoldLocked(_state.HeldKeyAwaitingLatePair ? "the late messages of the closing press did not arrive"
-                                                       : "3 s after it was last seen down");
-        return false;
-    }
-
-    return true;
-}
-
-void EndKeyHoldLocked(const char* why)
-{
-    if (_state.HeldKeyVk <= 0)
-        return;
-
-    LOG_DEBUG("menu key {:#x} no longer held back from the game: {}", _state.HeldKeyVk, why != nullptr ? why : "?");
-    _state.HeldKeyVk = 0;
-    _state.HeldKeyLastDownMs = 0;
-    _state.HeldKeyAwaitingLatePair = false;
-}
-
-void SetKeyUpStateOnly(int vk, DWORD messageTime, InputEventSource source)
+void SetKeyUpStateOnly(int vk, DWORD messageTime)
 {
     if (vk < 0 || vk >= 256)
         return;
@@ -120,10 +16,7 @@ void SetKeyUpStateOnly(int vk, DWORD messageTime, InputEventSource source)
     ButtonState& key = _state.Keys[vk];
 
     if (key.Down)
-    {
         key.Released = true;
-        RecordMenuKeyEdgeLocked(vk, false, messageTime, source, false);
-    }
 
     key.Down = false;
     key.LastMessageTime = messageTime;
@@ -314,7 +207,7 @@ int MouseMessageToButton(UINT msg, WPARAM wParam)
     }
 }
 
-void SetKeyDown(int vk, DWORD messageTime, bool blocked, InputEventSource source, bool repeat)
+void SetKeyDown(int vk, DWORD messageTime, bool blocked)
 {
     if (vk < 0 || vk >= 256)
         return;
@@ -323,10 +216,6 @@ void SetKeyDown(int vk, DWORD messageTime, bool blocked, InputEventSource source
 
     if (!key.Down)
     {
-        RecordPressEdgeLocked(key, messageTime, source, repeat);
-        CountDownForDiagLocked(false, messageTime, source);
-        RecordMenuKeyEdgeLocked(vk, true, messageTime, source, repeat);
-
         key.Pressed = true;
         _state.LastPressedKey = vk;
 
@@ -342,7 +231,7 @@ void SetKeyDown(int vk, DWORD messageTime, bool blocked, InputEventSource source
     SyncAggregateModifierStateLocked();
 }
 
-bool SetKeyUp(int vk, DWORD messageTime, InputEventSource source)
+bool SetKeyUp(int vk, DWORD messageTime)
 {
     if (vk < 0 || vk >= 256)
         return false;
@@ -352,10 +241,7 @@ bool SetKeyUp(int vk, DWORD messageTime, InputEventSource source)
     const bool wasBlockedDown = key.BlockedDown;
 
     if (key.Down)
-    {
         key.Released = true;
-        RecordMenuKeyEdgeLocked(vk, false, messageTime, source, false);
-    }
 
     key.Down = false;
     key.BlockedDown = false;
@@ -366,7 +252,7 @@ bool SetKeyUp(int vk, DWORD messageTime, InputEventSource source)
     return wasBlockedDown;
 }
 
-void SetMouseDown(int button, DWORD messageTime, bool blocked, InputEventSource source)
+void SetMouseDown(int button, DWORD messageTime, bool blocked)
 {
     if (button < 0 || button >= static_cast<int>(_state.MouseButtons.size()))
         return;
@@ -374,16 +260,7 @@ void SetMouseDown(int button, DWORD messageTime, bool blocked, InputEventSource 
     ButtonState& mouseButton = _state.MouseButtons[button];
 
     if (!mouseButton.Down)
-    {
-        if (RecordPressEdgeLocked(mouseButton, messageTime, source, false))
-        {
-            // A button-down message carries where it happened (the caller has just stored its lParam position).
-            mouseButton.PressPosValid = source == InputEventSource::Queue || source == InputEventSource::WndProc;
-            mouseButton.PressPos = _state.MouseClientPos;
-        }
-        CountDownForDiagLocked(true, messageTime, source);
         mouseButton.Pressed = true;
-    }
 
     mouseButton.Down = true;
     mouseButton.LastMessageTime = messageTime;
@@ -566,10 +443,7 @@ bool ShouldBlockMouseWindowMessageLocked(HWND hwnd, UINT msg)
     return ShouldBlockMouseInputLocked() && IsMouseMessage(msg) && IsTargetWindow(hwnd);
 }
 
-// `messageTime`: the message's own time (MSG::time on the queue path, GetMessageTime() in the WndProc), so an edge keeps
-// the time it happened even when the game's pump hands it over late (AMDNR 0.3.4.2).
-bool HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, InputMessageSource source,
-                         DWORD messageTime)
+bool HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, InputMessageSource source)
 {
     if (!IsTargetWindow(hwnd))
     {
@@ -651,7 +525,7 @@ bool HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, Inpu
         UpdateMousePositionFromClient(hwnd, lParam);
 
         const int button = MouseMessageToButton(msg, wParam);
-        SetMouseDown(button, messageTime, blockMouse, ToEventSource(source));
+        SetMouseDown(button, GetMessageTime(), blockMouse);
         OPTIINPUT_LOG_VERBOSE("mouse down button:{} blocked:{} pos=({}, {})", button, blockMouse ? 1 : 0,
                               _state.MouseClientPos.x, _state.MouseClientPos.y);
 
@@ -667,7 +541,7 @@ bool HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, Inpu
         UpdateMousePositionFromClient(hwnd, lParam);
 
         const int button = MouseMessageToButton(msg, wParam);
-        const bool wasBlockedDown = SetMouseUp(button, messageTime);
+        const bool wasBlockedDown = SetMouseUp(button, GetMessageTime());
         OPTIINPUT_LOG_VERBOSE("mouse up button:{} wasBlockedDown:{} pos=({}, {})", button, wasBlockedDown ? 1 : 0,
                               _state.MouseClientPos.x, _state.MouseClientPos.y);
 
@@ -696,21 +570,10 @@ bool HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, Inpu
     case WM_SYSKEYDOWN:
     {
         const int vk = NormalizeModifierVirtualKey(static_cast<int>(wParam), lParam);
-        // lParam bit 30: the key was already down (autorepeat).
-        const bool repeat = (lParam & (static_cast<LPARAM>(1) << 30)) != 0;
-        // AMDNR 0.3.4.2: the menu key that closed the menu stays away from the game until its key-up.
-        const bool held = IsHeldKeyLocked(vk);
-        if (held)
-        {
-            // The late key-down of the press that closed the menu (or a new press of the same key): from here the
-            // hold waits for that key-up, which the very next message of the pair brings.
-            _state.HeldKeyAwaitingLatePair = false;
-            _state.HeldKeyLastDownMs = GetTickCount();
-        }
-        SetKeyDown(vk, messageTime, blockKeyboard || held, ToEventSource(source), repeat);
-        OPTIINPUT_LOG_VERBOSE("key down vk:{} blocked:{} repeat:{}", vk, blockKeyboard ? 1 : 0, repeat ? 1 : 0);
+        SetKeyDown(vk, GetMessageTime(), blockKeyboard);
+        OPTIINPUT_LOG_VERBOSE("key down vk:{} blocked:{}", vk, blockKeyboard ? 1 : 0);
 
-        shouldBlock = blockKeyboard || held;
+        shouldBlock = blockKeyboard;
         break;
     }
 
@@ -718,16 +581,12 @@ bool HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, Inpu
     case WM_SYSKEYUP:
     {
         const int vk = NormalizeModifierVirtualKey(static_cast<int>(wParam), lParam);
-        const bool held = IsHeldKeyLocked(vk);
-        const bool wasBlockedDown = SetKeyUp(vk, messageTime, ToEventSource(source));
-        OPTIINPUT_LOG_VERBOSE("key up vk:{} wasBlockedDown:{} held:{}", vk, wasBlockedDown ? 1 : 0, held ? 1 : 0);
+        const bool wasBlockedDown = SetKeyUp(vk, GetMessageTime());
+        OPTIINPUT_LOG_VERBOSE("key up vk:{} wasBlockedDown:{}", vk, wasBlockedDown ? 1 : 0);
 
         // If the game saw the key down before the menu opened,
         // let it see the matching key up to avoid stuck movement/actions.
-        // AMDNR 0.3.4.2: the held menu key's up ends that press; the game never saw its down.
-        shouldBlock = wasBlockedDown || held;
-        if (held)
-            EndKeyHoldLocked("its key-up message");
+        shouldBlock = wasBlockedDown;
         break;
     }
 
@@ -767,7 +626,7 @@ bool HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, Inpu
         bool mustReachGame = false;
 
         if (shouldParseRawInput)
-            mustReachGame = HandleRawInputLocked(reinterpret_cast<HRAWINPUT>(lParam), messageTime);
+            mustReachGame = HandleRawInputLocked(reinterpret_cast<HRAWINPUT>(lParam));
 
         // The GetRawInputData hook uses the cached sanitize decision made above. Keep WM_INPUT
         // reachable only when it carries an owed release; all other blocked packets stay hidden.
@@ -831,7 +690,6 @@ void ClearTransientState()
     _state.ReceivedQueueMessageThisFrame = false;
     _state.ReceivedRawInputThisFrame = false;
     _state.ReceivedAnyInputThisFrame = false;
-    _state.PollRanThisFrame = false;
     _state.PolledInputUsedThisFrame = false;
     _state.PolledMouseUsedThisFrame = false;
     _state.PolledKeyboardUsedThisFrame = false;
@@ -879,13 +737,7 @@ LRESULT CALLBACK OptiInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                               static_cast<void*>(_state.InputHwnd), reinterpret_cast<std::uintptr_t>(originalWndProc),
                               _state.MenuVisible ? 1 : 0, _state.Focused ? 1 : 0);
         unicodeNoCharProbe = msg == WM_UNICHAR && wParam == UNICODE_NOCHAR && IsTargetWindow(hwnd);
-        // AMDNR 0.3.4.2: GetMessageTime is the time of the last message this thread took from its queue. A message
-        // sent from another thread (SendMessage) never went through the queue, so that time can predate the frame
-        // that armed the menu key latch (KeyPressLatch.h: Stale) while the key is already down and the poll cannot
-        // add a fresh edge: the menu key looked dead. Such a message is handled now, so its time is now. (A
-        // SendMessage from the window's own thread is not detectable and keeps the queue time.)
-        const DWORD messageTime = InSendMessageEx(nullptr) != ISMEX_NOSEND ? GetTickCount() : GetMessageTime();
-        handled = HandleWindowMessage(hwnd, msg, wParam, lParam, InputMessageSource::WndProc, messageTime);
+        handled = HandleWindowMessage(hwnd, msg, wParam, lParam, InputMessageSource::WndProc);
     }
 
     if (unicodeNoCharProbe)
@@ -936,8 +788,8 @@ bool ProcessRemovedMessage(MSG* msg)
             return false;
         }
 
-        handled = HandleWindowMessage(msg->hwnd, msg->message, msg->wParam, msg->lParam, InputMessageSource::MessageQueue,
-                                      msg->time);
+        handled =
+            HandleWindowMessage(msg->hwnd, msg->message, msg->wParam, msg->lParam, InputMessageSource::MessageQueue);
     }
 
     if (!handled)
@@ -1241,10 +1093,6 @@ BOOL WINAPI hkGetKeyboardState(PBYTE keyState)
         return result;
 
     std::unique_lock lock(_state.Mutex);
-
-    // AMDNR 0.3.4.2: the menu key that closed the menu, until it is released (HoldKeyUntilReleased).
-    if (bypassHookDepth == 0 && _state.HeldKeyVk > 0 && _state.HeldKeyVk < 256 && IsHeldKeyLocked(_state.HeldKeyVk))
-        keyState[_state.HeldKeyVk] = 0;
 
     const bool shouldBlockKeyboard = ShouldBlockKeyboardInputLocked();
     const bool shouldBlockMouse = ShouldBlockMouseInputLocked();

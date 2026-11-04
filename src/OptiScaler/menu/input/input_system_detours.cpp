@@ -1,5 +1,3 @@
-// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -272,7 +270,7 @@ bool InstallHooks()
 
     ResolveOptionalUser32Exports();
 
-    if (!messageHooks && !DiagSkipHookGroup(DiagHookGroup::Message))
+    if (!messageHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -291,7 +289,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 message hook installation failed result:{}", result);
     }
 
-    if (!keyStateHooks && !DiagSkipHookGroup(DiagHookGroup::KeyState))
+    if (!keyStateHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -309,7 +307,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 key state hook installation failed result:{}", result);
     }
 
-    if (!getPosHooks && !DiagSkipHookGroup(DiagHookGroup::MsgPos))
+    if (!getPosHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -326,7 +324,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 GetMessagePos hook installation failed result:{}", result);
     }
 
-    if (!clipCursorHooks && !DiagSkipHookGroup(DiagHookGroup::Clip))
+    if (!clipCursorHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -343,7 +341,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 clip cursor hook installation failed result:{}", result);
     }
 
-    if (!message2Hooks && !DiagSkipHookGroup(DiagHookGroup::SendPost))
+    if (!message2Hooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -365,7 +363,7 @@ bool InstallHooks()
     }
 
 #ifdef USE_HID_HOOKS
-    if (!State::Instance().isRunningOnLinux && !hidHooks && !DiagSkipHookGroup(DiagHookGroup::Hid))
+    if (!State::Instance().isRunningOnLinux && !hidHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -386,7 +384,7 @@ bool InstallHooks()
     }
 #endif //  USE_HID_HOOKS
 
-    if (!rawHooks && !DiagSkipHookGroup(DiagHookGroup::Raw))
+    if (!rawHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -404,7 +402,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 raw input installation failed result:{}", result);
     }
 
-    if (!windowsHooks && !DiagSkipHookGroup(DiagHookGroup::WinHook))
+    if (!windowsHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -422,7 +420,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 windows input installation failed result:{}", result);
     }
 
-    if (!positionHooks && !DiagSkipHookGroup(DiagHookGroup::Cursor))
+    if (!positionHooks)
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -447,21 +445,17 @@ bool InstallHooks()
 
     // If CursorPos hooks are not installed, try to install
     // IAT (Import Address Table) hooks for CursorPos
-    if (!positionHooks && !positionIATHooks && !DiagSkipHookGroup(DiagHookGroup::Cursor))
+    if (!positionHooks && !positionIATHooks)
         positionIATHooks = InstallCursorIatHooks();
 
-    // A group left out by [Hotfix] DiagInputHooksSkip counts as done so it is not retried.
-    namespace G = DiagHookGroup;
 #ifdef USE_HID_HOOKS
-    const bool hidReady = State::Instance().isRunningOnLinux || hidHooks || DiagSkipHookGroup(G::Hid);
+    const bool hidReady = State::Instance().isRunningOnLinux || hidHooks;
+    _state.HooksInstalled = messageHooks && keyStateHooks && getPosHooks && clipCursorHooks && message2Hooks &&
+                            hidReady && rawHooks && windowsHooks && (positionHooks || positionIATHooks);
 #else
-    const bool hidReady = true;
+    _state.HooksInstalled = messageHooks && keyStateHooks && getPosHooks && clipCursorHooks && message2Hooks &&
+                            rawHooks && windowsHooks && (positionHooks || positionIATHooks);
 #endif // USE_HID_HOOKS
-    _state.HooksInstalled =
-        (messageHooks || DiagSkipHookGroup(G::Message)) && (keyStateHooks || DiagSkipHookGroup(G::KeyState)) &&
-        (getPosHooks || DiagSkipHookGroup(G::MsgPos)) && (clipCursorHooks || DiagSkipHookGroup(G::Clip)) &&
-        (message2Hooks || DiagSkipHookGroup(G::SendPost)) && hidReady && (rawHooks || DiagSkipHookGroup(G::Raw)) &&
-        (windowsHooks || DiagSkipHookGroup(G::WinHook)) && (positionHooks || positionIATHooks || DiagSkipHookGroup(G::Cursor));
 
     return _state.HooksInstalled;
 }

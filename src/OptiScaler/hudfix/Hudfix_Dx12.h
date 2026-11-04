@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "SysUtils.h"
 #include <shaders/format_transfer/FT_Dx12.h>
@@ -26,13 +25,7 @@ enum CaptureInfo
     CreateSRV = 2,
     CreateUAV = 4,
     OMSetRTV = 8,
-    // UpscalerPass, not Upscaler. CaptureInfo is an UNSCOPED enum, so every enumerator
-    // lands in the global namespace - and `Upscaler` there collides head-on with `enum
-    // class Upscaler` in OptiTypes.h. Any translation unit that includes ResTrack_dx12.h
-    // (the only includer of this header) and then names the type gets C2872 "ambiguous
-    // symbol", which MSVC reports as an unrelated parse error on the following line.
-    // Nothing hit it before because no such TU existed; the FSR-RR feature is the first.
-    UpscalerPass = 16,
+    Upscaler = 16,
     SetCR = 32,
     SetGR = 64,
     Dispatch = 256,

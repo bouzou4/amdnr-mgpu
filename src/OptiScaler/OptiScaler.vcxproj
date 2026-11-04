@@ -89,7 +89,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>bcrypt.lib;winhttp.lib;WindowsApp.lib;Dbghelp.lib;dxgi.lib;d3d11.lib;d3d12.lib;vulkan-1.lib;dxguid.lib;freetype.lib;ffx_fsr2_api_x64d.lib;ffx_fsr2_api_dx11_x64d.lib;ffx_fsr2_api_dx12_x64d.lib;ffx_fsr2_api_vk_x64d.lib;ffx_fsr2_212_api_dx12_x64d.lib;ffx_fsr2_212_api_vk_x64d.lib;ffx_fsr2_212_api_x64d.lib;d3dcompiler.lib;d3dx11.lib;ffx_backend_dx11_x64d.lib;ffx_fsr3_x64d.lib;ffx_fsr3upscaler_x64d.lib;ffx_opticalflow_x64d.lib;ffx_frameinterpolation_x64d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>winhttp.lib;WindowsApp.lib;Dbghelp.lib;dxgi.lib;d3d11.lib;d3d12.lib;vulkan-1.lib;dxguid.lib;freetype.lib;ffx_fsr2_api_x64d.lib;ffx_fsr2_api_dx11_x64d.lib;ffx_fsr2_api_dx12_x64d.lib;ffx_fsr2_api_vk_x64d.lib;ffx_fsr2_212_api_dx12_x64d.lib;ffx_fsr2_212_api_vk_x64d.lib;ffx_fsr2_212_api_x64d.lib;d3dcompiler.lib;d3dx11.lib;ffx_backend_dx11_x64d.lib;ffx_fsr3_x64d.lib;ffx_fsr3upscaler_x64d.lib;ffx_opticalflow_x64d.lib;ffx_frameinterpolation_x64d.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>Source.def</ModuleDefinitionFile>
       <DelayLoadDLLs>vulkan-1.dll;dxgi.dll;d3d12.dll;D3DCOMPILER_47.dll</DelayLoadDLLs>
       <StackReserveSize>
@@ -126,7 +126,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>bcrypt.lib;winhttp.lib;WindowsApp.lib;Dbghelp.lib;dxgi.lib;d3d11.lib;d3d12.lib;vulkan-1.lib;dxguid.lib;freetype.lib;ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;ffx_fsr2_api_dx12_x64.lib;ffx_fsr2_api_vk_x64.lib;ffx_fsr2_212_api_dx12_x64.lib;ffx_fsr2_212_api_vk_x64.lib;ffx_fsr2_212_api_x64.lib;d3dcompiler.lib;ffx_backend_dx11_x64.lib;ffx_fsr3_x64.lib;ffx_frameinterpolation_x64.lib;ffx_fsr3upscaler_x64.lib;ffx_opticalflow_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>winhttp.lib;WindowsApp.lib;Dbghelp.lib;dxgi.lib;d3d11.lib;d3d12.lib;vulkan-1.lib;dxguid.lib;freetype.lib;ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;ffx_fsr2_api_dx12_x64.lib;ffx_fsr2_api_vk_x64.lib;ffx_fsr2_212_api_dx12_x64.lib;ffx_fsr2_212_api_vk_x64.lib;ffx_fsr2_212_api_x64.lib;d3dcompiler.lib;ffx_backend_dx11_x64.lib;ffx_fsr3_x64.lib;ffx_frameinterpolation_x64.lib;ffx_fsr3upscaler_x64.lib;ffx_opticalflow_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>Source.def</ModuleDefinitionFile>
       <DelayLoadDLLs>vulkan-1.dll;dxgi.dll;d3d12.dll;D3DCOMPILER_47.dll</DelayLoadDLLs>
       <AdditionalOptions>/ignore:4099</AdditionalOptions>
@@ -137,8 +137,6 @@ move $(SolutionDir)x64\Release\$(TargetFileName) $(SolutionDir)x64\Release\a\
 md $(SolutionDir)x64\Release\a\Licenses
 del /Q $(SolutionDir)x64\Release\a\Licenses\*.*
 copy $(SolutionDir)external\xess\LICENSE.txt $(SolutionDir)x64\Release\a\Licenses\XeSS_LICENSE.txt /Y
-copy "$(SolutionDir)READ ME - DLSS Neural Rendering.txt" $(SolutionDir)x64\Release\a\ /Y
-copy "$(SolutionDir)Licenses\RenoDX_ATTRIBUTION.txt" $(SolutionDir)x64\Release\a\Licenses\ /Y
 md $(SolutionDir)x64\Release\a\OptiScaler
 copy $(SolutionDir)external\xess\bin\*.dll $(SolutionDir)x64\Release\a\OptiScaler\ /Y
 copy $(SolutionDir)external\FidelityFX-SDK\docs\license.md $(SolutionDir)x64\Release\a\OptiScaler\Licenses\FidelityFX_v1_LICENSE.md /Y
@@ -181,7 +179,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>bcrypt.lib;winhttp.lib;WindowsApp.lib;Dbghelp.lib;dxgi.lib;d3d11.lib;d3d12.lib;vulkan-1.lib;dxguid.lib;freetype.lib;ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;ffx_fsr2_api_dx12_x64.lib;ffx_fsr2_api_vk_x64.lib;ffx_fsr2_212_api_dx12_x64.lib;ffx_fsr2_212_api_vk_x64.lib;ffx_fsr2_212_api_x64.lib;d3dcompiler.lib;ffx_backend_dx11_x64.lib;ffx_fsr3_x64.lib;ffx_frameinterpolation_x64.lib;ffx_fsr3upscaler_x64.lib;ffx_opticalflow_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>winhttp.lib;WindowsApp.lib;Dbghelp.lib;dxgi.lib;d3d11.lib;d3d12.lib;vulkan-1.lib;dxguid.lib;freetype.lib;ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;ffx_fsr2_api_dx12_x64.lib;ffx_fsr2_api_vk_x64.lib;ffx_fsr2_212_api_dx12_x64.lib;ffx_fsr2_212_api_vk_x64.lib;ffx_fsr2_212_api_x64.lib;d3dcompiler.lib;ffx_backend_dx11_x64.lib;ffx_fsr3_x64.lib;ffx_frameinterpolation_x64.lib;ffx_fsr3upscaler_x64.lib;ffx_opticalflow_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>Source.def</ModuleDefinitionFile>
       <DelayLoadDLLs>vulkan-1.dll;dxgi.dll;d3d12.dll;D3DCOMPILER_47.dll</DelayLoadDLLs>
       <AdditionalOptions>/ignore:4099</AdditionalOptions>
@@ -193,58 +191,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
       <Command>powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $date = Get-Date -Format 'yyyyMMdd_HHmmss'; $commit = (git -C '$(SolutionDir)' rev-parse --short HEAD 2&gt;$null); if (-not $commit) { $commit = 'unknown' }; function Write-Retry([string]$path, [string]$value) { for ($i = 0; $i -lt 30; $i++) { try { [System.IO.File]::WriteAllText($path, $value + [Environment]::NewLine, [System.Text.Encoding]::ASCII); return } catch [System.IO.IOException] { if ($i -eq 29) { throw }; Start-Sleep -Milliseconds 100 } } }; Write-Retry '$(ProjectDir)resource_build_date.h' ('#define VER_BUILD_DATE \"' + $date + '\"'); Write-Retry '$(ProjectDir)resource_build_commit.h' ('#define VER_BUILD_COMMIT \"' + $commit + '\"');"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
-  <ItemGroup>
-    <ClCompile Include="dlssnr\amd\RtgiNative.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClInclude Include="dlssnr\amd\RtgiNative.h" />
-    <ClCompile Include="dlssnr\amd\AmdPreSr.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="dlssnr\amd\AmdBridge.cpp" />
-    <ClCompile Include="dlssnr\lmxxf\LmxxfBackend.cpp" />
-    <ClInclude Include="dlssnr\amd\AmdPreSr.h" />
-    <ClInclude Include="dlssnr\amd\SubmissionState.h" />
-    <ClInclude Include="dlssnr\amd\RuntimeNotification.h" />
-    <ClInclude Include="dlssnr\amd\RuntimeHostLoad.h" />
-    <ClInclude Include="dlssnr\amd\AmdBridge.h" />
-    <ClInclude Include="dlssnr\lmxxf\LmxxfBackend.h" />
-  </ItemGroup>
-  <!-- AMDNR 0.3.4 (W0-2): every new file of the 0.3.4 plan, registered once as a stub. -->
-  <ItemGroup>
-    <ClInclude Include="dlssnr\amd\RuntimeCaps.h" />
-    <ClInclude Include="dlssnr\amd\NrControls.h" />
-    <ClInclude Include="dlssnr\amd\EditShapeRules.h" />
-    <ClInclude Include="dlssnr\menu\NeuralUi.h" />
-    <ClInclude Include="misc\ReportZip.h" />
-    <ClInclude Include="misc\AmdnrReport.h" />
-    <ClInclude Include="misc\CrashReport.h" />
-    <ClInclude Include="misc\ProcessNameMatch.h" />
-    <ClInclude Include="misc\LogRotationNames.h" />
-    <ClInclude Include="menu\input\ToggleGate.h" />
-    <ClInclude Include="menu\input\KeyPressLatch.h" />
-    <ClInclude Include="menu\input\EdgeReplay.h" />
-    <ClInclude Include="menu\input\InputDiagRate.h" />
-    <ClInclude Include="menu\RuntimeChooserSession.h" />
-    <ClCompile Include="dlssnr\menu\NeuralUi.cpp" />
-    <ClCompile Include="dlssnr\menu\NeuralTop.cpp" />
-    <ClCompile Include="dlssnr\menu\NeuralPerfQuality.cpp" />
-    <ClCompile Include="dlssnr\menu\NeuralLook.cpp" />
-    <ClCompile Include="dlssnr\menu\NeuralTools.cpp" />
-    <ClCompile Include="misc\ReportZip.cpp" />
-    <ClCompile Include="misc\AmdnrReport.cpp" />
-    <ClCompile Include="misc\CrashReport.cpp" />
-  </ItemGroup>
-  <!-- AMDNR 0.3.4 preview: AMDNR Screen GI (dlssnr\gi). AmdnrGi.cpp has no pch, so the offline lab compiles it too. -->
-  <ItemGroup>
-    <ClCompile Include="dlssnr\gi\AmdnrGi.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="dlssnr\gi\GiSeam.cpp" />
-    <ClInclude Include="dlssnr\gi\AmdnrGi.h" />
-    <ClInclude Include="dlssnr\gi\GiSeam.h" />
-    <ClInclude Include="dlssnr\gi\GiShared.h" />
-  </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framegen\nvngx\Nvngx_Combo.h" />
     <ClInclude Include="framegen\reprojection\swapchain\reprojectionSwapchain.h" />
@@ -280,7 +226,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="fsr4\FSR4PipelineLayouts.h" />
     <ClInclude Include="hooks\D3D12_Hooks.h" />
     <ClInclude Include="hooks\DxgiFactory_Hooks.h" />
-    <ClInclude Include="hooks\DxgiSwapchainSizing.h" />
     <ClInclude Include="hooks\DxgiFactory_WrappedCalls.h" />
     <ClInclude Include="hooks\Dxgi_Hooks.h" />
     <ClInclude Include="hooks\FG_Hooks.h" />
@@ -379,7 +324,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="spoofing\User32_Spoofing.h" />
     <ClInclude Include="hooks\VulkanwDx12_Hooks.h" />
     <ClInclude Include="misc\IdentifyGpu.h" />
-    <ClInclude Include="misc\DiagSwitches.h" />
     <ClInclude Include="inputs\FSR2_Dx11.h" />
     <ClInclude Include="inputs\FSR2_Vk.h" />
     <ClInclude Include="inputs\XeSS_Dx11.h" />
@@ -415,9 +359,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\output_scaling\precompile\bcds_magc_Shader_Vk.h" />
     <ClInclude Include="shaders\output_scaling\precompile\bcus_Shader_Vk.h" />
     <ClInclude Include="shaders\rcas\RCAS_Vk.h" />
-    <ClInclude Include="shaders\dlssnr\DlssNr_Vk.h" />
-    <ClInclude Include="dlssnr\DlssNrFeature_Vk.h" />
-    <ClInclude Include="dlssnr\DlssNr_ExposureScan.h" />
     <ClInclude Include="shaders\render_ui\precompile\render_ui_pm_PShader.h" />
     <ClInclude Include="shaders\render_ui\precompile\render_ui_pm_VShader.h" />
     <ClInclude Include="shaders\render_ui\precompile\render_ui_PShader.h" />
@@ -484,7 +425,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="misc\FrameLimit.h" />
     <ClInclude Include="misc\DeferredRelease.h" />
     <ClInclude Include="misc\Quirks.h" />
-    <ClInclude Include="misc\REFrameworkCheck.h" />
     <ClInclude Include="OwnedMutex.h" />
     <ClInclude Include="proxies\D3D12_Proxy.h" />
     <ClInclude Include="proxies\Dxgi_Proxy.h" />
@@ -826,12 +766,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="upscalers\fsr2_212\FSR2Feature_Vk_212.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature.cpp" />
     <ClCompile Include="upscalers\fsr31\FSR31Feature_Dx11.cpp" />
-    <ClCompile Include="upscalers\fsr31\FSR31Feature_Dx12.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="upscalers\fsr31\FSRDFeature_Dx12.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx11On12.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx12.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Vk.cpp" />
@@ -888,14 +822,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="Logger.cpp" />
     <ClCompile Include="inputs\NVNGX.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Dx11.cpp" />
-    <ClCompile Include="shaders\dlssnr\DlssNr_Dx12.cpp" />
-    <ClInclude Include="shaders\dlssnr\DlssNr_ActiveColor.h" />
-    <ClCompile Include="dlssnr\DlssNrFeature_Vk.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="dlssnr\DlssNr_ExposureScan.cpp" />
-    <ClCompile Include="dlssnr\DlssNr_Proxy.cpp" />
-    <ClCompile Include="dlssnr\DlssNr_Menu.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Dx12.cpp" />
     <ClCompile Include="BuildInfo.cpp" />
     <ClCompile Include="dllmain.cpp" />

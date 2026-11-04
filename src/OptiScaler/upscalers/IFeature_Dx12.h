@@ -39,11 +39,6 @@ class IFeature_Dx12 : public virtual IFeature
 
     void ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
                          D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState) const;
-    // AMDNR (C3-A, 0.3.3.2 rebuild): true when InColour is the AMD neural pass's replacement for this parameter
-    // block's colour. It arrives in NON_PIXEL_SHADER_RESOURCE and must leave in it, so the title's colour barriers
-    // (ColorResourceBarrier, the Unreal RENDER_TARGET default) do not apply to it. A resource-identity test, so a
-    // block whose colour was changed since cannot match. False when [DlssNr] AmdNrColourGuard is off.
-    bool IsNrColour(const NVSDK_NGX_Parameter* InParameters, ID3D12Resource* InColour) const;
 
     virtual bool InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) = 0;
     virtual bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) = 0;

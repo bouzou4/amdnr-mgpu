@@ -8,7 +8,6 @@
 #include <Util.h>
 #include <State.h>
 #include <Config.h>
-#include <misc/DiagSwitches.h>
 
 #include <cwctype>
 #include <misc/IdentifyGpu.h>
@@ -110,7 +109,6 @@ FARPROC WINAPI KernelHooks::hk_K32_GetProcAddress(HMODULE hModule, LPCSTR lpProc
     if (lpProcName != nullptr && (hModule == amdxc64Mark || hModule == nullptr) &&
         lstrcmpA(lpProcName, "AmdExtD3DCreateInterface") == 0 &&
         IdentifyGpu::getPrimaryGpu().fsr4Support != FSR4Support::None &&
-        !Config::Instance()->DiagNoAmdxc64Hooks.value_or_default() && // [Hotfix] crash-triage switch
         Util::GetCallerModule(_ReturnAddress()) != KernelBaseProxy::GetModuleHandleW_()(L"amdxc64.dll"))
     {
         LOG_TRACE("Giving hkAmdExtD3DCreateInterface");
@@ -203,9 +201,7 @@ HMODULE WINAPI KernelHooks::hk_K32_GetModuleHandleW(LPCWSTR lpModuleName)
 VALIDATE_HOOK(hk_K32_GetModuleHandleExA, Kernel32Proxy::PFN_GetModuleHandleExA)
 BOOL WINAPI KernelHooks::hk_K32_GetModuleHandleExA(DWORD dwFlags, LPCSTR lpModuleName, HMODULE* phModule)
 {
-    // [Hotfix] DiagNoXessProxies (crash triage): no OptiScaler-as-libxell answer either.
-    if (lpModuleName && dwFlags == 0 && strcmp("libxell.dll", lpModuleName) == 0 && phModule &&
-        !DiagSwitches::NoXessProxies())
+    if (lpModuleName && dwFlags == 0 && strcmp("libxell.dll", lpModuleName) == 0 && phModule)
     {
         *phModule = dllModule;
         return true;
@@ -258,11 +254,7 @@ DWORD WINAPI KernelHooks::hk_K32_GetFileAttributesW(LPCWSTR lpFileName)
         auto path = wstring_to_string(std::wstring(lpFileName));
         to_lower_in_place(path);
 
-        // "nvngx.dll_" excludes OUR neural-rendering forwarder, named nvngx.dll_dlssnr.dll -- it
-        // contains the substring "nvngx.dll", so without this the spoof redirects an attempt to open
-        // the forwarder to the signed driver nvngx.dll instead, and the wrong image is loaded as the
-        // forwarder. That crashed Dragon's Dogma 2 the moment Neural Rendering first initialised.
-        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") && !path.contains("nvngx.dll_") &&
+        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") &&
             !IsInsideWindowsDirectory(path)) // apply the override to just one path
         {
             LOG_DEBUG("Overriding GetFileAttributesW for nvngx");
@@ -285,8 +277,7 @@ HANDLE WINAPI KernelHooks::hk_K32_CreateFileW(LPCWSTR lpFileName, DWORD dwDesire
         auto path = wstring_to_string(std::wstring(lpFileName));
         to_lower_in_place(path);
 
-        // See the note in hk_K32_GetFileAttributesW: exclude our nvngx.dll_dlssnr.dll forwarder.
-        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") && !path.contains("nvngx.dll_") &&
+        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") && // apply the override to just one path
             !IsInsideWindowsDirectory(path))
         {
             static auto& signedDll = State::Instance().nvngxReplacement;

@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "IdentifyGpu.h"
 
@@ -9,7 +8,6 @@
 #include <proxies/D3d12_Proxy.h>
 #include "nvapi/NvApiTypes.h"
 #include <hooks/Amdxc64_Hooks.h>
-#include <misc/DiagSwitches.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -367,50 +365,6 @@ GpuInformation IdentifyGpu::getPrimaryGpu()
     return !allGpus.empty() ? allGpus.front() : GpuInformation {};
 }
 
-// The card table's generation of an AMD GPU: exact id + revision (set in checkGpuInfo before any D3D12 device exists),
-// else any revision of the same device id; kUndefinedGeneration for an id the table does not list.
-static device_info::HwGeneration TableGeneration(const GpuInformation& gpu)
-{
-    auto generation = gpu.amdHwGeneration;
-
-    // An unlisted revision of a listed device still tells the generation
-    if (generation == device_info::HwGeneration::kUndefinedGeneration)
-    {
-        auto cardInfo = device_info::GetCardInfo(
-            device_info::AdapterId(gpu.vendorId, gpu.deviceId, device_info::kRevisionIdAny));
-
-        if (cardInfo.has_value())
-            generation = cardInfo.value().generation;
-    }
-
-    return generation;
-}
-
-bool IdentifyGpu::isRdna3(const GpuInformation& gpu)
-{
-    if (gpu.vendorId != VendorId::AMD)
-        return false;
-
-    // Equality: the enum is not ordered (kGfx11_5 comes after kGfx12)
-    const auto generation = TableGeneration(gpu);
-    return generation == device_info::HwGeneration::kGfx11 || generation == device_info::HwGeneration::kGfx11_5;
-}
-
-bool IdentifyGpu::isRdna4(const GpuInformation& gpu)
-{
-    if (gpu.vendorId != VendorId::AMD)
-        return false;
-
-    const auto generation = TableGeneration(gpu);
-
-    // Equality: the enum is not ordered (kGfx11_5 > kGfx12)
-    if (generation != device_info::HwGeneration::kUndefinedGeneration)
-        return generation == device_info::HwGeneration::kGfx12;
-
-    // A device id newer than the table
-    return gpu.realFsr4Support == FSR4Support::FP8;
-}
-
 bool IdentifyGpu::gameUsesDxvk() { return State::Instance().api == DX11 && getPrimaryGpu().dxgiIsDxvk; }
 
 bool IdentifyGpu::gameUsesVkd3dProton() { return State::Instance().api == DX12 && getPrimaryGpu().d3d12IsVkd3dProton; }
@@ -528,30 +482,7 @@ void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3
                             res.realFsr4Support = FSR4Support::FP8;
                     }
 
-                    // [Hotfix] DiagNoAmdGpuProbe (crash triage): no amdxc64 load, no AmdExtD3DCreateInterface /
-                    // CheckSupport(Float8Conversion) on the probe device and no forced Release loop. RDNA 4 (gfx12)
-                    // in the card table counts as FP8, which is what that query answers on RDNA 4.
-                    const bool skipAmdProbe = res.realFsr4Support == FSR4Support::None && DiagSwitches::NoAmdGpuProbe();
-                    if (skipAmdProbe)
-                    {
-                        device_info::AdapterId adapterId(gpuInfo.vendorId, gpuInfo.deviceId, gpuInfo.revisionId);
-                        auto cardInfo = device_info::GetCardInfo(adapterId);
-
-                        // An unlisted revision of a listed device still tells the generation.
-                        if (!cardInfo.has_value())
-                            cardInfo = device_info::GetCardInfo(device_info::AdapterId(
-                                gpuInfo.vendorId, gpuInfo.deviceId, device_info::kRevisionIdAny));
-
-                        if (cardInfo.has_value() && cardInfo.value().generation == device_info::HwGeneration::kGfx12)
-                            res.realFsr4Support = FSR4Support::FP8;
-
-                        LOG_INFO("[Diag] DiagNoAmdGpuProbe: {:04X}:{:04X} card table generation {}, FSR 4 FP8 assumed: {}",
-                                 (unsigned) gpuInfo.vendorId, (unsigned) gpuInfo.deviceId,
-                                 cardInfo.has_value() ? (int) cardInfo.value().generation : -1,
-                                 res.realFsr4Support == FSR4Support::FP8);
-                    }
-
-                    if (res.realFsr4Support == FSR4Support::None && !skipAmdProbe)
+                    if (res.realFsr4Support == FSR4Support::None)
                     {
                         auto moduleAmdxc64 = KernelBaseProxy::GetModuleHandleW_()(L"amdxc64.dll");
 

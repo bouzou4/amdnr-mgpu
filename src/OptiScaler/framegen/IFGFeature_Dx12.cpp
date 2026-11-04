@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "IFGFeature_Dx12.h"
 #include <State.h>
@@ -8,109 +7,6 @@
 #include <misc/DeferredRelease.h>
 
 #include <magic_enum.hpp>
-
-#include <array>
-#include <atomic>
-#include <mutex>
-
-namespace
-{
-// AMDNR 0.3.4 (OI-28): an FG resource create that fails on every frame logs failures 1-5 and then every 1000th,
-// with the running count (RDR2 wrote about 58k identical error lines). The create count is kept per failing
-// request (result + resource desc + heap), so a one-off failure of another FG resource still logs at once; when the
-// small table is full, further requests share one count. Log only; the failure handling is unchanged.
-bool IsLoggedFailureCount(uint64_t count) { return count <= 5 || count % 1000 == 0; }
-
-bool ShouldLogRepeatedFailure(std::atomic<uint64_t>& failures, uint64_t& count)
-{
-    count = failures.fetch_add(1, std::memory_order_relaxed) + 1;
-    return IsLoggedFailureCount(count);
-}
-
-struct CreateFailureKey
-{
-    HRESULT hr = S_OK;
-    D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
-    UINT64 alignment = 0;
-    UINT64 width = 0;
-    UINT height = 0;
-    UINT16 depthOrArraySize = 0;
-    UINT16 mipLevels = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    UINT sampleCount = 0;
-    D3D12_TEXTURE_LAYOUT layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE;
-    HRESULT heapHr = S_OK;
-    int heapType = -1;
-
-    bool operator==(const CreateFailureKey&) const = default;
-};
-
-CreateFailureKey MakeCreateFailureKey(HRESULT hr, const D3D12_RESOURCE_DESC& desc, HRESULT heapHr, int heapType)
-{
-    CreateFailureKey key;
-    key.hr = hr;
-    key.dimension = desc.Dimension;
-    key.alignment = desc.Alignment;
-    key.width = desc.Width;
-    key.height = desc.Height;
-    key.depthOrArraySize = desc.DepthOrArraySize;
-    key.mipLevels = desc.MipLevels;
-    key.format = desc.Format;
-    key.sampleCount = desc.SampleDesc.Count;
-    key.layout = desc.Layout;
-    key.flags = desc.Flags;
-    key.heapHr = heapHr;
-    key.heapType = heapType;
-    return key;
-}
-
-class RepeatedFailureLog
-{
-  public:
-    // True for failures 1-5 and every 1000th of the same key. count = failures of that key so far; shared = the
-    // table was full, so count covers every request that did not get a slot.
-    bool ShouldLog(const CreateFailureKey& key, uint64_t& count, bool& shared)
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        shared = false;
-
-        for (size_t i = 0; i < _used; i++)
-        {
-            if (_slots[i].key == key)
-            {
-                count = ++_slots[i].count;
-                return IsLoggedFailureCount(count);
-            }
-        }
-
-        if (_used < _slots.size())
-        {
-            _slots[_used].key = key;
-            _slots[_used].count = 1;
-            _used++;
-            count = 1;
-            return true;
-        }
-
-        shared = true;
-        count = ++_sharedCount;
-        return IsLoggedFailureCount(count);
-    }
-
-  private:
-    struct Slot
-    {
-        CreateFailureKey key;
-        uint64_t count = 0;
-    };
-
-    std::mutex _mutex;
-    std::array<Slot, 8> _slots {};
-    size_t _used = 0;
-    uint64_t _sharedCount = 0;
-};
-} // namespace
 
 bool IFGFeature_Dx12::GetResourceCopy(FG_ResourceType type, D3D12_RESOURCE_STATES bufferState, ID3D12Resource* output)
 {
@@ -421,19 +317,7 @@ void IFGFeature_Dx12::FlipResource(Dx12Resource* resource)
     if (!CreateBufferResource(_device, resource->resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &flipOutput, true,
                               resource->type == FG_ResourceType::Depth))
     {
-        // One count per flipped type (Depth, Velocity): a failing depth flip does not hide a later velocity one.
-        static std::atomic<uint64_t> flipFailures[2] {};
-        uint64_t failures = 0;
-
-        if (ShouldLogRepeatedFailure(flipFailures[type == FG_ResourceType::Depth ? 0 : 1], failures))
-        {
-            LOG_ERROR("{}, CreateBufferResource for flip is failed! (failure {}, logged 1-5 then every 1000th)",
-                      magic_enum::enum_name(type), failures);
-        }
-
-        // (AMDNR 0.3.4, G1) A failed re-create after a size/format change has already released the stored copy:
-        // store what is left (nullptr), so the next frame creates a new one instead of reading the freed one.
-        _resourceCopy[fIndex][type] = flipOutput;
+        LOG_ERROR("{}, CreateBufferResource for flip is failed!", magic_enum::enum_name(type));
         return;
     }
 
@@ -633,31 +517,13 @@ bool IFGFeature_Dx12::CreateBufferResource(ID3D12Device* device, ID3D12Resource*
     D3D12_HEAP_PROPERTIES heapProperties;
     D3D12_HEAP_FLAGS heapFlags;
     auto hr = source->GetHeapProperties(&heapProperties, &heapFlags);
-    const HRESULT heapHr = hr; // for the error line only; the create below runs either way, as before
 
     hr = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &inDesc, initialState, nullptr,
                                          IID_PPV_ARGS(target));
 
     if (hr != S_OK)
     {
-        static RepeatedFailureLog createFailures;
-        uint64_t failures = 0;
-        bool sharedCount = false;
-        // heapProperties is only read when GetHeapProperties filled it.
-        const int heapType = SUCCEEDED(heapHr) ? static_cast<int>(heapProperties.Type) : -1;
-
-        if (createFailures.ShouldLog(MakeCreateFailureKey(hr, inDesc, heapHr, heapType), failures, sharedCount))
-        {
-            LOG_ERROR("CreateCommittedResource result: {:X} (dimension {} {}x{}x{} mips {} format {} samples {} "
-                      "flags {:#x} layout {} alignment {} heap {} (GetHeapProperties {:X}); failure {}{}, logged 1-5 "
-                      "then every 1000th)",
-                      (UINT64) hr, static_cast<int>(inDesc.Dimension), inDesc.Width, inDesc.Height,
-                      inDesc.DepthOrArraySize, inDesc.MipLevels, static_cast<int>(inDesc.Format),
-                      inDesc.SampleDesc.Count, static_cast<UINT>(inDesc.Flags), static_cast<int>(inDesc.Layout),
-                      inDesc.Alignment, heapType, (UINT64) heapHr, failures,
-                      sharedCount ? " of requests without their own count" : "");
-        }
-
+        LOG_ERROR("CreateCommittedResource result: {:X}", (UINT64) hr);
         return false;
     }
 

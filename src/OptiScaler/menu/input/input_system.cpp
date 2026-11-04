@@ -1,14 +1,7 @@
-// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
 #include <include/imgui/imgui.h>
-#include <include/imgui/imgui_internal.h> // AMDNR 0.3.4.2 diagnostics: GImGui->HoveredWindow, WithinFrameScope
-
-#include <cstdio>
-#include <string>
-#include <vector>
 
 namespace OptiInput
 {
@@ -63,129 +56,6 @@ DirectInputGetDeviceData_t o_DirectInputDeviceGetDeviceData = nullptr;
 DirectInputDeviceRelease_t o_DirectInputDeviceRelease = nullptr;
 
 thread_local int bypassHookDepth = 0;
-
-bool DiagInputDisabled()
-{
-    static const bool disabled = []
-    {
-        const bool value = Config::Instance()->DiagNoInputHooks.value_or_default();
-
-        if (value)
-        {
-            LOG_INFO("[Diag] DiagNoInputHooks=true: OptiInput is not started (no WndProc subclass, no Win32/HID/raw/"
-                     "SetWindowsHookEx/cursor/XInput/DirectInput/GameInput hooks); the OptiScaler menu gets no input");
-        }
-
-        return value;
-    }();
-
-    return disabled;
-}
-
-bool DiagSkipHookGroup(uint32_t group)
-{
-    static const uint32_t skipMask = []
-    {
-        const std::string raw = Config::Instance()->DiagInputHooksSkip.value_or_default();
-
-        if (raw.empty())
-            return 0u;
-
-        struct GroupName
-        {
-            const char* Name;
-            uint32_t Bits;
-        };
-
-        namespace G = DiagHookGroup;
-        constexpr uint32_t minimalBits = G::KeyState | G::MsgPos | G::Clip | G::SendPost | G::Hid | G::Raw |
-                                         G::WinHook | G::Cursor | G::XInput | G::DInput | G::GameInput;
-
-        const GroupName names[] = {
-            { "message", G::Message },     { "keystate", G::KeyState }, { "msgpos", G::MsgPos },
-            { "clip", G::Clip },           { "sendpost", G::SendPost }, { "hid", G::Hid },
-            { "raw", G::Raw },             { "winhook", G::WinHook },   { "cursor", G::Cursor },
-            { "xinput", G::XInput },       { "dinput", G::DInput },     { "gameinput", G::GameInput },
-            { "subclass", G::Subclass },   { "minimal", minimalBits },
-            // AMDNR 0.3.4.2: not hook groups; the two menu input changes of 0.3.4.2 (off = 0.3.4.1 behaviour).
-            { "presslatch", G::MenuPressLatch }, { "clickreplay", G::MenuClickReplay },
-        };
-
-        uint32_t mask = 0;
-        std::string unknown;
-        std::string token;
-
-        auto flush = [&]
-        {
-            if (token.empty())
-                return;
-
-            bool found = false;
-            for (const auto& entry : names)
-            {
-                if (token == entry.Name)
-                {
-                    mask |= entry.Bits;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found)
-                unknown += (unknown.empty() ? "" : " ") + token;
-
-            token.clear();
-        };
-
-        for (const char ch : raw)
-        {
-            if (ch == ',' || ch == ';' || ch == '|' || ch == ' ' || ch == '\t')
-                flush();
-            else
-                token.push_back(ch);
-        }
-
-        flush();
-
-        std::string skipped;
-        for (const auto& entry : names)
-        {
-            if (entry.Bits != minimalBits && (mask & entry.Bits) != 0)
-                skipped += (skipped.empty() ? "" : " ") + std::string(entry.Name);
-        }
-
-        LOG_INFO("[Diag] DiagInputHooksSkip={}: OptiInput leaves these hook groups uninstalled: {}{}{}", raw,
-                 skipped.empty() ? "(none)" : skipped, unknown.empty() ? "" : " | unknown names ignored: ", unknown);
-
-        return mask;
-    }();
-
-    return (skipMask & group) != 0;
-}
-
-bool MenuPressLatchEnabled() { return !DiagSkipHookGroup(DiagHookGroup::MenuPressLatch); }
-
-bool MenuClickReplayEnabled() { return !DiagSkipHookGroup(DiagHookGroup::MenuClickReplay); }
-
-const char* InputEventSourceName(InputEventSource source)
-{
-    switch (source)
-    {
-    case InputEventSource::Poll:
-        return "poll";
-    case InputEventSource::PollTap:
-        return "pollTap";
-    case InputEventSource::Queue:
-        return "queue";
-    case InputEventSource::WndProc:
-        return "wndproc";
-    case InputEventSource::Raw:
-        return "raw";
-    case InputEventSource::None:
-    default:
-        return "none";
-    }
-}
 
 std::mutex& GetDetourTransactionMutex()
 {
@@ -337,65 +207,10 @@ void LogInputHealthSnapshotLocked(const char* origin)
     static DWORD lastTargetProcessId = 0;
     static DWORD lastInputProcessId = 0;
     static std::uint64_t lastPollingFallbackWarnFrame = 0;
-    static std::uint64_t lastNoInputWarnFrame = 0;
     static std::uint64_t lastNoInputHwndWarnFrame = 0;
     static std::uint64_t lastNoSubclassWarnFrame = 0;
 
-    // P27 (0.3.4): GetTickCount64() of the last input from each channel that feeds the menu (0 = none yet).
-    static std::uint64_t lastWindowInputMs = 0;
-    static std::uint64_t lastQueueInputMs = 0;
-    static std::uint64_t lastRawInputMs = 0;
-    static std::uint64_t lastPolledInputMs = 0;
-    static std::uint64_t lastAnyInputMs = 0;
-    static std::uint64_t lastPolledInputFrameCount = 0;
-    static std::uint64_t noInputWarnedStretchMs = ~0ull;
-    static constexpr std::uint64_t kInputHealthWarnFrames = 600;
-    static constexpr std::uint64_t kInputQuietMs = 10000;
-
     frameIndex++;
-
-    // P27 (0.3.4): the two input-health warnings below used to count only window/queue/raw messages on the one
-    // frame they sampled, so they fired on healthy sessions: frames without a key press or mouse move, menus fed by
-    // polling, and titles where another program's WndProc took the subclass over (most likely the Steam overlay in
-    // Hogwarts Legacy) while the queue detours and polling still fed the menu. Every channel now counts; the
-    // menu-visible line is a WARN only after kInputQuietMs with no input from any of them, once per such quiet
-    // stretch, and the subclass line is always a debug line (its loss has its own one-time WARN); the repeats (every
-    // kInputHealthWarnFrames frames, as before) are debug lines. Polling is read from its cumulative counter
-    // as well: with OverlayMenu=false BeginFrame runs twice per frame, and the second poll clears
-    // PolledInputUsedThisFrame for a mouse move or button edge the first poll saw.
-    const std::uint64_t nowMs = GetTickCount64();
-    static const std::uint64_t firstSnapshotMs = nowMs;
-
-    const bool polledThisFrame =
-        _state.PolledInputUsedThisFrame || _state.PolledInputFrameCount != lastPolledInputFrameCount;
-    lastPolledInputFrameCount = _state.PolledInputFrameCount;
-
-    if (_state.ReceivedWindowMessageThisFrame)
-        lastWindowInputMs = nowMs;
-    if (_state.ReceivedQueueMessageThisFrame)
-        lastQueueInputMs = nowMs;
-    if (_state.ReceivedRawInputThisFrame)
-        lastRawInputMs = nowMs;
-    if (polledThisFrame)
-        lastPolledInputMs = nowMs;
-
-    const bool anyInputThisFrame = _state.ReceivedAnyInputThisFrame || polledThisFrame;
-    if (anyInputThisFrame)
-        lastAnyInputMs = nowMs;
-
-    const std::uint64_t quietMs = nowMs - (lastAnyInputMs != 0 ? lastAnyInputMs : firstSnapshotMs);
-    const bool menuInputFlowing = quietMs < kInputQuietMs;
-    const auto recentInput = [nowMs](std::uint64_t lastMs) { return lastMs != 0 && nowMs - lastMs < kInputQuietMs; };
-
-    // A quiet stretch is named by the time of its last input (0 = none since start); one WARN per stretch.
-    const auto warnOncePerQuietStretch = [menuInputFlowing](std::uint64_t& warnedStretchMs)
-    {
-        if (menuInputFlowing || warnedStretchMs == lastAnyInputMs)
-            return false;
-
-        warnedStretchMs = lastAnyInputMs;
-        return true;
-    };
 
     HWND foregroundHwnd = GetForegroundWindow();
     DWORD foregroundProcessId = 0;
@@ -520,57 +335,21 @@ void LogInputHealthSnapshotLocked(const char* origin)
                  "in-process input module.");
     }
 
-    // P27 (0.3.4): the subclass loss itself is logged once, at WARN, where it happens (ValidateWindowSubclassLocked:
-    // "subclass lost ..."; InstallWindowSubclass / SetInputWindow: "failed to subclass ..."), so this repeat is always
-    // a debug line naming the channels that feed the menu. It is not a WARN even after a quiet stretch: with the menu
-    // closed a quiet stretch is a player who does not touch keyboard or mouse (game start, loading, gamepad, alt-tab),
-    // and with the menu open the 'menu is visible but no ...' line below reports it (with subclassed:no).
-    // Re-installing the subclass over another program's WndProc is not done here (it can make a recursive WndProc
-    // chain, see ValidateWindowSubclassLocked).
     if (_state.InputHwnd != nullptr && _state.UseWndProcSubclass && !_state.WndProcSubclassed &&
-        frameIndex - lastNoSubclassWarnFrame >= kInputHealthWarnFrames)
+        frameIndex - lastNoSubclassWarnFrame >= 600)
     {
         lastNoSubclassWarnFrame = frameIndex;
-
-        LOG_DEBUG("InputHwnd is set but WndProc is not subclassed; input in the last {} ms: window:{} queue:{} "
-                  "raw:{} polled:{} (none for {} ms): input:{} inputPid:{} externalTarget:{}",
-                  kInputQuietMs, YesNo(recentInput(lastWindowInputMs)), YesNo(recentInput(lastQueueInputMs)),
-                  YesNo(recentInput(lastRawInputMs)), YesNo(recentInput(lastPolledInputMs)), quietMs,
-                  static_cast<void*>(_state.InputHwnd), _state.InputProcessId, YesNo(_state.ExternalTargetProcess));
+        LOG_WARN(
+            "InputHwnd is set but WndProc is not subclassed: input:{} inputPid:{} useSubclass:{} externalTarget:{}",
+            static_cast<void*>(_state.InputHwnd), _state.InputProcessId, YesNo(_state.UseWndProcSubclass),
+            YesNo(_state.ExternalTargetProcess));
     }
 
-    // P27 (0.3.4): polling counts as input too, and a quiet frame (no key press or mouse move) is not a fault: WARN
-    // once per kInputQuietMs stretch without input on any channel, else a debug line.
-    // AMDNR 0.3.4.2: checked every kInputQuietMs by time, not every kInputHealthWarnFrames frames (at Assetto Corsa's
-    // 4-10 fps, 600 frames were 60-150 s).
-    if (_state.MenuVisible && _state.InputHwnd != nullptr && !anyInputThisFrame &&
-        _state.NoInputWarnCheck.Due(nowMs, kInputQuietMs))
-    {
-        lastNoInputWarnFrame = frameIndex;
-
-        if (warnOncePerQuietStretch(noInputWarnedStretchMs))
-        {
-            LOG_WARN("menu is visible but no window/queue/raw/polled input was received for {} ms. input:{} "
-                     "foreground:{} focused:{} subclassed:{}. Check that InputHwnd is the real overlay/menu HWND and "
-                     "that its message pump runs.",
-                     quietMs, static_cast<void*>(_state.InputHwnd), static_cast<void*>(foregroundHwnd),
-                     YesNo(_state.Focused), YesNo(_state.WndProcSubclassed));
-        }
-        else
-        {
-            LOG_DEBUG("menu is visible and this frame had no input; input in the last {} ms: window:{} queue:{} "
-                      "raw:{} polled:{} (none for {} ms). input:{} foreground:{} focused:{} subclassed:{}",
-                      kInputQuietMs, YesNo(recentInput(lastWindowInputMs)), YesNo(recentInput(lastQueueInputMs)),
-                      YesNo(recentInput(lastRawInputMs)), YesNo(recentInput(lastPolledInputMs)), quietMs,
-                      static_cast<void*>(_state.InputHwnd), static_cast<void*>(foregroundHwnd), YesNo(_state.Focused),
-                      YesNo(_state.WndProcSubclassed));
-        }
-    }
-
-    // Upstream: polling saw input while every native message path stayed silent.
     const bool receivedNativeInputThisFrame = _state.ReceivedWindowMessageThisFrame ||
                                               _state.ReceivedQueueMessageThisFrame || _state.ReceivedRawInputThisFrame;
 
+    // An idle frame without Win32/raw messages is normal.
+    // Only warn when polling actually observed user input while all native message paths saw none
     if (_state.MenuVisible && _state.Focused && _state.InputHwnd != nullptr && _state.PolledInputUsedThisFrame &&
         !receivedNativeInputThisFrame && frameIndex - lastPollingFallbackWarnFrame >= 600)
     {
@@ -624,131 +403,44 @@ bool ShouldPollVirtualKey(int vk)
     }
 }
 
-// AMDNR 0.3.4.2: the menu's nav keys (EdgeReplay.h) and the runtime chooser keys, whose "pressed since the last call"
-// bit the poll believes while the menu is open.
-bool IsMenuNavTapKey(int vk)
-{
-    switch (vk)
-    {
-    case VK_TAB:
-    case VK_LEFT:
-    case VK_RIGHT:
-    case VK_UP:
-    case VK_DOWN:
-    case VK_SPACE:
-    case VK_RETURN:
-    case VK_ESCAPE:
-    case VK_NUMPAD1:
-    case VK_NUMPAD2:
-        return true;
-    default:
-        return vk >= '0' && vk <= '9';
-    }
-}
-
-// What the poll saw of one key or button (AMDNR 0.3.4.2): its physical reading, the last poll that saw it down, and
-// that value as it was before this frame's first poll (the freshness line of EdgeReplay.h).
-void RecordPollReadingLocked(ButtonState& button, bool down, DWORD time, bool firstPollThisFrame)
-{
-    if (firstPollThisFrame)
-    {
-        button.PollDownBeforeValid = button.LastPollDownValid;
-        button.PollDownBeforeMs = button.LastPollDownMs;
-    }
-
-    button.PolledDown = down;
-
-    if (down)
-    {
-        button.LastPollDownValid = true;
-        button.LastPollDownMs = time;
-    }
-}
-
-void PollVirtualKeyLocked(int vk, DWORD time, bool firstPollThisFrame, bool menuKeyTapPrimed, bool navTapPrimed)
+void PollVirtualKeyLocked(int vk, DWORD time)
 {
     if (!ShouldPollVirtualKey(vk))
         return;
 
-    const SHORT keyState = RealGetAsyncKeyStateSafe(vk);
-    const bool down = (keyState & 0x8000) != 0;
-
-    ButtonState& key = _state.Keys[vk];
-    const bool polledDownBefore = key.PolledDown;
-    RecordPollReadingLocked(key, down, time, firstPollThisFrame);
-
-    // AMDNR 0.3.4.2: a tap that went down and up between two polls (GetAsyncKeyState bit 0), for the menu key and,
-    // while the menu is open, its nav keys: one press and release now, and late messages of that tap are stale. A
-    // press any source delivered since this key's previous poll is not a tap (PressCountAtLastPoll).
-    const bool tapWatched = (menuKeyTapPrimed && vk == _state.MenuKeyVk) || (navTapPrimed && IsMenuNavTapKey(vk));
+    const bool down = (RealGetAsyncKeyStateSafe(vk) & 0x8000) != 0;
 
     if (down)
     {
-        if (vk == _state.HeldKeyVk)
-        {
-            // The held key reads down again: the hold waits for its release, not for a late message pair.
-            _state.HeldKeyAwaitingLatePair = false;
-            _state.HeldKeyLastDownMs = time;
-        }
-
-        SetKeyDown(vk, time, ShouldBlockKeyboardInputLocked(), InputEventSource::Poll, false);
-    }
-    else if (tapWatched && MenuInput::IsMissedTap(true, (keyState & 1) != 0, down, polledDownBefore, key.Down,
-                                                  key.PressCount, key.PressCountAtLastPoll))
-    {
-        key.LastPollDownValid = true;
-        key.LastPollDownMs = time;
-        SetKeyDown(vk, time, ShouldBlockKeyboardInputLocked(), InputEventSource::PollTap, false);
-        SetKeyUpStateOnly(vk, time, InputEventSource::PollTap);
-    }
-    else if (key.Down)
-    {
-        SetKeyUpStateOnly(vk, time, InputEventSource::Poll);
+        SetKeyDown(vk, time, ShouldBlockKeyboardInputLocked());
+        return;
     }
 
-    key.PressCountAtLastPoll = key.PressCount;
+    if (_state.Keys[vk].Down)
+        SetKeyUpStateOnly(vk, time);
 }
 
-bool PollMouseButtonLocked(int vk, int button, DWORD time, bool firstPollThisFrame, bool tapPrimed)
+bool PollMouseButtonLocked(int vk, int button, DWORD time)
 {
     if (button < 0 || button >= static_cast<int>(_state.MouseButtons.size()))
         return false;
 
-    ButtonState& mouseButton = _state.MouseButtons[button];
-    const bool wasDown = mouseButton.Down;
-    const SHORT keyState = RealGetAsyncKeyStateSafe(vk);
-    const bool down = (keyState & 0x8000) != 0;
-    const bool polledDownBefore = mouseButton.PolledDown;
-    RecordPollReadingLocked(mouseButton, down, time, firstPollThisFrame);
-
-    bool used = false;
+    const bool wasDown = _state.MouseButtons[button].Down;
+    const bool down = (RealGetAsyncKeyStateSafe(vk) & 0x8000) != 0;
 
     if (down)
     {
-        SetMouseDown(button, time, ShouldBlockMouseInputLocked(), InputEventSource::Poll);
-        used = !wasDown;
-    }
-    // AMDNR 0.3.4.2: a click that went down and up between two polls while the menu is open (GetAsyncKeyState bit 0):
-    // one click now (FeedImGui replays it), and the late messages of that click are older than this poll. A click any
-    // source delivered since this button's previous poll is not a tap (PressCountAtLastPoll): with OverlayMenu=false
-    // a whole click can be pumped and replayed between two polls, and must not click a second time.
-    else if (MenuInput::IsMissedTap(tapPrimed, (keyState & 1) != 0, down, polledDownBefore, wasDown,
-                                    mouseButton.PressCount, mouseButton.PressCountAtLastPoll))
-    {
-        mouseButton.LastPollDownValid = true;
-        mouseButton.LastPollDownMs = time;
-        SetMouseDown(button, time, ShouldBlockMouseInputLocked(), InputEventSource::PollTap);
-        SetMouseUpStateOnly(button, time);
-        used = true;
-    }
-    else if (wasDown)
-    {
-        SetMouseUpStateOnly(button, time);
-        used = true;
+        SetMouseDown(button, time, ShouldBlockMouseInputLocked());
+        return !wasDown;
     }
 
-    mouseButton.PressCountAtLastPoll = mouseButton.PressCount;
-    return used;
+    if (wasDown)
+    {
+        SetMouseUpStateOnly(button, time);
+        return true;
+    }
+
+    return false;
 }
 
 HWND GetPolledCoordinateHwndLocked()
@@ -992,8 +684,6 @@ void PollInputFallbackLocked()
 
     if (!_state.Initialized || !_state.Focused)
     {
-        // AMDNR 0.3.4.2: after a frame without a poll the "pressed since the last call" bits can be stale.
-        _state.TapGate.NoPoll();
         RefreshInputAcquisitionModeLocked();
         return;
     }
@@ -1032,18 +722,11 @@ void PollInputFallbackLocked()
         }
     }
 
-    // AMDNR 0.3.4.2: "pressed since the last call" bits believed this poll (EdgeReplay.h, TapBitGate), and whether
-    // this is the frame's first poll (BeginFrame can run twice per frame with OverlayMenu=false).
-    const bool firstPollThisFrame = !_state.PollRanThisFrame;
-    const bool menuKeyTapPrimed = _state.MenuKeyTapWatch && _state.TapGate.Primed(false, _state.MenuVisible);
-    const bool navTapPrimed = _state.MenuVisible && MenuClickReplayEnabled() &&
-                              _state.TapGate.Primed(true, _state.MenuVisible);
-
-    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_LBUTTON, 0, time, firstPollThisFrame, navTapPrimed);
-    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_RBUTTON, 1, time, firstPollThisFrame, navTapPrimed);
-    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_MBUTTON, 2, time, firstPollThisFrame, navTapPrimed);
-    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_XBUTTON1, 3, time, firstPollThisFrame, navTapPrimed);
-    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_XBUTTON2, 4, time, firstPollThisFrame, navTapPrimed);
+    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_LBUTTON, 0, time);
+    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_RBUTTON, 1, time);
+    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_MBUTTON, 2, time);
+    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_XBUTTON1, 3, time);
+    _state.PolledMouseUsedThisFrame |= PollMouseButtonLocked(VK_XBUTTON2, 4, time);
 
     if (_state.PolledMouseUsedThisFrame)
         _state.PolledMouseFrameCount++;
@@ -1051,7 +734,7 @@ void PollInputFallbackLocked()
     for (int vk = 0; vk < 256; ++vk)
     {
         const bool wasDown = _state.Keys[vk].Down;
-        PollVirtualKeyLocked(vk, time, firstPollThisFrame, menuKeyTapPrimed, navTapPrimed);
+        PollVirtualKeyLocked(vk, time);
 
         if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
             _state.PolledKeyboardUsedThisFrame = true;
@@ -1065,9 +748,6 @@ void PollInputFallbackLocked()
         _state.PolledInputUsedThisFrame = true;
         _state.PolledInputFrameCount++;
     }
-
-    _state.TapGate.AfterPoll(_state.MenuVisible);
-    _state.PollRanThisFrame = true;
 
     RefreshInputAcquisitionModeLocked();
 }
@@ -1094,9 +774,6 @@ void ApplyMenuVisibilityChangeLocked(bool visible)
 
     if (!wasMenuVisible && visible)
     {
-        // AMDNR 0.3.4.2: the menu is open again, so it blocks the key itself.
-        EndKeyHoldLocked("the menu opened");
-
         HandleBlockingFocusGainLocked();
     }
     else if (wasMenuVisible && !visible)
@@ -1122,9 +799,6 @@ void ApplyMenuVisibilityChangeLocked(bool visible)
 
 bool Initialize(const InitializeOptions& options)
 {
-    if (DiagInputDisabled())
-        return false;
-
     std::unique_lock lock(_state.Mutex);
 
     if (_state.CurrentProcessId == 0)
@@ -1202,7 +876,7 @@ bool Initialize(HWND targetHwnd, bool isUwp)
     InitializeOptions options {};
     options.TargetHwnd = targetHwnd;
     options.IsUwp = isUwp;
-    options.UseWndProcSubclass = !DiagSkipHookGroup(DiagHookGroup::Subclass);
+    options.UseWndProcSubclass = true;
 
     return Initialize(options);
 }
@@ -1213,7 +887,7 @@ bool Initialize(HWND targetHwnd, HWND inputHwnd, bool isUwp)
     options.TargetHwnd = targetHwnd;
     options.InputHwnd = inputHwnd;
     options.IsUwp = isUwp;
-    options.UseWndProcSubclass = !DiagSkipHookGroup(DiagHookGroup::Subclass);
+    options.UseWndProcSubclass = true;
 
     return Initialize(options);
 }
@@ -1442,25 +1116,6 @@ void ResetStateAfterShutdown()
 
     _state.MouseWheel = 0.0f;
     _state.TextInput.clear();
-
-    // AMDNR 0.3.4.2
-    _state.MenuKeyVk = 0;
-    _state.MenuKeyTapWatch = false;
-    _state.MenuKeyEdgeHead = 0;
-    _state.MenuKeyEdgeCount = 0;
-    _state.MenuKeyEdgesDropped = 0;
-    _state.PollRanThisFrame = false;
-    _state.TapGate = {};
-    _state.HeldKeyVk = 0;
-    _state.HeldKeyLastDownMs = 0;
-    _state.FedKeyDown = {};
-    _state.ReplayedKeyCount = {};
-    _state.FedMouseDown = {};
-    _state.ReplayedMouseCount = {};
-    _state.LastFedMousePos = { LONG_MIN, LONG_MIN };
-    _state.DiagWindow = {};
-    _state.DiagOpen = {};
-    _state.DiagMenuVisible = false;
 }
 
 void Shutdown()
@@ -1526,9 +1181,6 @@ static void BeginFrameLocked(HWND targetHwnd, HWND inputHwnd, bool hasInputHwnd,
 
 void BeginFrame(HWND targetHwnd, bool isUwp)
 {
-    if (DiagInputDisabled())
-        return;
-
     std::unique_lock lock(_state.Mutex);
 
     if (!_state.Initialized)
@@ -1549,9 +1201,6 @@ void BeginFrame(HWND targetHwnd, bool isUwp)
 
 void BeginFrame(HWND targetHwnd, HWND inputHwnd, bool isUwp)
 {
-    if (DiagInputDisabled())
-        return;
-
     std::unique_lock lock(_state.Mutex);
 
     if (!_state.Initialized)
@@ -1586,14 +1235,6 @@ void FeedImGui(bool menuVisible)
         io.ClearInputKeys();
         io.ClearInputMouse();
 
-        // AMDNR 0.3.4.2: ImGui holds nothing down now; edges made while the menu was hidden are never replayed.
-        _state.FedKeyDown = {};
-        _state.FedMouseDown = {};
-        for (int vk = 0; vk < 256; ++vk)
-            _state.ReplayedKeyCount[vk] = _state.Keys[vk].PressCount;
-        for (std::size_t b = 0; b < _state.MouseButtons.size(); ++b)
-            _state.ReplayedMouseCount[b] = _state.MouseButtons[b].PressCount;
-
         return;
     }
 
@@ -1619,10 +1260,6 @@ void FeedImGui(bool menuVisible)
         io.KeyAlt = false;
         io.KeySuper = false;
 
-        // AMDNR 0.3.4.2: ImGui clears its keys and buttons when the app loses focus.
-        _state.FedKeyDown = {};
-        _state.FedMouseDown = {};
-
         return;
     }
 
@@ -1630,73 +1267,6 @@ void FeedImGui(bool menuVisible)
     {
         if (vk >= 0 && vk < 256)
             io.AddKeyEvent(key, _state.Keys[vk].Down);
-    };
-
-    // AMDNR 0.3.4.2 (Assetto Corsa at 3-10 fps): besides the level, a fresh edge pair inside one frame is replayed
-    // (menu/input/EdgeReplay.h): a click shorter than a frame, or a release and a new press. ImGui's trickle queue
-    // turns the pair into exactly one click over two frames.
-    const bool replayEdges = MenuClickReplayEnabled();
-    const DWORD replayNow = GetTickCount();
-    const std::uint32_t replayMaxAgeMs = MenuInput::ReplayMaxAgeMs(io.DeltaTime * 1000.0f);
-
-    auto SampleOf = [](const ButtonState& button)
-    {
-        MenuInput::EdgeSample sample {};
-        sample.down = button.Down;
-        sample.pressed = button.Pressed;
-        sample.released = button.Released;
-        sample.pressRepeat = button.PressRepeat;
-        sample.pressByPoll =
-            button.PressSource == InputEventSource::Poll || button.PressSource == InputEventSource::PollTap;
-        sample.pressCount = button.PressCount;
-        sample.pressTimeMs = button.PressTimeMs;
-        sample.pollDownBeforeValid = button.PollDownBeforeValid;
-        sample.pollDownBeforeMs = button.PollDownBeforeMs;
-        return sample;
-    };
-
-    auto DecideReplayOf = [&](const ButtonState& button, bool lastFedDown, std::uint32_t& lastSeenPressCount)
-    {
-        MenuInput::ReplayDecision decision {};
-        if (replayEdges)
-            decision = MenuInput::DecideReplay(SampleOf(button), lastFedDown, lastSeenPressCount, replayNow,
-                                               replayMaxAgeMs);
-        lastSeenPressCount = button.PressCount;
-
-        if (decision.kind != MenuInput::ReplayKind::None)
-            _state.DiagWindow.Replayed++;
-        else if (decision.stale)
-            _state.DiagWindow.Stale++;
-
-        return decision;
-    };
-
-    auto AddNavKey = [&](ImGuiKey key, int vk)
-    {
-        if (vk < 0 || vk >= 256)
-            return;
-
-        const ButtonState& state = _state.Keys[vk];
-        const MenuInput::ReplayDecision decision =
-            DecideReplayOf(state, _state.FedKeyDown[vk], _state.ReplayedKeyCount[vk]);
-
-        if (decision.kind == MenuInput::ReplayKind::Click)
-        {
-            io.AddKeyEvent(key, true);
-            io.AddKeyEvent(key, false);
-            _state.FedKeyDown[vk] = false;
-        }
-        else if (decision.kind == MenuInput::ReplayKind::Reclick)
-        {
-            io.AddKeyEvent(key, false);
-            io.AddKeyEvent(key, true);
-            _state.FedKeyDown[vk] = true;
-        }
-        else
-        {
-            io.AddKeyEvent(key, state.Down);
-            _state.FedKeyDown[vk] = state.Down;
-        }
     };
 
     const bool polledCtrlDown = (RealGetAsyncKeyStateSafe(VK_CONTROL) & 0x8000) != 0 ||
@@ -1748,55 +1318,22 @@ void FeedImGui(bool menuVisible)
     AddKey(ImGuiKey_LeftAlt, VK_LMENU);
     AddKey(ImGuiKey_RightAlt, VK_RMENU);
 
-    const float mouseX = static_cast<float>(_state.MouseClientPos.x);
-    const float mouseY = static_cast<float>(_state.MouseClientPos.y);
-    io.AddMousePosEvent(mouseX, mouseY);
-
-    if (_state.MouseClientPos.x != _state.LastFedMousePos.x || _state.MouseClientPos.y != _state.LastFedMousePos.y)
-    {
-        _state.LastFedMousePos = _state.MouseClientPos;
-        _state.DiagWindow.Moves++;
-    }
+    io.AddMousePosEvent(static_cast<float>(_state.MouseClientPos.x), static_cast<float>(_state.MouseClientPos.y));
 
     if (_state.MouseWheel != 0.0f)
         io.AddMouseWheelEvent(0.0f, _state.MouseWheel);
 
-    for (int b = 0; b < static_cast<int>(_state.MouseButtons.size()); ++b)
-    {
-        const ButtonState& mouseButton = _state.MouseButtons[b];
-        const MenuInput::ReplayDecision decision =
-            DecideReplayOf(mouseButton, _state.FedMouseDown[b], _state.ReplayedMouseCount[b]);
+    io.AddMouseButtonEvent(0, _state.MouseButtons[0].Down);
+    io.AddMouseButtonEvent(1, _state.MouseButtons[1].Down);
+    io.AddMouseButtonEvent(2, _state.MouseButtons[2].Down);
+    io.AddMouseButtonEvent(3, _state.MouseButtons[3].Down);
+    io.AddMouseButtonEvent(4, _state.MouseButtons[4].Down);
 
-        if (decision.kind == MenuInput::ReplayKind::Click)
-        {
-            // Down and up where the button went down (a message's lParam), then back to the cursor.
-            if (mouseButton.PressPosValid)
-                io.AddMousePosEvent(static_cast<float>(mouseButton.PressPos.x),
-                                    static_cast<float>(mouseButton.PressPos.y));
-            io.AddMouseButtonEvent(b, true);
-            io.AddMouseButtonEvent(b, false);
-            if (mouseButton.PressPosValid)
-                io.AddMousePosEvent(mouseX, mouseY);
-            _state.FedMouseDown[b] = false;
-        }
-        else if (decision.kind == MenuInput::ReplayKind::Reclick)
-        {
-            io.AddMouseButtonEvent(b, false);
-            io.AddMouseButtonEvent(b, true);
-            _state.FedMouseDown[b] = true;
-        }
-        else
-        {
-            io.AddMouseButtonEvent(b, mouseButton.Down);
-            _state.FedMouseDown[b] = mouseButton.Down;
-        }
-    }
-
-    AddNavKey(ImGuiKey_Tab, VK_TAB);
-    AddNavKey(ImGuiKey_LeftArrow, VK_LEFT);
-    AddNavKey(ImGuiKey_RightArrow, VK_RIGHT);
-    AddNavKey(ImGuiKey_UpArrow, VK_UP);
-    AddNavKey(ImGuiKey_DownArrow, VK_DOWN);
+    AddKey(ImGuiKey_Tab, VK_TAB);
+    AddKey(ImGuiKey_LeftArrow, VK_LEFT);
+    AddKey(ImGuiKey_RightArrow, VK_RIGHT);
+    AddKey(ImGuiKey_UpArrow, VK_UP);
+    AddKey(ImGuiKey_DownArrow, VK_DOWN);
     AddKey(ImGuiKey_PageUp, VK_PRIOR);
     AddKey(ImGuiKey_PageDown, VK_NEXT);
     AddKey(ImGuiKey_Home, VK_HOME);
@@ -1804,9 +1341,9 @@ void FeedImGui(bool menuVisible)
     AddKey(ImGuiKey_Insert, VK_INSERT);
     AddKey(ImGuiKey_Delete, VK_DELETE);
     AddKey(ImGuiKey_Backspace, VK_BACK);
-    AddNavKey(ImGuiKey_Space, VK_SPACE);
-    AddNavKey(ImGuiKey_Enter, VK_RETURN);
-    AddNavKey(ImGuiKey_Escape, VK_ESCAPE);
+    AddKey(ImGuiKey_Space, VK_SPACE);
+    AddKey(ImGuiKey_Enter, VK_RETURN);
+    AddKey(ImGuiKey_Escape, VK_ESCAPE);
 
     for (int vk = 'A'; vk <= 'Z'; vk++)
     {
@@ -1815,126 +1352,17 @@ void FeedImGui(bool menuVisible)
 
     for (int vk = '0'; vk <= '9'; vk++)
     {
-        AddNavKey(static_cast<ImGuiKey>(ImGuiKey_0 + (vk - '0')), vk);
+        io.AddKeyEvent(static_cast<ImGuiKey>(ImGuiKey_0 + (vk - '0')), _state.Keys[vk].Down);
     }
 
     for (wchar_t ch : _state.TextInput)
         io.AddInputCharacterUTF16(ch);
 }
 
-namespace
-{
-std::string DiagSourceCounts(const std::array<std::uint32_t, InputEventSourceCount>& counts)
-{
-    return "wnd " + std::to_string(counts[static_cast<std::size_t>(InputEventSource::WndProc)]) + " queue " +
-           std::to_string(counts[static_cast<std::size_t>(InputEventSource::Queue)]) + " raw " +
-           std::to_string(counts[static_cast<std::size_t>(InputEventSource::Raw)]) + " poll " +
-           std::to_string(counts[static_cast<std::size_t>(InputEventSource::Poll)]) + " tap " +
-           std::to_string(counts[static_cast<std::size_t>(InputEventSource::PollTap)]);
-}
-
-// AMDNR 0.3.4.2 (D2 / D4): while the menu is visible, one INFO line per second (menu/input/InputDiagRate.h: 120 per
-// session, then one per 30 s) and a summary when it closes: which source delivered the menu's clicks and keys, how late
-// the game's messages were, and whether ImGui turned them into clicks.
-void UpdateMenuInputDiagLocked(bool menuVisible)
-{
-    static MenuInput::LineBudget summaryBudget { 60 };
-    const std::uint64_t now = GetTickCount64();
-    const bool wasVisible = _state.DiagMenuVisible;
-    _state.DiagMenuVisible = menuVisible;
-
-    if (menuVisible && !wasVisible)
-    {
-        // Opened this frame: count from now on.
-        _state.DiagWindow = {};
-        _state.DiagOpen = {};
-        _state.DiagOpenStartMs = now;
-        _state.DiagLastEndFrameMs = now;
-        _state.DiagLimiter.Start(now);
-        return;
-    }
-
-    if (!menuVisible)
-    {
-        if (wasVisible)
-        {
-            MenuInputDiagCounters open = _state.DiagOpen;
-            open.Add(_state.DiagWindow);
-
-            if (open.Frames != 0 && summaryBudget.Take())
-            {
-                LOG_INFO("menu input, that open: {:.1f} s, {} frames (avg {} ms), focused {}, foreground elsewhere {} "
-                         "(pid {}) | mouse downs {}, replayed {}, stale {}, max message age {} ms | ImGui clicks {}, "
-                         "hovered {} | key downs {}",
-                         static_cast<double>(now - _state.DiagOpenStartMs) / 1000.0, open.Frames,
-                         open.FrameMsSum / open.Frames, open.FocusedFrames, open.ForegroundOtherFrames,
-                         open.ForegroundOtherPid, DiagSourceCounts(open.MouseDowns), open.Replayed, open.Stale,
-                         open.MaxMsgAgeMs, open.ImGuiClicks, open.HoveredFrames, DiagSourceCounts(open.KeyDowns));
-            }
-        }
-
-        _state.DiagWindow = {};
-        _state.DiagOpen = {};
-        return;
-    }
-
-    MenuInputDiagCounters& window = _state.DiagWindow;
-    window.Frames++;
-    window.FrameMsSum += now - _state.DiagLastEndFrameMs;
-    _state.DiagLastEndFrameMs = now;
-
-    if (_state.Focused)
-        window.FocusedFrames++;
-
-    if (const HWND foreground = GetForegroundWindow(); foreground != nullptr)
-    {
-        const HWND foregroundRoot = GetAncestor(foreground, GA_ROOT);
-        if (foregroundRoot != _state.TargetRootHwnd && foregroundRoot != _state.InputRootHwnd)
-        {
-            window.ForegroundOtherFrames++;
-            DWORD foregroundPid = 0;
-            GetWindowThreadProcessId(foreground, &foregroundPid);
-            window.ForegroundOtherPid = foregroundPid;
-        }
-    }
-
-    // RenderMenu calls EndFrame after ImGui::NewFrame, so this frame's clicks and hover are known.
-    if (ImGuiContext* context = ImGui::GetCurrentContext(); context != nullptr && context->WithinFrameScope)
-    {
-        const ImGuiIO& io = context->IO;
-        for (int b = 0; b < ImGuiMouseButton_COUNT; ++b)
-        {
-            if (io.MouseClicked[b])
-                window.ImGuiClicks++;
-        }
-
-        if (context->HoveredWindow != nullptr)
-            window.HoveredFrames++;
-    }
-
-    if (!_state.DiagLimiter.Due(now))
-        return;
-
-    LOG_INFO("menu input: {} frames (avg {} ms), focused {}, foreground elsewhere {} | mouse downs {}, replayed {}, "
-             "stale {}, max message age {} ms | moves {}, ImGui clicks {}, hovered {}, pos ({}, {}) | key downs {}",
-             window.Frames, window.Frames != 0 ? window.FrameMsSum / window.Frames : 0, window.FocusedFrames,
-             window.ForegroundOtherFrames, DiagSourceCounts(window.MouseDowns), window.Replayed, window.Stale,
-             window.MaxMsgAgeMs, window.Moves, window.ImGuiClicks, window.HoveredFrames, _state.MouseClientPos.x,
-             _state.MouseClientPos.y, DiagSourceCounts(window.KeyDowns));
-
-    _state.DiagOpen.Add(window);
-    window = {};
-}
-} // namespace
-
 void EndFrame(bool menuVisible)
 {
-    if (DiagInputDisabled())
-        return;
-
     std::unique_lock lock(_state.Mutex);
 
-    UpdateMenuInputDiagLocked(menuVisible);
     ApplyMenuVisibilityChangeLocked(menuVisible);
     LogInputHealthSnapshotLocked("EndFrame");
     ClearTransientState();
@@ -1942,9 +1370,6 @@ void EndFrame(bool menuVisible)
 
 void SetMenuVisible(bool visible)
 {
-    if (DiagInputDisabled())
-        return;
-
     std::unique_lock lock(_state.Mutex);
 
     ApplyMenuVisibilityChangeLocked(visible);
@@ -2055,10 +1480,6 @@ bool ShouldBlockCursor()
 bool ShouldBlockVirtualKey(int vk)
 {
     std::unique_lock lock(_state.Mutex);
-
-    // AMDNR 0.3.4.2: the menu key that closed the menu, until it is released (HoldKeyUntilReleased).
-    if (bypassHookDepth == 0 && IsHeldKeyLocked(vk))
-        return true;
 
     if (IsMouseVirtualKey(vk))
         return ShouldBlockMouseInputLocked();
@@ -2243,8 +1664,6 @@ InputAcquisitionMode GetInputAcquisitionMode()
 
 void ResetMenuInputTransientState()
 {
-    std::unique_lock lock(_state.Mutex);
-
     _state.ExternalPendingMouseDeltaX = 0;
     _state.ExternalPendingMouseDeltaY = 0;
     _state.MouseWheel = 0.0f;
@@ -2261,252 +1680,6 @@ void ResetMenuInputTransientState()
         button.Pressed = false;
         button.Released = false;
     }
-
-    // AMDNR 0.3.4.2: the menu opens with ImGui's input cleared; nothing from before is replayed into it.
-    _state.FedKeyDown = {};
-    _state.FedMouseDown = {};
-    for (int vk = 0; vk < 256; ++vk)
-        _state.ReplayedKeyCount[vk] = _state.Keys[vk].PressCount;
-    for (std::size_t b = 0; b < _state.MouseButtons.size(); ++b)
-        _state.ReplayedMouseCount[b] = _state.MouseButtons[b].PressCount;
-}
-
-KeyObservation GetKeyObservation(int vk)
-{
-    std::unique_lock lock(_state.Mutex);
-
-    KeyObservation observation {};
-
-    if (vk < 0 || vk >= 256)
-        return observation;
-
-    const ButtonState& key = _state.Keys[vk];
-    observation.Down = key.Down;
-    observation.Pressed = key.Pressed;
-    observation.Released = key.Released;
-    observation.PressCount = key.PressCount;
-    observation.PressTimeMs = key.PressTimeMs;
-    observation.PressSource = key.PressSource;
-    observation.PressRepeat = key.PressRepeat;
-    observation.PolledThisFrame = _state.PollRanThisFrame && ShouldPollVirtualKey(vk);
-    observation.PolledDown = key.PolledDown;
-    observation.PollDownBeforeValid = key.PollDownBeforeValid;
-    observation.PollDownBeforeMs = key.PollDownBeforeMs;
-    return observation;
-}
-
-void SetMenuKey(int vk, bool readTapBit)
-{
-    std::unique_lock lock(_state.Mutex);
-
-    const int key = vk > 0 && vk < 256 ? vk : 0;
-    if (key != _state.MenuKeyVk)
-    {
-        _state.MenuKeyVk = key;
-        _state.MenuKeyEdgeHead = 0;
-        _state.MenuKeyEdgeCount = 0;
-        EndKeyHoldLocked("the menu key changed");
-    }
-
-    _state.MenuKeyTapWatch = key != 0 && readTapBit;
-}
-
-std::size_t DrainMenuKeyEdges(KeyEdgeRecord* out, std::size_t maxCount, std::size_t* dropped)
-{
-    std::unique_lock lock(_state.Mutex);
-
-    std::size_t written = 0;
-    std::size_t lost = _state.MenuKeyEdgesDropped;
-
-    while (_state.MenuKeyEdgeCount != 0)
-    {
-        if (out != nullptr && written < maxCount)
-            out[written++] = _state.MenuKeyEdges[_state.MenuKeyEdgeHead];
-        else
-            lost++;
-
-        _state.MenuKeyEdgeHead = (_state.MenuKeyEdgeHead + 1) % _state.MenuKeyEdges.size();
-        _state.MenuKeyEdgeCount--;
-    }
-
-    _state.MenuKeyEdgeHead = 0;
-    _state.MenuKeyEdgesDropped = 0;
-
-    if (dropped != nullptr)
-        *dropped = lost;
-
-    return written;
-}
-
-void HoldKeyUntilReleased(int vk)
-{
-    std::unique_lock lock(_state.Mutex);
-
-    if (vk <= 0 || vk >= 256 || IsMouseVirtualKey(vk))
-        return;
-
-    // Already up: the poll found the whole press between two frames (a tap: SetKeyDown and SetKeyUpStateOnly in one
-    // poll), so there is no release left to wait for -- but the game's own WM_KEYDOWN / WM_KEYUP of that same
-    // physical press can still arrive up to about 2 s later (Assetto Corsa at 3-10 fps) with the menu already
-    // closed, and nothing else would keep that stray press from the game. The hold then waits for exactly that late
-    // pair (MenuInput::kHoldLatePairTimeoutMs, ended by the pair's key-up), instead of a release with the 3 s
-    // window refreshed while the key is seen down.
-    const ButtonState& key = _state.Keys[vk];
-    const bool stillDown = key.Down || key.PolledDown;
-
-    _state.HeldKeyVk = vk;
-    _state.HeldKeyAwaitingLatePair = !stillDown;
-    _state.HeldKeyLastDownMs = GetTickCount();
-
-    if (!stillDown)
-        LOG_DEBUG("menu key {:#x} closed the menu and already reads up: held back from the game until the late "
-                  "messages of that press arrive, at most {} ms",
-                  vk, MenuInput::kHoldLatePairTimeoutMs);
-}
-
-void LogMenuOpenDiagnostics(int backBufferWidth, int backBufferHeight, float imguiDisplayWidth,
-                            float imguiDisplayHeight)
-{
-    if (DiagInputDisabled())
-        return;
-
-    std::unique_lock lock(_state.Mutex);
-
-    // AMDNR 0.3.4.2 (D3): the first opens of a session only.
-    static MenuInput::LineBudget budget { 5 };
-    if (!budget.Take())
-        return;
-
-    const HWND target = _state.TargetHwnd;
-
-    RECT client {};
-    RECT window {};
-    const bool haveClient = target != nullptr && GetClientRect(target, &client) != FALSE;
-    const bool haveWindow = target != nullptr && GetWindowRect(target, &window) != FALSE;
-
-    // DPI (user32 of Windows 10 1607 and later, resolved at run time): -1 = not available.
-    // (DPI_AWARENESS_CONTEXT is a handle and DPI_AWARENESS an int enum; spelled so for any SDK target.)
-    using GetDpiForWindow_t = UINT(WINAPI*)(HWND);
-    using GetThreadDpiAwarenessContext_t = HANDLE(WINAPI*)();
-    using GetWindowDpiAwarenessContext_t = HANDLE(WINAPI*)(HWND);
-    using GetAwarenessFromDpiAwarenessContext_t = int(WINAPI*)(HANDLE);
-
-    int dpi = -1;
-    int threadAwareness = -1;
-    int windowAwareness = -1;
-
-    if (const HMODULE user32 = GetModuleHandleW(L"user32.dll"); user32 != nullptr)
-    {
-        const auto getDpiForWindow =
-            reinterpret_cast<GetDpiForWindow_t>(GetProcAddress(user32, "GetDpiForWindow"));
-        const auto getThreadContext =
-            reinterpret_cast<GetThreadDpiAwarenessContext_t>(GetProcAddress(user32, "GetThreadDpiAwarenessContext"));
-        const auto getWindowContext =
-            reinterpret_cast<GetWindowDpiAwarenessContext_t>(GetProcAddress(user32, "GetWindowDpiAwarenessContext"));
-        const auto getAwareness = reinterpret_cast<GetAwarenessFromDpiAwarenessContext_t>(
-            GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext"));
-
-        if (getDpiForWindow != nullptr && target != nullptr)
-            dpi = static_cast<int>(getDpiForWindow(target));
-
-        if (getAwareness != nullptr && getThreadContext != nullptr)
-            threadAwareness = static_cast<int>(getAwareness(getThreadContext()));
-
-        if (getAwareness != nullptr && getWindowContext != nullptr && target != nullptr)
-            windowAwareness = static_cast<int>(getAwareness(getWindowContext(target)));
-    }
-
-    RECT clip {};
-    BOOL haveClip = FALSE;
-    {
-        ScopedHookBypass bypass;
-        haveClip = o_GetClipCursor != nullptr ? o_GetClipCursor(&clip) : ::GetClipCursor(&clip);
-    }
-
-    POINT cursor {};
-    POINT cursorClient {};
-    if (RealGetCursorPosSafe(&cursor))
-    {
-        cursorClient = cursor;
-        if (target != nullptr)
-            ScreenToClient(target, &cursorClient);
-    }
-
-    const HWND foreground = GetForegroundWindow();
-    DWORD foregroundPid = 0;
-    if (foreground != nullptr)
-        GetWindowThreadProcessId(foreground, &foregroundPid);
-    const HWND foregroundRoot = foreground != nullptr ? GetAncestor(foreground, GA_ROOT) : nullptr;
-    const bool foregroundIsGame =
-        foregroundRoot != nullptr && (foregroundRoot == _state.TargetRootHwnd || foregroundRoot == _state.InputRootHwnd);
-
-    LOG_INFO("menu open #{}: client {}x{} window {}x{} back buffer {}x{} ImGui display {:.0f}x{:.0f} | dpi {} "
-             "awareness thread {} window {} | cursor client ({}, {}) clip {} ({}, {}, {}, {}) | foreground {} pid {} "
-             "focused {} subclassed {}",
-             budget.used, haveClient ? client.right - client.left : -1, haveClient ? client.bottom - client.top : -1,
-             haveWindow ? window.right - window.left : -1, haveWindow ? window.bottom - window.top : -1,
-             backBufferWidth, backBufferHeight, imguiDisplayWidth, imguiDisplayHeight, dpi, threadAwareness,
-             windowAwareness, cursorClient.x, cursorClient.y, haveClip ? "yes" : "no", clip.left, clip.top, clip.right,
-             clip.bottom, foregroundIsGame ? "game" : "other", foregroundPid, _state.Focused ? 1 : 0,
-             _state.WndProcSubclassed ? 1 : 0);
-
-    // Raw input registrations of this process: usage page / usage, flags (0x30 NOLEGACY, 0x100 INPUTSINK, 0x200
-    // CAPTUREMOUSE / NOHOTKEYS, 0x1000 EXINPUTSINK), and whether their target is the game window.
-    std::string rawDevices;
-    UINT deviceCount = 0;
-    if (GetRegisteredRawInputDevices(nullptr, &deviceCount, sizeof(RAWINPUTDEVICE)) == 0 && deviceCount != 0)
-    {
-        std::vector<RAWINPUTDEVICE> devices(deviceCount);
-        const UINT got = GetRegisteredRawInputDevices(devices.data(), &deviceCount, sizeof(RAWINPUTDEVICE));
-        if (got != static_cast<UINT>(-1))
-        {
-            for (UINT i = 0; i < got && i < 16; ++i)
-            {
-                const RAWINPUTDEVICE& device = devices[i];
-                const char* targetName = device.hwndTarget == nullptr ? "focus"
-                                         : (device.hwndTarget == target || device.hwndTarget == _state.InputHwnd)
-                                             ? "game"
-                                             : "other";
-                char item[96] {};
-                std::snprintf(item, sizeof(item), "%s0x%x/0x%x flags 0x%lx target %s", rawDevices.empty() ? "" : ", ",
-                              static_cast<unsigned>(device.usUsagePage), static_cast<unsigned>(device.usUsage),
-                              static_cast<unsigned long>(device.dwFlags), targetName);
-                rawDevices += item;
-            }
-        }
-    }
-
-    unsigned hooks[4] {}; // WH_KEYBOARD (2), WH_MOUSE (7), WH_KEYBOARD_LL (13), WH_MOUSE_LL (14)
-    for (const WindowsHookSlot& slot : _state.WindowsHookSlots)
-    {
-        if (!slot.InUse || slot.Hook == nullptr)
-            continue;
-        switch (slot.HookType)
-        {
-        case WH_KEYBOARD:
-            hooks[0]++;
-            break;
-        case WH_MOUSE:
-            hooks[1]++;
-            break;
-        case WH_KEYBOARD_LL:
-            hooks[2]++;
-            break;
-        case WH_MOUSE_LL:
-            hooks[3]++;
-            break;
-        default:
-            break;
-        }
-    }
-
-    LOG_INFO("menu open #{}: raw input {} | tracked hooks WH_KEYBOARD {} WH_MOUSE {} WH_KEYBOARD_LL {} WH_MOUSE_LL {} | "
-             "DirectInput devices {} (keyboard {} mouse {}), CreateDevice calls {} | menu key {:#x} on press {} | "
-             "click replay {}",
-             budget.used, rawDevices.empty() ? "none" : rawDevices, hooks[0], hooks[1], hooks[2], hooks[3],
-             _state.DirectInputTrackedDeviceCount, _state.DirectInputKeyboardDeviceSeen ? 1 : 0,
-             _state.DirectInputMouseDeviceSeen ? 1 : 0, _state.DirectInputCreateDeviceCallCount, _state.MenuKeyVk,
-             _state.MenuKeyTapWatch ? 1 : 0, MenuClickReplayEnabled() ? 1 : 0);
 }
 
 } // namespace OptiInput

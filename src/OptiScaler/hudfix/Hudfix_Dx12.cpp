@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "Hudfix_Dx12.h"
 
@@ -271,7 +270,7 @@ inline static std::string GetSourceString(UINT source)
         return "UAV";
     case CaptureInfo::OMSetRTV:
         return "OM";
-    case CaptureInfo::UpscalerPass:
+    case CaptureInfo::Upscaler:
         return "Ups";
     case CaptureInfo::SetCR:
         return "SCR";
@@ -339,7 +338,7 @@ bool Hudfix_Dx12::CheckResource(ResourceInfo* resource)
         auto toleranceY = height / 20;
 
         // Extended size check
-        if (resource->captureInfo != CaptureInfo::UpscalerPass &&
+        if (resource->captureInfo != CaptureInfo::Upscaler &&
             !(Config::Instance()->FGRelaxedResolutionCheck.value_or_default() &&
               resDesc.Height >= height - toleranceY && resDesc.Height <= height + toleranceY &&
               resDesc.Width >= width - toleranceX && resDesc.Width <= width + toleranceX))

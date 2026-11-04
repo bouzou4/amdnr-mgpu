@@ -517,12 +517,6 @@ void* ReflexHooks::getHookedReflex(unsigned int InterfaceId)
 // For updating information about Reflex hooks
 void ReflexHooks::update(bool fgActive, bool isVulkan)
 {
-    if (State::Instance().externalFrameGeneration)
-    {
-        State::Instance().reflexLimitsFps = false;
-        State::Instance().reflexShowWarning = false;
-        return;
-    }
     // We can still use just the markers to limit the fps with Reflex disabled
     // But need to fallback in case a game stops sending them for some reason
     _updatesWithoutMarker++;
@@ -610,8 +604,6 @@ void ReflexHooks::update(bool fgActive, bool isVulkan)
 // 0 - disables the fps cap
 void ReflexHooks::setFPSLimit(float fps)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_INFO("Set FPS Limit to: {}", fps);
     if (fps == 0.0)
         _minimumIntervalUs = 0;

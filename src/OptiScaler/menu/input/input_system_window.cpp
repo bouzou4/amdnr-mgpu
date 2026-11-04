@@ -1,11 +1,5 @@
-// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
-
-#include <imgui/ImGuiNotify.hpp>
-
-#include <unordered_set>
 
 namespace OptiInput
 {
@@ -73,51 +67,6 @@ void LogQueryWindowFailure(const char* label, HWND hwnd)
              threadId, _state.CurrentProcessId);
 }
 
-// (AMDNR 0.3.4.1) The menu's window is gone: the menu keeps asking for it every frame (BeginFrameLocked), so
-// the rejection is logged once per window, and the player gets one warning per session with the way out (and,
-// on Wine/Proton, one toast). Seen on Proton with FSR FG: the Vulkan menu had bound to a helper window that was destroyed.
-void NoteTargetWindowRejected(HWND hwnd)
-{
-    static std::mutex loggedMutex;
-    static std::unordered_set<HWND> logged;
-    static bool lostNoticeShown = false;
-
-    bool showLost = false;
-    {
-        std::lock_guard<std::mutex> lock(loggedMutex);
-        if (!logged.insert(hwnd).second)
-            return;
-
-        if (hwnd != nullptr && !IsWindow(hwnd) && !lostNoticeShown)
-        {
-            lostNoticeShown = true;
-            showLost = true;
-        }
-    }
-
-    LogQueryWindowFailure("SetTargetWindow", hwnd);
-
-    if (!showLost)
-        return;
-
-    const char* advice = State::Instance().isRunningOnLinux
-                             ? "On Proton with frame generation, set [Menu] OverlayMenu=false or "
-                               "[FrameGen] FGOutput=nofg"
-                             : "If the menu does not open or take input, set [Menu] OverlayMenu=false";
-
-    LOG_WARN("Menu window lost. {} (window {} no longer exists)", advice, static_cast<void*>(hwnd));
-
-    // Toast only on Wine/Proton: on Windows a game that destroys its window (exit, splash -> main window, window
-    // re-create on a mode change) can hit this for a frame or two, and the old behaviour there was a log line only.
-    if (!State::Instance().isRunningOnLinux)
-        return;
-
-    ImGuiToast toast { ImGuiToastType::Warning, 15000 };
-    toast.setTitle("%s", "Menu window lost");
-    toast.setContent("%s", advice);
-    ImGui::InsertNotification(toast);
-}
-
 void SetFocusStateLocked(bool focused, const char* reason, HWND foreground, DWORD foregroundProcessId,
                          DWORD foregroundThreadId)
 {
@@ -150,7 +99,7 @@ void SetTargetWindow(HWND hwnd, bool isUwp, bool useWndProcSubclass)
 
     if (!QueryWindowIdentity(hwnd, &rootHwnd, &processId, &threadId))
     {
-        NoteTargetWindowRejected(hwnd);
+        LogQueryWindowFailure("SetTargetWindow", hwnd);
         ClearTargetWindowLocked();
         return;
     }

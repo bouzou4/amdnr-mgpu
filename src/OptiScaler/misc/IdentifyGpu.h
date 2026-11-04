@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include <nvapi.h>
 #include <proxies/D3D12_Proxy.h>
@@ -99,13 +98,6 @@ class IdentifyGpu
     // Sorted by priority, the first one should be treated as the primary one
     static std::vector<GpuInformation> getAllGpus();
     static GpuInformation getPrimaryGpu();
-    // RDNA 4 (gfx12): the card table's generation for the device id (any revision of a listed id); for an id the table
-    // does not list, the FP8 probe's answer once updateD3d12Capabilities has run.
-    static bool isRdna4(const GpuInformation& gpu);
-    // (AMDNR 0.3.4) RDNA 3 and 3.5 (gfx11, gfx11.5): RX 7000 / W7000, the gfx1103 APUs (780M, 760M, 740M, Z1, Z2) and
-    // gfx115x (890M, 880M, Z2 Extreme, Radeon 8060S / 8050S, 860M, 840M), by the same card table lookup as isRdna4. An id
-    // the table does not list is not RDNA 3 here (no probe answers it).
-    static bool isRdna3(const GpuInformation& gpu);
 
     // Game is rendering through the translation layer, based on the API it's currently using
     static bool gameUsesDxvk();

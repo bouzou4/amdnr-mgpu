@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "XeFG_Dx12.h"
 
@@ -12,137 +11,7 @@
 
 #include <DirectXMath.h>
 
-#include <Util.h>
-#include <vector>
-
 using namespace DirectX;
-
-// AMDNR 0.3.3 (MFG stutter, C): the display the XeFG swapchain is on, logged once per
-// swapchain. The refresh rate was never in the log, and the first stutter design was
-// built on a guess of ~144 Hz for what turned out to be a 360 Hz panel. QueryDisplayConfig
-// gives the exact rational rate of the monitor's active path; the desktop mode's integer
-// rate (EnumDisplaySettings, what the menu shows) goes next to it. Log only.
-//
-// Then the swapchain XeFG presents every frame on: its size, buffers and flags, once. With
-// [XeFG] PaceOnSwapchain on (off by default) its frame latency waitable object is handed
-// to the pacing engine (XeFGPacing.h, E); nothing about the swapchain itself is changed.
-// XeFG creates that swapchain through the DXGI factory hook inside
-// D3D12InitFromSwapChainDesc, which records it as State's current real swapchain, so only
-// a pointer that changed during this init is looked at - never a stale one.
-static void DescribeXeFGSwapchain(HWND hwnd, IDXGISwapChain* realBefore)
-{
-    const int desktopHz = Util::GetActiveRefreshRate(hwnd);
-    bool logged = false;
-
-    MONITORINFOEXW monitorInfo {};
-    monitorInfo.cbSize = sizeof(monitorInfo);
-
-    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-
-    if (monitor != nullptr && GetMonitorInfoW(monitor, &monitorInfo))
-    {
-        UINT32 pathCount = 0;
-        UINT32 modeCount = 0;
-        std::vector<DISPLAYCONFIG_PATH_INFO> paths;
-        std::vector<DISPLAYCONFIG_MODE_INFO> modes;
-        LONG status = ERROR_INSUFFICIENT_BUFFER;
-
-        // The topology can change between the two calls, which is what the retry is for.
-        for (int attempt = 0; attempt < 3 && status == ERROR_INSUFFICIENT_BUFFER; attempt++)
-        {
-            if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
-                break;
-
-            paths.resize(pathCount);
-            modes.resize(modeCount);
-            status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(),
-                                        nullptr);
-        }
-
-        if (status == ERROR_SUCCESS)
-        {
-            for (UINT32 i = 0; i < pathCount && i < paths.size() && !logged; i++)
-            {
-                const auto& path = paths[i];
-
-                DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
-                source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-                source.header.size = sizeof(source);
-                source.header.adapterId = path.sourceInfo.adapterId;
-                source.header.id = path.sourceInfo.id;
-
-                if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
-                    wcscmp(source.viewGdiDeviceName, monitorInfo.szDevice) != 0)
-                    continue;
-
-                DISPLAYCONFIG_TARGET_DEVICE_NAME target {};
-                target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-                target.header.size = sizeof(target);
-                target.header.adapterId = path.targetInfo.adapterId;
-                target.header.id = path.targetInfo.id;
-
-                std::wstring name = L"unknown";
-
-                if (DisplayConfigGetDeviceInfo(&target.header) == ERROR_SUCCESS &&
-                    target.monitorFriendlyDeviceName[0] != 0)
-                    name = target.monitorFriendlyDeviceName;
-
-                const auto& rate = path.targetInfo.refreshRate;
-                const double hz =
-                    rate.Denominator != 0 ? static_cast<double>(rate.Numerator) / rate.Denominator : 0.0;
-
-                LOG_INFO("XeFG swapchain: display {} ({}) refreshes at {:.3f} Hz ({}/{}); desktop mode {} Hz",
-                         wstring_to_string(name), wstring_to_string(monitorInfo.szDevice), hz, rate.Numerator,
-                         rate.Denominator, desktopHz);
-
-                logged = true;
-            }
-        }
-    }
-
-    if (!logged)
-        LOG_INFO("XeFG swapchain: display refreshes at {} Hz (desktop mode; QueryDisplayConfig has no active path "
-                 "for the window's monitor)",
-                 desktopHz);
-
-    auto* real = State::Instance().currentRealSwapchain;
-
-    if (real == nullptr || real == realBefore)
-    {
-        LOG_INFO("XeFG swapchain: the swapchain XeFG presents on was not seen being created");
-        return;
-    }
-
-    IDXGISwapChain2* real2 = nullptr;
-
-    if (real->QueryInterface(IID_PPV_ARGS(&real2)) != S_OK || real2 == nullptr)
-        return;
-
-    DXGI_SWAP_CHAIN_DESC1 desc {};
-
-    if (real2->GetDesc1(&desc) == S_OK)
-    {
-        LOG_INFO("XeFG swapchain: XeFG presents on {}x{}, format {}, {} buffers, swap effect {}, flags {:#x}",
-                 desc.Width, desc.Height, (UINT) desc.Format, desc.BufferCount, (UINT) desc.SwapEffect, desc.Flags);
-
-        if (Config::Instance()->FGXeFGPaceOnSwapchain.value_or_default())
-        {
-            HANDLE waitable = nullptr;
-
-            if ((desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0)
-                waitable = real2->GetFrameLatencyWaitableObject();
-
-            if (waitable != nullptr)
-                XeFGPacing::SetSwapchainWaitable(waitable);
-            else
-                LOG_INFO("XeFG swapchain: PaceOnSwapchain has nothing to wait on (no frame latency waitable object, "
-                         "flags {:#x})",
-                         desc.Flags);
-        }
-    }
-
-    real2->Release();
-}
 
 void XeFG_Dx12::xefgLogCallback(const char* message, xefg_swapchain_logging_level_t level, void* userData)
 {
@@ -312,7 +181,6 @@ bool XeFG_Dx12::DestroySwapchainContext()
         else
         {
             State::Instance().currentFGSwapchain = nullptr;
-            XeFGPacing::OnContextDestroyed();
 
             // Its XeLL context isn't read anymore
             InputCommon::release_xefg_xell();
@@ -320,46 +188,6 @@ bool XeFG_Dx12::DestroySwapchainContext()
     }
 
     return true;
-}
-
-// A swapchain init that failed leaves its context holding everything the provider allocated
-// for it (about 957 MiB at 4K, measured with the 10X ceiling, freed again by Destroy), and left
-// in _swapChainContext it is the context the next CreateSwapchain call skips creation for and
-// inits again. So it is destroyed here, and the next call starts from a fresh one. Only a
-// context the failing call created itself is torn down: one that already existed may be
-// serving the FG swapchain of another window. The swapchain the game gets is the plain one
-// the DXGI hook creates when FG refuses, as before.
-void XeFG_Dx12::DropFailedSwapchainContext(xefg_swapchain_result_t result, bool createdHere)
-{
-    XeFGProxy::NoteInitResult(_maxInterpolationCount + 1, (int32_t) result);
-
-    // Above 6X is opt-in and not yet proven in a game, so say where the way back is.
-    if (_maxInterpolationCount > XeFGUnlock::UnpacedMaxInterpolations)
-    {
-        LOG_ERROR("XeFG swapchain failed at {}X ({} {}); no XeFG on this swapchain. [XeFG] MaxInterpolatedFrames=5 "
-                  "(6X) goes back to the shipped ceiling",
-                  _maxInterpolationCount + 1, magic_enum::enum_name(result), (int32_t) result);
-    }
-
-    if (!createdHere || _swapChainContext == nullptr || State::Instance().isShuttingDown)
-        return;
-
-    auto context = _swapChainContext;
-    _swapChainContext = nullptr;
-
-    auto destroyResult = XeFGProxy::Destroy()(context);
-
-    LOG_INFO("Destroy of the failed XeFG context: {} ({})", magic_enum::enum_name(destroyResult), (UINT) destroyResult);
-
-    // As in DestroySwapchainContext: a context the provider will not destroy is kept, which is
-    // where this stood before.
-    if (destroyResult != XEFG_SWAPCHAIN_RESULT_SUCCESS)
-    {
-        _swapChainContext = context;
-        return;
-    }
-
-    XeFGPacing::OnContextDestroyed();
 }
 
 xefg_swapchain_d3d12_resource_data_t XeFG_Dx12::GetResourceData(FG_ResourceType type, int index)
@@ -417,8 +245,6 @@ xefg_swapchain_d3d12_resource_data_t XeFG_Dx12::GetResourceData(FG_ResourceType 
 bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, DXGI_SWAP_CHAIN_DESC* desc,
                                         IDXGISwapChain** swapChain)
 {
-    // Set when this call creates the context, so a failure below only tears down its own.
-    bool createdHere = false;
     if (_swapChainContext == nullptr)
     {
         LOG_DEBUG("Creating swapchain context for the first time");
@@ -430,8 +256,6 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
 
         if (_swapChainContext == nullptr)
             return false;
-
-        createdHere = true;
 
         _width = desc->BufferDesc.Width;
         _height = desc->BufferDesc.Height;
@@ -555,9 +379,6 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 #endif // !DONT_USE_XMX
 
-    // AMDNR 0.3.3: compared, never dereferenced - see DescribeXeFGSwapchain.
-    IDXGISwapChain* realSwapchainBefore = State::Instance().currentRealSwapchain;
-
     xefg_swapchain_result_t result;
     result = XeFGProxy::D3D12InitFromSwapChainDesc()(_swapChainContext, hwnd, &scDesc, &fsDesc, realQueue, factory12,
                                                      &params);
@@ -565,7 +386,6 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
         LOG_ERROR("D3D12InitFromSwapChainDesc error: {} ({:X})", magic_enum::enum_name(result), (UINT) result);
-        DropFailedSwapchainContext(result, createdHere);
         return false;
     }
 
@@ -574,7 +394,6 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
         LOG_ERROR("D3D12GetSwapChainPtr error: {} ({})", magic_enum::enum_name(result), (UINT) result);
-        DropFailedSwapchainContext(result, createdHere);
         return false;
     }
 
@@ -588,11 +407,6 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     _swapChain = *swapChain;
     _hwnd = hwnd;
 
-    XeFGProxy::NoteInitResult(0, 0);
-
-    // AMDNR 0.3.3 (MFG stutter, C/E): the display's refresh rate and XeFG's own swapchain.
-    DescribeXeFGSwapchain(hwnd, realSwapchainBefore);
-
     return true;
 }
 
@@ -600,8 +414,6 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
                                          DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
                                          IDXGISwapChain1** swapChain)
 {
-    // Set when this call creates the context, so a failure below only tears down its own.
-    bool createdHere = false;
     if (_swapChainContext == nullptr)
     {
         if (State::Instance().currentD3D12Device == nullptr)
@@ -611,8 +423,6 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 
         if (_swapChainContext == nullptr)
             return false;
-
-        createdHere = true;
 
         _width = desc->Width;
         _height = desc->Height;
@@ -698,9 +508,6 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 
     xefg_swapchain_result_t result;
 
-    // AMDNR 0.3.3: compared, never dereferenced - see DescribeXeFGSwapchain.
-    IDXGISwapChain* realSwapchainBefore = State::Instance().currentRealSwapchain;
-
     {
 #ifndef DONT_USE_XMX
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
@@ -712,7 +519,6 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
         LOG_ERROR("D3D12InitFromSwapChainDesc error: {} ({})", magic_enum::enum_name(result), (UINT) result);
-        DropFailedSwapchainContext(result, createdHere);
         return false;
     }
 
@@ -721,7 +527,6 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
         LOG_ERROR("D3D12GetSwapChainPtr error: {} ({})", magic_enum::enum_name(result), (UINT) result);
-        DropFailedSwapchainContext(result, createdHere);
         return false;
     }
 
@@ -734,11 +539,6 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
     _gameCommandQueue = realQueue;
     _swapChain = *swapChain;
     _hwnd = hwnd;
-
-    XeFGProxy::NoteInitResult(0, 0);
-
-    // AMDNR 0.3.3 (MFG stutter, C/E): the display's refresh rate and XeFG's own swapchain.
-    DescribeXeFGSwapchain(hwnd, realSwapchainBefore);
 
     return true;
 }
@@ -774,35 +574,16 @@ void XeFG_Dx12::Activate()
     if (State::Instance().activeFgInput == FGInput::Upscaler && currentFeature != nullptr)
         nativeAA = currentFeature->RenderWidth() == currentFeature->DisplayWidth();
 
-    // AMDNR: XeFG\AllowDilatedMV lets the game's dilated (display-resolution) motion vectors
-    // through this check - the same test as the Frame Gen tab (menu_common.cpp). Only the MV
-    // check is skipped; the context was already created with XEFG_SWAPCHAIN_INIT_FLAG_HIGH_RES_MV
-    // from XeFG\HighResMV, as before. Off by default, so the default path is unchanged.
-    const bool mvsAccepted = IsLowResMV() || nativeAA ||
-                             (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs);
-    const bool ignoreChecks = Config::Instance()->FGXeFGIgnoreInitChecks.value_or_default();
-    const bool allowDilatedMV = Config::Instance()->FGXeFGAllowDilatedMV.value_or_default();
-
     if (_swapChainContext != nullptr && _fgContext != nullptr && !_isActive &&
-        (mvsAccepted || ignoreChecks || allowDilatedMV))
+        (IsLowResMV() || nativeAA || (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs) ||
+         Config::Instance()->FGXeFGIgnoreInitChecks.value_or_default()))
     {
-        if (!mvsAccepted && !ignoreChecks)
-            LOG_INFO("Dilated (high-res) motion vectors allowed by XeFG AllowDilatedMV");
-
         auto result = XeFGProxy::SetEnabled()(_swapChainContext, true);
 
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
             _isActive = true;
             _lastDispatchedFrame = 0;
-
-            // AMDNR 0.3.3 (MFG stutter, A4): the pacing engine restarts its own state and
-            // warms up at its next present; the count is also what the 3X-and-above gates
-            // on the present path read. Before the first Dispatch has set the count (and
-            // on a provider without SetNumInterpolatedFrames) it is the configured one.
-            XeFGPacing::OnActivate(_framesToInterpolate >= 1
-                                       ? _framesToInterpolate
-                                       : Config::Instance()->FGXeFGInterpolationCount.value_or_default());
             _generationOff = false;
 
             // FG back on: Dynamic MFG starts its averages over but keeps what it learned
@@ -847,10 +628,6 @@ void XeFG_Dx12::Deactivate()
         {
             _isActive = false;
         }
-
-        // AMDNR 0.3.3 (MFG stutter): the present path's 3X-and-above gates let go.
-        if (!_isActive)
-            XeFGPacing::OnDeactivate();
 
         // Activate switches frame generation back on
         _generationOff = false;
@@ -936,15 +713,9 @@ bool XeFG_Dx12::Dispatch()
 
     if (XeFGProxy::SetNumInterpolatedFrames() != nullptr)
     {
-        // Volatile, as in CreateSwapchain: the clamp is this session's limit, not the user's
-        // choice. A plain assignment would be saved by the next SaveIni, so a session held at
-        // 6X (ceiling capped for want of pacing, or a game-copy provider) would overwrite an
-        // ini InterpolationCount=9 with 5, and 10X would stay lost after pacing came back.
-        // The saved value stays whatever the ini or the MFG combo last set; picking a count
-        // in the combo makes it a real value again.
         if (Config::Instance()->FGXeFGInterpolationCount.value_or_default() > _maxInterpolationCount)
         {
-            Config::Instance()->FGXeFGInterpolationCount.set_volatile_value(_maxInterpolationCount);
+            Config::Instance()->FGXeFGInterpolationCount = _maxInterpolationCount;
             LOG_WARN("Requested interpolation count is higher than max supported, setting to max: {}",
                      _maxInterpolationCount);
         }
@@ -981,11 +752,6 @@ bool XeFG_Dx12::Dispatch()
             auto intResult = XeFGProxy::SetNumInterpolatedFrames()(_swapChainContext, targetCount);
 
             _framesToInterpolate = targetCount;
-
-            // AMDNR 0.3.3 (MFG stutter, A4): the provider keeps its timing ring across a
-            // multiplier change, so the pacing engine warms up again (the toggle below
-            // re-activates as well; a second request is harmless).
-            XeFGPacing::OnMultiplierChange(_framesToInterpolate);
 
             if (intResult != XEFG_SWAPCHAIN_RESULT_SUCCESS)
             {
@@ -1114,32 +880,10 @@ bool XeFG_Dx12::Dispatch()
     else
         constData.resetHistory = false;
 
-    // xefg_swapchain.h documents frameRenderTime as the time it took to render the current
-    // frame. In practice _ftDelta is filled on every frame by every FG input: the
-    // Streamline/DLSSG path (Streamline_Inputs_Dx12.cpp) and the upscaler path hand it
-    // State::lastFGFrameTime, the present-to-present delta measured in FGPresent
-    // (FG_Hooks.cpp), and the FSR-FG inputs the game's own frame time delta. So the
-    // pacing engine's RenderTimeMs() below is only a fallback for a frame that arrives
-    // with none, and the value fed is normally that delta.
-    //
-    // AMDNR 0.3.3 correction: this used to say nothing fills _ftDelta here, and that the
-    // provider paces its generated frames from this value, which fed a lock. Neither
-    // holds. The provider's pacing ring (ctx + 0x168) stores its own measured real-frame
-    // period, not this: in Silent Hill 2 a burst stepped at 139.18 ms while 6.31 ms was
-    // fed. The lock at 3X and above is bounded in XeFGPacing.h (TsDetour), and what is fed
-    // is deliberately left as it was in 0.3.3.
-    auto frameRenderTime = _ftDelta[fIndex];
-
-    if (!(frameRenderTime > 0.0))
-        frameRenderTime = XeFGPacing::RenderTimeMs();
-
-    if (!(frameRenderTime > 0.0))
-        frameRenderTime = state.lastFGFrameTime;
-
     switch (Config::Instance()->FTInput.value_or_default())
     {
     case FrameTimeSource::Input:
-        constData.frameRenderTime = static_cast<float>(frameRenderTime);
+        constData.frameRenderTime = (float) _ftDelta[fIndex];
         break;
 
     case FrameTimeSource::Opti:
@@ -1151,10 +895,8 @@ bool XeFG_Dx12::Dispatch()
         break;
     }
 
-    XeFGPacing::NoteFedFrameTime(constData.frameRenderTime);
-
-    LOG_DEBUG("Reset: {}, Input FT: {}, Opti FT: {}, Set FT: {} ms, Opti Id: {}, Reflex Id: {}", _reset[fIndex],
-              _ftDelta[fIndex], state.lastFGFrameTime, constData.frameRenderTime, _frameCount,
+    LOG_DEBUG("Reset: {}, Opti FT: {}, Source FT: {}, Set FT: {}, Opti Id: {}, Reflex Id: {}", _reset[fIndex],
+              constData.frameRenderTime, _ftDelta[fIndex], constData.frameRenderTime, _frameCount,
               State::Instance().reflexFrameId);
 
     auto frameId = static_cast<uint32_t>(willDispatchFrame);

@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 
 #include "Vulkan_Hooks.h"
@@ -26,10 +25,6 @@
 #include <vulkan/vulkan.h>
 
 #include <unordered_map>
-
-#include <unordered_map>
-
-#include <dlssnr/DlssNr_VkExtensions.h>
 
 #include <detours/detours.h>
 #include <misc/IdentifyGpu.h>
@@ -503,10 +498,6 @@ static VkResult hkvkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
 {
     LOG_FUNC();
 
-    // (AMDNR 0.3.3.2, [Hooks] SkipOwnVulkanObjects) An instance OptiScaler creates for itself on this thread
-    // (State.h, CreatingOwnVulkanObjects) is not the game's: it is never recorded as State::VulkanInstance.
-    const bool own = CreatingOwnVulkanObjects() && Config::Instance()->SkipOwnVulkanObjects.value_or_default();
-
     VkInstanceCreateInfo localCreateInfo {};
     memcpy(&localCreateInfo, pCreateInfo, sizeof(VkInstanceCreateInfo));
 
@@ -553,17 +544,8 @@ static VkResult hkvkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, cons
         result = o_vkCreateInstance(&localCreateInfo, pAllocator, pInstance);
     }
 
-    if (result == VK_SUCCESS && own)
-    {
-        {
-            std::scoped_lock lock(_vkApiVersionMutex);
-            _instanceApiVersions[*pInstance] = requestedApiVersion;
-        }
-
-        LOG_DEBUG("OptiScaler's own VkInstance {0:X}: not captured as the game's", (UINT64) *pInstance);
-    }
     // OptiScaler's own Streamline only makes short lived ones
-    else if (result == VK_SUCCESS && !StreamlineProxy::IsInitializing())
+    if (result == VK_SUCCESS && !StreamlineProxy::IsInitializing())
     {
         {
             std::scoped_lock lock(_vkApiVersionMutex);
@@ -609,13 +591,6 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 {
     LOG_FUNC();
 
-    // (AMDNR 0.3.3.2, [Hooks] SkipOwnVulkanObjects) A device OptiScaler creates for itself on this thread
-    // (State.h, CreatingOwnVulkanObjects) is not the game's: the Anti-Lag 2 state and the overlay's device
-    // stay the game's. Off: the process-wide vulkanSkipHooks decides the overlay's capture, as before.
-    const bool skipOwn = Config::Instance()->SkipOwnVulkanObjects.value_or_default();
-    const bool own = skipOwn && CreatingOwnVulkanObjects();
-    const bool skipCapture = skipOwn ? own : State::Instance().vulkanSkipHooks;
-
     VkDeviceCreateInfo localCreateInfo {};
     memcpy(&localCreateInfo, pCreateInfo, sizeof(VkDeviceCreateInfo));
 
@@ -644,7 +619,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     features2.pNext = &antiLagFeatures;
 
-    if (getPhysicalDeviceFeatures2 && !own)
+    if (getPhysicalDeviceFeatures2)
     {
         getPhysicalDeviceFeatures2(physicalDevice, &features2);
         State::Instance().vkAntiLagSupported = antiLagFeatures.antiLag != 0;
@@ -654,7 +629,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
     VulkanDeviceFeatureState fgFeatures(&localCreateInfo, getPhysicalDeviceFeatures2);
 
     // Before spoofing, which drops the extensions it only pretends to have
-    if (!State::Instance().vulkanSkipHooks && !State::Instance().creatingD3DDevice && !own &&
+    if (!State::Instance().vulkanSkipHooks && !State::Instance().creatingD3DDevice &&
         getPhysicalDeviceFeatures2 != nullptr && !IsDxgiBackedCaller(_ReturnAddress()) &&
         (fg = CreateFGFeature()) != nullptr)
     {
@@ -666,85 +641,6 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         {
             LOG_WARN("Timeline semaphores aren't supported, can't use FG with this device");
             fg = nullptr;
-        }
-    }
-
-    // Neural Rendering on Vulkan without a D3D12 bridge, or the reason it cannot be.
-    //
-    // The model needs two NVIDIA vendor extensions to load its kernels, a game never asks for them,
-    // and a device's extension list cannot be changed after creation. This is the only moment it can
-    // be arranged. Reported either way: if the answer is no, the log says so here rather than leaving
-    // a create failure three layers down to be explained.
-    //
-    // Only appended when the feature is switched on, and only what the physical device already
-    // offers -- asking for an extension a driver does not have makes vkCreateDevice fail and the game
-    // not start.
-    DlssNr::VkExt::Merged nrExtensions;
-
-    // On anything but an NVIDIA GPU this block must not run at all. The AMD neural path is
-    // D3D12 (both runtimes bind to D3D12 queues); a Vulkan title gets no neural pass in this
-    // build, and the two NVX names only exist on NVIDIA drivers. The probe below asks the
-    // hooked vkEnumerateDeviceExtensionProperties, which - with Vulkan extension spoofing on -
-    // lists the NVX pair as present on AMD so that a game's DLSS check passes; taking that at
-    // face value appended them here and the real vkCreateDevice answered
-    // VK_ERROR_EXTENSION_NOT_PRESENT (Indiana Jones and the Great Circle, RX 9070 XT: "Could
-    // not create the Vulkan device" before the first frame).
-    const bool nvidiaGpu = IdentifyGpu::getPrimaryGpu().vendorId == VendorId::Nvidia;
-
-    if (Config::Instance()->DlssNrEnabled.value_or_default() && !nvidiaGpu)
-    {
-        static bool said = false;
-        if (!said)
-        {
-            said = true;
-            LOG_INFO("DLSS-NR Vulkan: not an NVIDIA GPU - the neural pass is D3D12-only on this path, so the "
-                     "device is created with the game's own extension list (nothing appended)");
-        }
-    }
-    else if (Config::Instance()->DlssNrEnabled.value_or_default())
-    {
-        std::vector<std::string> supported;
-        {
-            // The driver's real list, not the spoofed one.
-            ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
-            supported = DlssNr::VkExt::SupportedDeviceExtensions(
-                o_vkGetInstanceProcAddr, State::Instance().VulkanInstance, physicalDevice);
-        }
-
-        nrExtensions.names.assign(localCreateInfo.ppEnabledExtensionNames,
-                                  localCreateInfo.ppEnabledExtensionNames + localCreateInfo.enabledExtensionCount);
-
-        std::string present, added, missing;
-
-        for (const char* want : DlssNr::VkExt::kDevice)
-        {
-            const bool already = DlssNr::VkExt::ListHas(localCreateInfo.ppEnabledExtensionNames,
-                                                        localCreateInfo.enabledExtensionCount, want);
-
-            if (already)
-                present += std::string(present.empty() ? "" : ", ") + want;
-            else if (!DlssNr::VkExt::Contains(supported, want))
-                missing += std::string(missing.empty() ? "" : ", ") + want;
-            else
-            {
-                nrExtensions.names.push_back(want);
-                added += std::string(added.empty() ? "" : ", ") + want;
-            }
-        }
-
-        LOG_INFO("DLSS-NR Vulkan: device offers {} extensions. game already enabled: [{}]. added here: "
-                 "[{}]. NOT AVAILABLE: [{}]",
-                 supported.size(), present.empty() ? "none" : present, added.empty() ? "none" : added,
-                 missing.empty() ? "none" : missing);
-
-        if (!missing.empty())
-            LOG_WARN("DLSS-NR Vulkan: the native path is not possible on this device -- the model's kernels "
-                     "cannot be loaded without the extensions listed as NOT AVAILABLE");
-
-        if (!added.empty())
-        {
-            localCreateInfo.ppEnabledExtensionNames = nrExtensions.names.data();
-            localCreateInfo.enabledExtensionCount = (uint32_t) nrExtensions.names.size();
         }
     }
 
@@ -775,13 +671,9 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         Hudfix_Vk::HookDevice(*pDevice);
     }
 
-    if (Config::Instance()->DlssNrEnabled.value_or_default())
-        LOG_INFO("DLSS-NR Vulkan: vkCreateDevice returned {} with {} extensions requested", (int) result,
-                 localCreateInfo.enabledExtensionCount);
-
     if (result == VK_SUCCESS && Config::Instance()->OverlayMenu.value_or_default())
     {
-        if (!skipCapture)
+        if (!State::Instance().vulkanSkipHooks)
         {
             // Disabled to prevent unnecessary object release
             // MenuOverlayVk::DestroyVulkanObjects(false);
@@ -818,7 +710,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         }
     }
 
-    if (State::Instance().vkAntiLagSupported && !own)
+    if (State::Instance().vkAntiLagSupported)
     {
         if (result == VK_SUCCESS && o_vkGetDeviceProcAddr)
         {
@@ -1059,47 +951,6 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
     {
         State::Instance().screenWidth = static_cast<float>(pCreateInfo->imageExtent.width);
         State::Instance().screenHeight = static_cast<float>(pCreateInfo->imageExtent.height);
-
-        // The same question the DXGI side asks: what does one unit of this buffer mean?
-        //
-        // EXTENDED_SRGB_LINEAR is scRGB, 1.0 = 80 nits. HDR10_ST2084 is PQ, 1.0 = 10000 nits. Both
-        // are absolute, so in either the white point is arithmetic rather than a reading -- which
-        // matters most for the games that supply no exposure texture, since nothing else answers for
-        // them. Logged, not yet used.
-        {
-            static VkColorSpaceKHR lastSpace = (VkColorSpaceKHR) -1;
-
-            if (pCreateInfo->imageColorSpace != lastSpace)
-            {
-                lastSpace = pCreateInfo->imageColorSpace;
-
-                const char* name = "other";
-                const char* meaning = "relative -- no scale to be had";
-
-                switch (pCreateInfo->imageColorSpace)
-                {
-                case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
-                    name = "scRGB (extended sRGB, linear)";
-                    meaning = "absolute: 1.0 = 80 nits, so 203-nit paper white = 2.5375";
-                    break;
-                case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-                    name = "PQ / ST.2084 (HDR10)";
-                    meaning = "absolute: 1.0 = 10000 nits, so 203-nit paper white = 0.0203";
-                    break;
-                case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
-                    name = "sRGB (SDR)";
-                    break;
-                case VK_COLOR_SPACE_HDR10_HLG_EXT:
-                    name = "HLG";
-                    break;
-                default:
-                    break;
-                }
-
-                LOG_INFO("DLSS-NR: swapchain colour space {} -- {} ({}), format {}",
-                         (int) pCreateInfo->imageColorSpace, name, meaning, (int) pCreateInfo->imageFormat);
-            }
-        }
 
         LOG_DEBUG("if (result == VK_SUCCESS && device != VK_NULL_HANDLE && pCreateInfo != nullptr && pSwapchain != "
                   "VK_NULL_HANDLE)");

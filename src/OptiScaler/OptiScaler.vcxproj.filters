@@ -530,9 +530,6 @@
     <ClInclude Include="misc\Quirks.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="misc\REFrameworkCheck.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="hooks\Ntdll_Hooks.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1086,39 +1083,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\magnifier\precompile\Magnifier_Shader_Vk.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\RtgiNative.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\AmdPreSr.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\SubmissionState.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\RuntimeNotification.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\RuntimeHostLoad.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\AmdBridge.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="hooks\DxgiSwapchainSizing.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="shaders\dlssnr\DlssNr_Vk.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\DlssNrFeature_Vk.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\DlssNr_ExposureScan.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="shaders\dlssnr\DlssNr_ActiveColor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="framegen\reprojection\Reprojection_Dx12.h">
@@ -1917,116 +1881,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="upscalers\dlss\DLSSFeature_VkOnDx12.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\amd\RtgiNative.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\amd\AmdPreSr.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\amd\AmdBridge.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="shaders\dlssnr\DlssNr_Dx12.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="shaders\dlssnr\DlssNr_Vk.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\DlssNrFeature_Vk.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\DlssNr_ExposureScan.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\DlssNr_Proxy.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\DlssNr_Menu.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="dlssnr\amd\RuntimeCaps.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\NrControls.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\amd\EditShapeRules.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\menu\NeuralUi.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="misc\ReportZip.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="misc\AmdnrReport.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="misc\CrashReport.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="misc\ProcessNameMatch.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="misc\LogRotationNames.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="menu\input\ToggleGate.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="menu\input\KeyPressLatch.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="menu\input\EdgeReplay.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="menu\input\InputDiagRate.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="menu\RuntimeChooserSession.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClCompile Include="dlssnr\menu\NeuralUi.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\gi\AmdnrGi.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\gi\GiSeam.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClInclude Include="dlssnr\gi\AmdnrGi.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\gi\GiSeam.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="dlssnr\gi\GiShared.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClCompile Include="dlssnr\menu\NeuralTop.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\menu\NeuralPerfQuality.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\menu\NeuralLook.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="dlssnr\menu\NeuralTools.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="misc\ReportZip.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="misc\AmdnrReport.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="misc\CrashReport.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

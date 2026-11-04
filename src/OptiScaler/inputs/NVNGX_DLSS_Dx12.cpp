@@ -17,8 +17,6 @@
 #include <imgui/ImGuiNotify.hpp>
 
 #include <hooks/D3D12_Hooks.h>
-#include <dlssnr/DlssNr.h>
-#include <dlssnr/amd/AmdBridge.h>
 
 #include <dxgi1_4.h>
 #include <shared_mutex>
@@ -675,7 +673,6 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
 
     // Create context entry
     Dx12Contexts[handleId] = {};
-    Dx12Contexts[handleId].rayReconstruction = InFeatureID != NVSDK_NGX_Feature_SuperSampling;
 
     // Retrieve feature implementation
     if (!FeatureProvider_Dx12::GetFeature(upscalerBackend, handleId, InParameters, &Dx12Contexts[handleId].feature))
@@ -1063,19 +1060,7 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
     bool evalSuccess = false;
     {
         ScopedSkipHeapCapture skip {};
-
-        // AMDNR call sites (dlssnr/README.md), rebuilt for this base: docs/AMDNR_GAPS.md.
-        const bool rrFeature = feature->GetUpscalerType() == Upscaler::DLSSD;
-        if (!rrFeature)
-            DlssNr::EvaluateBeforeUpscale(InCmdList, InParameters, state.currentCommandQueue);
-
         evalSuccess = feature->Evaluate(InCmdList, InParameters);
-        DlssNr::AmdBridge::Restore(InParameters);
-
-        if (evalSuccess)
-            DlssNr::EvaluateAfterUpscale(InCmdList, InParameters, state.currentCommandQueue, rrFeature);
-        else
-            DlssNr::AmdBridge::UpscalerSkipped();
 
         // Resource tracking
         UpscalerInputsDx12::UpscaleEnd(InCmdList, InParameters, feature);

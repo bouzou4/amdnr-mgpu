@@ -1,8 +1,6 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include <pch.h>
 #include <Config.h>
 #include <Util.h>
-#include <dlssnr/amd/AmdBridge.h>
 #include <proxies/FfxApi_Proxy.h>
 #include "FFXFeature_Dx12.h"
 #include <misc/DeferredRelease.h>
@@ -103,29 +101,23 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
 
     params.commandList = InCommandList;
 
-    // The AMD replacement arrives in COMPUTE_READ and must remain there.
-    // Game-specific barriers describe the original texture, not this scratch UAV.
-    const bool amdReplacement = DlssNr::AmdBridge::HasReplacement(InParameters);
-    ID3D12Resource* paramColor = nullptr;
+    ID3D12Resource* paramColor;
     if (InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor) != NVSDK_NGX_Result_Success)
         InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &paramColor);
-    // The colour as the caller handed it (AMDNR C3-C, 0.3.3.2 rebuild). The padding workaround below retargets
-    // paramColor at its scratch copy; the source's own state is what the copy and the restore act on.
-    ID3D12Resource* const sourceColor = paramColor;
 
     if (paramColor)
     {
         LOG_DEBUG("Color exist..");
 
-        if (!amdReplacement && Config::Instance()->ColorResourceBarrier.has_value())
+        if (Config::Instance()->ColorResourceBarrier.has_value())
         {
             ResourceBarrier(InCommandList, paramColor,
                             (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value(),
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
-        else if (!amdReplacement && (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
+        else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
                  State::Instance().gameEngine == GameEngineType::Unreal ||
-                 State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine))
+                 State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
         {
             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
             ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -516,9 +508,8 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
     }
 
     // restore resource states
-    // The title's colour (sourceColor), not the padding workaround's scratch copy that paramColor may point at now.
-    if (!amdReplacement && sourceColor && Config::Instance()->ColorResourceBarrier.has_value())
-        ResourceBarrier(InCommandList, sourceColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    if (paramColor && Config::Instance()->ColorResourceBarrier.has_value())
+        ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value());
 
     if (paramVelocity && Config::Instance()->MVResourceBarrier.has_value())
@@ -568,15 +559,11 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
         auto& versions =
             _customUpscaler != nullptr ? _customUpscaler->versions : State::Instance().ffxUpscalerVersionsDx12;
 
-        LOG_INFO("[CREATE] FFX QueryVersions, device {:X}", (size_t) Device);
-
         if (!QueryVersionsDx12(Device, _customUpscaler) || versions.ids.empty())
         {
             LOG_ERROR("No FFX upscalers reported!");
             return false;
         }
-
-        LOG_INFO("[CREATE] FFX QueryVersions done: {} versions", versions.ids.size());
 
         InitFlags();
 
@@ -625,13 +612,10 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
         {
             ScopedSkipHeapCapture skipHeapCapture {};
 
-            LOG_INFO("[CREATE] FFX CreateContext, version index {}",
-                     Config::Instance()->FfxUpscalerIndex.value_or_default());
             auto ret =
                 _customUpscaler != nullptr
                     ? FfxApiProxy::D3D12_CreateContext(&_customUpscaler->module, &_context, &_contextDesc.header, NULL)
                     : FfxApiProxy::D3D12_CreateContext(&_context, &_contextDesc.header, NULL);
-            LOG_INFO("[CREATE] FFX CreateContext returned {}", FfxApiProxy::ReturnCodeToString(ret));
 
             if (ret != FFX_API_RETURN_OK)
             {

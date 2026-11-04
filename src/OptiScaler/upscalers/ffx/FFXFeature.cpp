@@ -51,14 +51,7 @@ bool FFXFeature::QueryVersionsDx12(ID3D12Device* device, CustomFfxModule* custom
     versionQuery.versionIds = versions.ids.data();
     versionQuery.versionNames = versions.names.data();
 
-    if (query() != FFX_API_RETURN_OK)
-        return false;
-
-    // AMDNR: the provider list in the log
-    for (size_t i = 0; i < versionCount; i++)
-        LOG_INFO("FFX upscaler provider {}: {} ({:X})", i, versions.names[i], versions.ids[i]);
-
-    return true;
+    return query() == FFX_API_RETURN_OK;
 }
 
 bool FFXFeature::QueryVersionsVulkan(void* deviceContext, CustomFfxModule* custom)

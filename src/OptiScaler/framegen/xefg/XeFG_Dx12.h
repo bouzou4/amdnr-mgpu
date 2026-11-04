@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 #include <framegen/IFGFeature_Dx12.h>
@@ -37,7 +36,6 @@ class XeFG_Dx12 : public virtual IFGFeature_Dx12
 
     bool CreateSwapchainContext(ID3D12Device* device);
     bool DestroySwapchainContext();
-    void DropFailedSwapchainContext(xefg_swapchain_result_t result, bool createdHere);
     xefg_swapchain_d3d12_resource_data_t GetResourceData(FG_ResourceType type, int index = -1);
 
     bool Dispatch();

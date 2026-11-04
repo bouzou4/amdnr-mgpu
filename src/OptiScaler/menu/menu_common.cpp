@@ -1,23 +1,9 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
-#include <dlssnr/amd/AmdBridge.h>
-#include <dlssnr/amd/RuntimeCaps.h> // ToggleNoticeRuntime: the Neural tab's runtime rule
 #include "menu_common.h"
-#include <dlssnr/DlssNr_ExposureScan.h>
-
-#include <algorithm>
-#include <cfloat>
-
-#include <dlssnr/DlssNr.h>
 #include "PresentRateMeter.h"
 #include <inputs/FG/XeFG_Inputs_Dx12.h>
 
 #include "input/input_system.h"
-#include "input/ToggleGate.h"
-#include "input/KeyPressLatch.h"   // AMDNR 0.3.4.2: the menu key toggles once per physical press, on the press
-#include "input/EdgeReplay.h"      // AMDNR 0.3.4.2: MenuInput::PressIsFresh (runtime chooser keys)
-#include "input/InputDiagRate.h"   // AMDNR 0.3.4.2: MenuInput::LineBudget (menu key log)
-#include "RuntimeChooserSession.h" // AMDNR 0.3.4.2: the first-launch runtime chooser's rules
 
 #include "font/Hack_Compressed.h"
 
@@ -54,9 +40,6 @@
 #include <memory>
 #include <type_traits>
 #include <misc/IdentifyGpu.h>
-#include <misc/REFrameworkCheck.h>
-#include <misc/AmdnrReport.h> // Save report (AMDNR 0.3.4, RenderSaveReportRow)
-#include <dlssnr/menu/NeuralUi.h> // AMDNR 0.3.4 menu look: the mock's widgets (Button, SectionHeader, ...)
 #include <hooks/Amdxc64_Hooks.h>
 #include <low_latency/input/input_common.h>
 #include <plugins/PluginApi.h>
@@ -88,33 +71,8 @@ static bool fgHotkeyLeftDefault = false; // FG hotkey temporarily overrode Defau
 static int fgHotkeySavedOverride = -1;   // Override DLSSG Ratio with value before Off, -1 = Default
 static bool inputFps = false;
 static bool inputFpsCycle = false;
-// Not a key debounce: UpdateManualInput refreshes lastInputTick only while a keybind is being captured, so this
-// keeps every shortcut quiet for 1 s after a capture ends (the key just bound must not fire at once). The re-toggle
-// guard of the menu and NR keys is menuToggleGate / nrToggleGate in HandleMenuShortcuts (AMDNR 0.3.4).
 static uint64_t lastInputTick = 0;
 constexpr uint64_t debounceThreshold = 1000;
-// AMDNR 0.3.4 (Assetto Corsa): one press of the menu or NR key could arrive as two release edges 16-316 ms apart
-// (a late WM_KEYDOWN re-arms the key after the poll saw it up), which toggled twice. HandleMenuShortcuts drops an
-// edge closer than [Hotfix] MenuToggleDebounceMs (400; 0 = 0.3.3.2) to the last accepted one of the same key.
-static MenuInput::ToggleGate menuToggleGate;
-static MenuInput::ToggleGate nrToggleGate;
-// AMDNR 0.3.4.2 (Assetto Corsa, second report): AC hands its key messages over up to about 2 s late, so one press still
-// toggled the menu twice (pairs 1.4-2.0 s apart, beyond the gate's 1000 ms cap). The menu key now toggles once per
-// physical press, on the press edge (menu/input/KeyPressLatch.h, UpdateMenuKeyLatch); a release never toggles. UWP and
-// [Hotfix] DiagInputHooksSkip=presslatch keep the 0.3.4.1 release edge. The gate above stays as a backstop.
-static MenuInput::KeyPressLatch menuKeyLatch;
-static int menuKeyLatchVk = -1;        // the key the latch follows; the latch starts over when ShortcutKey changes
-static bool menuToggleByLatch = false; // this frame's menu toggle came from the latch (a close holds the key back)
-static MenuInput::LineBudget menuKeyEdgeLog { 40 }; // one INFO line per menu-key edge, 40 per session
-static MenuInput::LineBudget menuGateLog { 10 };
-// AMDNR 0.3.4.2: the first-launch runtime chooser (menu/RuntimeChooserSession.h). RenderNeuralRuntimeChooser draws
-// it, UpdateManualInput feeds it keys, and closing the menu answers it "Decide later".
-static MenuUi::RuntimeChooserSession chooserSession;
-// AMDNR 0.3.4.2 (H2): the chooser no longer opens the menu by itself at boot; RaiseNeuralChoiceNotice posts one
-// notification per process instead.
-static MenuUi::RuntimeChooserBoot chooserBoot;
-static std::array<uint32_t, std::size(MenuUi::kChooserKeyVks)> chooserKeySeen {}; // press counts already judged
-static constexpr const char* kChooserTitle = "Choose the neural runtime";
 
 static bool hasGamepad = false;
 static bool ffxInitTried = false;
@@ -125,51 +83,6 @@ static Upscaler currentBackend = Upscaler::Reset;
 static std::string currentBackendName = "";
 static int refreshRate = 0;
 static ImVec2 lastPosition(-1000.0f, -1000.0f);
-
-// The AMD neural runtime stopped for this session: danielblnc refused or failed, lmxxf failed to load or
-// create, or poisoned by a fatal error. The backend's own flag first; the status words as a fallback
-// (danielblnc's Status never blocks; lmxxf's is short). "backend stopped" covers danielblnc's
-// "AMD idle: backend stopped" and lmxxf's "lmxxf backend stopped[ at submission]: ...".
-static bool AmdNeuralRuntimeStopped()
-{
-    if (DlssNr::AmdBridge::RuntimeStopped())
-        return true;
-    const std::string st = DlssNr::AmdBridge::Status();
-    for (const char* key : { "AMD idle: stopped", "backend stopped", "AMD pre-SR stopped", "lmxxf poisoned",
-                             "session is poisoned", "lmxxf stopped" })
-    {
-        if (st.find(key) != std::string::npos)
-            return true;
-    }
-    return false;
-}
-
-// The runtime the NR toggle notice names (AMDNR 0.3.4), or nullptr when there is none to name: the one this process
-// built its backend for; before one is built, what the bridge will build, by the Neural tab's own rule
-// (RuntimeCaps::detail::MenuIsLmxxfNow, G1: one rule for both); nothing while a choice between two installed
-// runtimes is still open, when neither will run, or on a GPU that is not AMD. Only when the key is pressed: the
-// file checks are not for every frame.
-static const char* ToggleNoticeRuntime()
-{
-    using DlssNr::AmdBridge::NeuralRuntime;
-    switch (DlssNr::AmdBridge::ActiveRuntime())
-    {
-    case NeuralRuntime::Lmxxf:
-        return "lmxxf";
-    case NeuralRuntime::Daniel:
-        return "danielblnc";
-    default:
-        break;
-    }
-    if (!DlssNr::AmdBridge::GpuSupportInfo().amd)
-        return nullptr;
-    const bool daniel = DlssNr::AmdBridge::HasFiles();
-    if (DlssNr::AmdBridge::ChosenRuntime() == NeuralRuntime::Unchosen && daniel && DlssNr::AmdBridge::LmxxfReady())
-        return nullptr;
-    if (DlssNr::RuntimeCaps::detail::MenuIsLmxxfNow())
-        return "lmxxf";
-    return daniel ? "danielblnc" : nullptr;
-}
 
 static ImVec2 splashPosition(-1000.0f, -1000.0f);
 static ImVec2 splashSize(0.0f, 0.0f);
@@ -276,8 +189,6 @@ static std::string updateNoticeUrl;
 static float lastMenuScale = 0.0f;
 static CustomOptional<uint32_t> comboPreset { 0 };
 static int lastKey = 0;
-static bool inputDlssNr = false;
-static bool inputCapture = false;
 static bool capturingKey = false;
 static int selectedMenuTab = 0;
 static const char* requestedMenuTab = nullptr; // Label of a tab to switch to on the next frame
@@ -658,18 +569,7 @@ struct FsExistsCache
 };
 
 static FsExistsCache nukemsExists;
-static FsExistsCache nukemsExistsShipped; // amdnr_dlssg_fsr3.dll, the name the zip ships it under
 static FsExistsCache enablerExists;
-
-// AMDNR does not ship DLSS Enabler, so every place that needs it says where it comes from.
-static constexpr const char* kEnablerUrl = "https://www.nexusmods.com/site/mods/757";
-static constexpr const char* kEnablerHowTo =
-    "dlss-enabler-headless.dll is not included with AMDNR. To use this option:\n"
-    "1. Download DLSS Enabler 4.9.0 or newer by Artur Graniszewski:\n"
-    "   https://www.nexusmods.com/site/mods/757\n"
-    "2. Rename its version.dll to dlss-enabler-headless.dll\n"
-    "3. Put it in the OptiScaler folder (next to OptiScaler.ini)\n"
-    "The menu finds it the next time it is opened; restart the game to use it.";
 
 struct FlagDefinition
 {
@@ -856,176 +756,6 @@ void MenuCommon::RenderCard(RenderMenuContext& ctx, void (*render)(RenderMenuCon
     render(ctx);
 }
 
-// AMDNR 0.3.4.2: the menu key goes through the press latch, except on UWP (its KeyUp callback toggles on the release),
-// with [Hotfix] DiagInputHooksSkip=presslatch, and for a key OptiInput does not track with edges of its own (the
-// Shift / Ctrl / Alt aggregates, mouse buttons): those keep the 0.3.4.1 release edge.
-static bool MenuKeyUsesLatch(int vk, bool isUwp)
-{
-    if (isUwp || vk <= 0 || vk >= 256 || !OptiInput::MenuPressLatchEnabled())
-        return false;
-
-    switch (vk)
-    {
-    case VK_SHIFT:
-    case VK_CONTROL:
-    case VK_MENU:
-    case VK_LBUTTON:
-    case VK_RBUTTON:
-    case VK_MBUTTON:
-    case VK_XBUTTON1:
-    case VK_XBUTTON2:
-        return false;
-    default:
-        return true;
-    }
-}
-
-// AMDNR 0.3.4.2: the menu key's edges since the last frame, each press judged by the latch; one INFO line per edge (40
-// per session: source, repeat bit, event tick, age, the poll's reading, verdict), so the next report names the late
-// source. `gated`: keybind capture, or the second after it. Returns whether the latch handles the menu key.
-static bool UpdateMenuKeyLatch(int vk, bool isUwp, bool gated)
-{
-    const bool useLatch = MenuKeyUsesLatch(vk, isUwp);
-
-    if (vk != menuKeyLatchVk)
-    {
-        menuKeyLatch.Reset();
-        menuKeyLatchVk = vk;
-    }
-
-    OptiInput::SetMenuKey(vk > 0 && vk < 256 ? vk : 0, useLatch);
-
-    std::array<OptiInput::KeyEdgeRecord, OptiInput::MaxMenuKeyEdges> edges {};
-    std::size_t dropped = 0;
-    const std::size_t count = OptiInput::DrainMenuKeyEdges(edges.data(), edges.size(), &dropped);
-    const DWORD now = GetTickCount();
-
-    for (std::size_t i = 0; i < count; ++i)
-    {
-        const OptiInput::KeyEdgeRecord& edge = edges[i];
-        const char* verdict = "release, ignored";
-
-        if (edge.Down && useLatch)
-        {
-            // `gated`: keybind capture (or the second after it). `inputMenu`: a toggle another path already asked
-            // for this frame, which then takes the press rather than the menu toggling twice -- a guard only since
-            // 0.3.4.2, because the runtime chooser no longer raises the menu and nothing else sets inputMenu before
-            // the latch runs for a latch key.
-            const MenuInput::LatchVerdict latch = menuKeyLatch.OnPress(edge.EventMs, edge.Repeat, gated || inputMenu);
-            verdict = MenuInput::LatchVerdictName(latch);
-
-            if (latch == MenuInput::LatchVerdict::Fire)
-            {
-                inputMenu = true;
-                menuToggleByLatch = true;
-                lastKey = vk;
-            }
-        }
-        else if (edge.Down)
-        {
-            verdict = "press (release-edge mode)";
-        }
-        else if (!useLatch)
-        {
-            verdict = "release (release-edge mode)";
-        }
-
-        const DWORD age = MenuInput::TickBefore(now, edge.EventMs) ? 0 : now - edge.EventMs;
-        if (menuKeyEdgeLog.Take())
-        {
-            LOG_INFO("menu key {:#x} {} src {} repeat {} event {} age {} ms polled {} visible {} -> {}", vk,
-                     edge.Down ? "down" : "up", OptiInput::InputEventSourceName(edge.Source), edge.Repeat ? 1 : 0,
-                     edge.EventMs, age, edge.PolledDown ? "down" : "up", edge.MenuVisible ? 1 : 0, verdict);
-        }
-        else if (menuKeyEdgeLog.CapReached())
-        {
-            LOG_INFO("menu key: {} edges logged, no more this session", menuKeyEdgeLog.cap);
-        }
-    }
-
-    if (dropped != 0)
-        LOG_DEBUG("menu key: {} older edges did not fit the ring", dropped);
-
-    if (useLatch)
-    {
-        // Re-arm at the first frame the key is up: physically by this frame's poll when it ran, else the level.
-        const OptiInput::KeyObservation key = OptiInput::GetKeyObservation(vk);
-        menuKeyLatch.OnFrame(key.PolledThisFrame ? !key.PolledDown : !key.Down, now);
-    }
-
-    return useLatch;
-}
-
-// AMDNR 0.3.4.2 (C2): the runtime chooser's keys, read from OptiInput (not ImGui), so they work at any frame rate and
-// even when ImGui is not fed keys: 1 / 2 (Numpad too) pick a row, Enter uses it, Esc decides later. Each press is
-// judged once; an autorepeat, a late copy of a press (EdgeReplay.h's freshness), a press from before the chooser
-// appeared and the menu key itself do nothing. `menuVisible`: the menu was on screen last frame (a hidden menu draws no
-// chooser, so its keys belong to the game).
-static void UpdateRuntimeChooserKeys(int menuKeyVk, bool menuVisible)
-{
-    const DWORD now = GetTickCount();
-    if (!menuVisible)
-        chooserSession.OnFrame(false, now);
-
-    const float frameMs = ImGui::GetCurrentContext() != nullptr ? ImGui::GetIO().DeltaTime * 1000.0f : 0.0f;
-    const uint32_t maxAgeMs = MenuInput::ReplayMaxAgeMs(frameMs);
-    const auto runtimes = DlssNr::RuntimeCaps::All();
-
-    for (std::size_t i = 0; i < std::size(MenuUi::kChooserKeyVks); ++i)
-    {
-        const int vk = MenuUi::kChooserKeyVks[i];
-        const OptiInput::KeyObservation key = OptiInput::GetKeyObservation(vk);
-
-        if (key.PressCount == chooserKeySeen[i])
-            continue;
-
-        chooserKeySeen[i] = key.PressCount;
-
-        const MenuUi::ChooserKey chooserKey = MenuUi::ChooserKeyFromVk(vk, menuKeyVk);
-        if (key.PressRepeat || chooserKey == MenuUi::ChooserKey::None || !chooserSession.visibleLastFrame)
-            continue;
-
-        uint32_t age = 0;
-        if (!MenuInput::PressIsFresh(key.PressTimeMs, key.PollDownBeforeValid, key.PollDownBeforeMs, now, maxAgeMs,
-                                     &age))
-        {
-            LOG_INFO("runtime chooser: key {:#x} ignored, a late copy of an earlier press ({} ms old)", vk, age);
-            continue;
-        }
-
-        switch (chooserSession.OnKey(chooserKey, key.PressTimeMs))
-        {
-        case MenuUi::ChooserEvent::Stale:
-            LOG_INFO("runtime chooser: key {:#x} ignored, pressed before the chooser appeared", vk);
-            break;
-        case MenuUi::ChooserEvent::Picked:
-        {
-            const int row = chooserSession.pick;
-            LOG_INFO("runtime chooser: row {} ({}) picked by key {:#x}", row + 1,
-                     row >= 0 && row < static_cast<int>(runtimes.size()) ? runtimes[row].name : "?", vk);
-            break;
-        }
-        case MenuUi::ChooserEvent::UseRequested:
-            LOG_INFO("runtime chooser: Enter pressed, using row {}", chooserSession.EffectivePick() + 1);
-            break;
-        case MenuUi::ChooserEvent::Later:
-            LOG_INFO("runtime chooser: decided later ({}); not shown again this session",
-                     MenuUi::LaterReasonName(MenuUi::LaterReason::Escape));
-            break;
-        default:
-            break;
-        }
-    }
-}
-
-// AMDNR 0.3.4.2 (C1): the player closed the menu (menu key, Close button) while the runtime chooser was open: that is
-// "Decide later" for this session (before, the modal stayed in ImGui's popup stack and came back on every open).
-static void ChooserMenuClosed(const char* how)
-{
-    if (chooserSession.OnMenuHidden(DlssNr::AmdBridge::RuntimeChoiceNeeded()))
-        LOG_INFO("runtime chooser: menu closed ({}), treated as Decide later for this session", how);
-}
-
 void MenuCommon::UpdateManualInput(HWND targetHwnd)
 {
     OptiInput::BeginFrame(targetHwnd);
@@ -1052,30 +782,18 @@ void MenuCommon::UpdateManualInput(HWND targetHwnd)
     const auto currentTick = GetTickCount64();
     const bool canAcceptInputs = lastInputTick + debounceThreshold < currentTick;
 
-    // AMDNR 0.3.4.2: the menu key through the press latch (gated like every shortcut); else the release edge below.
-    const int menuKey = config->ShortcutKey.value_or_default();
-    const bool menuKeyLatched = UpdateMenuKeyLatch(menuKey, _isUWP, capturingKey || !canAcceptInputs);
-
     if (!capturingKey && canAcceptInputs)
     {
-        if (!menuKeyLatched)
-            CheckShortcut(menuKey, inputMenu, "Menu key pressed, will be switching menu");
+        CheckShortcut(config->ShortcutKey.value_or_default(), inputMenu, "Menu key pressed, will be switching menu");
         CheckShortcut(config->FpsShortcutKey.value_or_default(), inputFps, "Menu key pressed, will be switching FPS");
         CheckShortcut(config->FGShortcutKey.value_or_default(), inputFG, "Menu key pressed, will be switching FG mode");
         CheckShortcut(config->FpsCycleShortcutKey.value_or_default(), inputFpsCycle,
                       "Menu key pressed, will be switching FPS mode");
-        CheckShortcut(config->DlssNrToggleKey.value_or_default(), inputDlssNr,
-                      "Neural Rendering key pressed, will be toggling the pass");
-        CheckShortcut(config->DlssNrCaptureKey.value_or_default(), inputCapture,
-                      "Capture key pressed, will request 8 frames");
     }
     else if (capturingKey)
     {
         lastInputTick = currentTick;
     }
-
-    // AMDNR 0.3.4.2 (C2): keys of the runtime chooser while it is on screen.
-    UpdateRuntimeChooserKeys(menuKey, _isVisible);
 
     lastKey = OptiInput::GetLastPressedKey();
 }
@@ -1085,8 +803,7 @@ void MenuCommon::ShowTooltip(const char* tip)
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
     {
         ImGui::BeginTooltip();
-        // Unformatted (AMDNR 0.3.4): the tip is text, not a format string, and it ends at an ImGui "##" ID suffix
-        ImGui::TextUnformatted(tip, ImGui::FindRenderedTextEnd(tip));
+        ImGui::Text(tip);
         ImGui::EndTooltip();
     }
 }
@@ -1249,19 +966,6 @@ class Keybind
     }
 };
 
-// The Neural tab shows the toggle binder beside the Enable checkbox (the Keybinds section keeps its own copy of the
-// same binding).
-void MenuCommon::RenderDlssNrToggleKeybind()
-{
-    static auto nrToggle = Keybind("Toggle hotkey", 15);
-    nrToggle.Render(Config::Instance()->DlssNrToggleKey);
-}
-
-std::string MenuCommon::KeyName(int virtualKey)
-{
-    return Keybind::KeyNameFromVirtualKeyCode(static_cast<USHORT>(virtualKey));
-}
-
 Upscaler MenuCommon::GetBackendCode(const API api)
 {
     if (auto feature = State::Instance().currentFeature)
@@ -1411,23 +1115,6 @@ static std::vector<int> FfxVersionsNewestFirst(const State::FfxVersionList& vers
     return order;
 }
 
-// The backends a D3D11 or Vulkan game reaches the neural pass through: OptiScaler's D3D12 bridge, the "w/Dx12" ones.
-// The native D3D11 and Vulkan backends run on the game's own device and never reach it (the Neural tab's hint).
-static bool UpscalerReachesNeuralPass(Upscaler upscaler)
-{
-    switch (upscaler)
-    {
-    case Upscaler::XeSS_on12:
-    case Upscaler::FSR21_on12:
-    case Upscaler::FSR22_on12:
-    case Upscaler::FFX_on12:
-    case Upscaler::DLSS_on12:
-        return true;
-    default:
-        return false;
-    }
-}
-
 void MenuCommon::RenderUpscalerCombo(const API api, Upscaler currentUpscaler, const std::vector<Upscaler>& options)
 {
     auto primaryGpu = IdentifyGpu::getPrimaryGpu();
@@ -1451,20 +1138,12 @@ void MenuCommon::RenderUpscalerCombo(const API api, Upscaler currentUpscaler, co
 
     const auto currentCustom = SelectedCustom(currentUpscaler, api);
 
-    // AMDNR 0.3.4 (menu plan 5.9): in a D3D11 or Vulkan game with Neural Rendering on, the items that carry the neural
-    // pass end in " - Neural", so the working pick is visible in the list itself. Not on NVIDIA cards.
-    const bool tagNeural = (api == API::DX11 || api == API::Vulkan) && primaryGpu.vendorId != VendorId::Nvidia &&
-                           config->DlssNrEnabled.value_or_default();
-
     // Interop is only shown here, the list uses a tag for it
     auto selectedName = upscalerName(targetBackend, ffxIndex);
     if (auto custom = SelectedCustom(targetBackend, api); !custom.empty())
         selectedName = custom;
     else if (IsOn12(targetBackend))
         selectedName += " (Dx12)";
-
-    if (tagNeural && UpscalerReachesNeuralPass(targetBackend))
-        selectedName += " - Neural";
 
     if (!ImGui::BeginCombo("##UpscalerCombo", selectedName.c_str(), ImGuiComboFlags_HeightLargest))
         return;
@@ -1558,8 +1237,6 @@ void MenuCommon::RenderUpscalerCombo(const API api, Upscaler currentUpscaler, co
             ImGui::Separator();
 
         auto name = entry.custom.empty() ? upscalerName(entry.upscaler, entry.ffxIndex) : entry.custom;
-        if (tagNeural && UpscalerReachesNeuralPass(entry.upscaler))
-            name += " - Neural";
         auto label = StrFmt("%s##%d%s", name.c_str(), (int) entry.upscaler, entry.custom.c_str());
         // Folder names in Dx12Upscaler aren't case sensitive
         const bool selected =
@@ -2165,95 +1842,6 @@ static void MenuHdrCheck(ImGuiIO io)
     }
 }
 
-// The DLSS Enabler frame generation sections' note while dlss-enabler-headless.dll is missing: what it
-// is, where it comes from, and a link. AMDNR does not ship it.
-static void RenderEnablerMissing()
-{
-    ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.f, 0.f, 1.f)), "dlss-enabler-headless.dll is missing");
-    ImGui::TextWrapped("%s", kEnablerHowTo);
-    ImGui::TextLinkOpenURL("DLSS Enabler on Nexus Mods", kEnablerUrl);
-}
-
-// ---- AMDNR 0.3.4 palette -----------------------------------------------------------------------------------
-// The colours and the "mock px" unit of the Neural tab's hand-drawn widgets (dlssnr/menu/NeuralUi.h). The rest of the
-// menu keeps upstream's theme (ApplyThemeStyle).
-namespace
-{
-constexpr ImVec4 MockHex(unsigned rgb, float a = 1.0f)
-{
-    return ImVec4(float((rgb >> 16) & 0xFF) / 255.0f, float((rgb >> 8) & 0xFF) / 255.0f, float(rgb & 0xFF) / 255.0f, a);
-}
-
-// In MenuColor order (menu_common.h).
-constexpr ImVec4 kMockPalette[] = {
-    MockHex(0xe6e4df), // Text
-    MockHex(0x8d8a84), // Dim
-    MockHex(0x7d7a74), // Tag
-    MockHex(0xe05a5a), // Section
-    MockHex(0x3a2226), // Rule
-    MockHex(0x26262a), // Frame
-    MockHex(0x2e2e33), // FrameHovered
-    MockHex(0x35353b), // FrameActive
-    MockHex(0x7a1f2b), // Fill
-    MockHex(0x8f1d2c), // FillActive
-    MockHex(0xdddddd), // Value
-    MockHex(0x777777), // CheckOutline
-    MockHex(0xc73a45), // CheckOn
-    MockHex(0x4a2a30), // ButtonBorder
-    MockHex(0x8f1d2c), // Selected
-    MockHex(0xffffff), // White
-};
-static_assert(std::size(kMockPalette) == static_cast<size_t>(MenuColor::Count), "one palette entry per MenuColor");
-
-constexpr float kMenuFontPx = 14.0f;
-constexpr float kBitmapFontPx = 13.0f; // ImGui's built-in font ([Menu] UseHQFont=false), scaled by the Menu Scale
-} // namespace
-
-ImVec4 MenuCommon::ThemeColor(MenuColor c)
-{
-    const int i = std::clamp(static_cast<int>(c), 0, static_cast<int>(MenuColor::Count) - 1);
-    if (Config::Instance()->LightTheme.value_or_default())
-    {
-        // The light style's own colours (already tone-mapped by MenuHdrCheck when HDR is on).
-        switch (c)
-        {
-        case MenuColor::Dim:
-        case MenuColor::Tag:
-        case MenuColor::CheckOutline:
-            return ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-        case MenuColor::Section:
-        case MenuColor::CheckOn:
-            return ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
-        case MenuColor::Rule:
-        case MenuColor::ButtonBorder:
-            return ImGui::GetStyleColorVec4(ImGuiCol_Separator);
-        case MenuColor::Frame:
-            return ImGui::GetStyleColorVec4(ImGuiCol_FrameBg);
-        case MenuColor::FrameHovered:
-            return ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered);
-        case MenuColor::FrameActive:
-            return ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive);
-        case MenuColor::Fill:
-            return ImGui::GetStyleColorVec4(ImGuiCol_SliderGrab);
-        case MenuColor::FillActive:
-        case MenuColor::Selected:
-            return ImGui::GetStyleColorVec4(ImGuiCol_SliderGrabActive);
-        default:
-            return ImGui::GetStyleColorVec4(ImGuiCol_Text);
-        }
-    }
-    return toneMapColor(kMockPalette[i]);
-}
-
-ImU32 MenuCommon::ThemeColorU32(MenuColor c) { return ImGui::GetColorU32(ThemeColor(c)); }
-
-float MenuCommon::MockPx()
-{
-    // The built-in bitmap font is 13 px x the Menu Scale inside the window (its font scale), so one mock px is the
-    // Menu Scale there, as RenderMainMenuWindow's theme has it.
-    return ImGui::GetFontSize() / (Config::Instance()->UseHQFont.value_or_default() ? kMenuFontPx : kBitmapFontPx);
-}
-
 static float MenuResolutionScale(ImGuiIO io)
 {
     if (Config::Instance()->MenuScale.has_value())
@@ -2675,34 +2263,6 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
 
     // Handle Inputs
     {
-        // Re-toggle guard (AMDNR 0.3.4) for the menu and NR keys, here where every source of the two flags (the
-        // poll and messages in UpdateManualInput, UWP KeyUp) is consumed once per RenderMenu. Keybind capture and
-        // the other shortcuts are untouched.
-        const bool menuToggledByLatch = menuToggleByLatch; // AMDNR 0.3.4.2
-        menuToggleByLatch = false;
-        if (inputMenu || inputDlssNr)
-        {
-            const uint32_t debounceMs =
-                MenuInput::ToggleDebounceMsFromIni(config->MenuToggleDebounceMs.value_or_default());
-            const uint64_t nowMs = GetTickCount64();
-            if (inputMenu && !menuToggleGate.Accept(nowMs, debounceMs))
-            {
-                inputMenu = false;
-                if (menuGateLog.Take())
-                    LOG_INFO("Menu key edge ignored: {} ms after the last toggle (MenuToggleDebounceMs {})",
-                             nowMs - menuToggleGate.lastAcceptedMs, debounceMs);
-                else
-                    LOG_DEBUG("Menu key edge ignored: {} ms after the last toggle (MenuToggleDebounceMs {})",
-                              nowMs - menuToggleGate.lastAcceptedMs, debounceMs);
-            }
-            if (inputDlssNr && !nrToggleGate.Accept(nowMs, debounceMs))
-            {
-                inputDlssNr = false;
-                LOG_DEBUG("Neural Rendering key edge ignored: {} ms after the last toggle (MenuToggleDebounceMs {})",
-                          nowMs - nrToggleGate.lastAcceptedMs, debounceMs);
-            }
-        }
-
         if (inputFG)
         {
             inputFG = false;
@@ -2771,50 +2331,6 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
             config->ShowFps = !config->ShowFps.value_or_default();
         }
 
-        if (inputCapture)
-        {
-            inputCapture = false;
-            AmdNrRequestCapture(0);
-            ImGuiToast toast { ImGuiToastType::Info, 1500 };
-            toast.setTitle("DLSS Neural Rendering");
-            toast.setContent("Capturing 8 frames");
-            ImGui::InsertNotification(toast);
-        }
-
-        if (inputDlssNr)
-        {
-            inputDlssNr = false;
-            config->DlssNrEnabled = !config->DlssNrEnabled.value_or_default();
-            // INFO, not DEBUG: every in-game NR on/off belongs in a report, and the default LogLevel 2
-            // dropped this line (the TLOU logs could not say when NR had been toggled)
-            LOG_INFO("Neural Rendering toggle key pressed, setting DlssNrEnabled to {}",
-                     config->DlssNrEnabled.value_or_default());
-            // Both AMD runtimes: the carried edit and the runtime history are from before the
-            // pause; start clean when the pass comes back.
-            DlssNr::AmdBridge::InvalidateHistory();
-
-            // "On" must not hide a runtime that stopped for this session (refused, failed, poisoned).
-            // Read before the toggle note below, so nothing written for the note can hide the stop.
-            const bool nrOn = config->DlssNrEnabled.value_or_default();
-            const bool runtimeStopped = nrOn && AmdNeuralRuntimeStopped();
-
-            // Same line in amd_presr.log / lmxxf_backend.log, next to the Record lines (0.3.3.2)
-            DlssNr::AmdBridge::NoteToggle(nrOn, "key");
-            // The notice names the runtime that carries the pass (AMDNR 0.3.4): "Neural Rendering: On (lmxxf)".
-            const char* runtime = nrOn ? ToggleNoticeRuntime() : nullptr;
-            ImGuiToast toast { runtimeStopped ? ImGuiToastType::Warning : ImGuiToastType::Info,
-                               runtimeStopped ? 5000 : 2000 };
-            if (!nrOn)
-                toast.setTitle("%s", "Neural Rendering: Off");
-            else if (runtime != nullptr)
-                toast.setTitle("Neural Rendering: On (%s)", runtime);
-            else
-                toast.setTitle("%s", "Neural Rendering: On");
-            if (runtimeStopped)
-                toast.setContent("%s", "but the neural runtime is stopped (see the Neural tab)");
-            ImGui::InsertNotification(toast);
-        }
-
         if (inputFpsCycle && config->ShowFps.value_or_default())
             config->FpsOverlayType = (FpsOverlay) ((config->FpsOverlayType.value_or_default() + 1) % FpsOverlay_COUNT);
 
@@ -2834,16 +2350,12 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
                 OptiInput::ResetMenuInputTransientState();
 
                 ApplyThemeStyle();
-                // ApplyThemeStyle writes the 1.0 geometry (padding, spacing, rounding); only the rescale in
-                // BeginMenuFrameIfNeeded multiplies it by the Menu Scale, so let it run again (AMDNR 0.3.4).
-                lastMenuScale = 0.0f;
 
                 refreshRate = Util::GetActiveRefreshRate(_handle);
 
                 auto optiPath = std::filesystem::path(Config::Instance()->MainDllPath.value());
                 state.artursFgFileAvailable = enablerExists.Get(optiPath / L"dlss-enabler-headless.dll");
-                state.nukemsFgFileAvailable = nukemsExistsShipped.Get(optiPath / L"amdnr_dlssg_fsr3.dll") ||
-                                              nukemsExists.Get(optiPath / L"dlssg_to_fsr3_amd_is_better.dll");
+                state.nukemsFgFileAvailable = nukemsExists.Get(optiPath / L"dlssg_to_fsr3_amd_is_better.dll");
 
                 if (State::Instance().currentFeature != nullptr)
                 {
@@ -2854,25 +2366,10 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
                     else if (upscalerType == Upscaler::DLSS || upscalerType == Upscaler::DLSS_on12)
                         comboPreset = config->RenderPresetForAll.value_or_default();
                 }
-
-                // AMDNR 0.3.4.2 (D3): what can keep input from the menu, on the first opens of a session.
-                OptiInput::LogMenuOpenDiagnostics(static_cast<int>(state.screenWidth),
-                                                  static_cast<int>(state.screenHeight), io.DisplaySize.x,
-                                                  io.DisplaySize.y);
             }
             else
             {
-                // AMDNR 0.3.4.2: CloseCurrentPopup did nothing here (no popup is being drawn between two frames), so
-                // the runtime chooser's modal stayed in ImGui's popup stack and came back on every open. This trims
-                // the stack (between frames that is all it does; it also closes an open combo, as meant before), and
-                // the chooser takes it as "Decide later" for this session.
-                ImGui::ClosePopupsOverWindow(nullptr, false);
-                ChooserMenuClosed("menu key");
-
-                // Closed on the press: keep that key from the game until it is released (a close on the release
-                // never let the game see it either).
-                if (menuToggledByLatch)
-                    OptiInput::HoldKeyUntilReleased(config->ShortcutKey.value_or_default());
+                ImGui::CloseCurrentPopup();
 
                 _showMipmapCalcWindow = false;
                 _showHudlessWindow = false;
@@ -2918,7 +2415,7 @@ void MenuCommon::UpdateVersionAndStartupNotifications(RenderMenuContext& ctx)
             const auto notice = [&]()
             {
                 ImGuiToast updateNotification { ImGuiToastType::Error, updateNoticeTime };
-                updateNotification.setTitle("AMDNR update available");
+                updateNotification.setTitle("OptiScaler Update available");
                 updateNotification.setContent(
                     "Press %s for more info",
                     Keybind::KeyNameFromVirtualKeyCode(config->ShortcutKey.value_or_default()).c_str());
@@ -2953,54 +2450,6 @@ void MenuCommon::UpdateVersionAndStartupNotifications(RenderMenuContext& ctx)
             ImGui::InsertNotification(notification);
         }
 
-        // REFramework (AMDNR 0.3.3.2, misc/REFrameworkCheck.h): the dinput8.dll actually loaded decides. The startup
-        // check only looked at the files, so it is corrected here once, in either direction, with one log line.
-        if (state.gameQuirks & GameQuirk::NeedsREFramework)
-        {
-            bool loaded = false;
-            const std::wstring proxy = REFrameworkCheck::LoadedProxy(loaded);
-            const bool warned = static_cast<bool>(state.postCodes & PostCode::REFrameworkMissing);
-            if (loaded && !proxy.empty() && warned)
-            {
-                state.postCodes.reset(PostCode::REFrameworkMissing);
-                LOG_INFO("REFramework found after all: dinput8.dll loaded from {}", wstring_to_string(proxy));
-            }
-            else if (loaded && proxy.empty() && !warned)
-            {
-                if (config->WarnMissingREFramework.value_or_default())
-                {
-                    state.postCodes |= PostCode::REFrameworkMissing;
-                    LOG_WARN("REFramework NOT loaded (this process uses Windows' own dinput8.dll). {}",
-                             REFrameworkCheck::Advice(state.gameExe, false));
-                }
-                else
-                {
-                    // WarnMissingREFramework=false: no post code, as at startup (dllmain.cpp, OI-12B). One INFO only
-                    // when the startup check had found REFramework's files, the new fact here; when it found none it
-                    // already logged "REFramework not found (warning silenced ...)" (G1).
-                    bool folderOnly = false;
-                    if (!REFrameworkCheck::FilesFound(Util::ExePath().parent_path(), folderOnly).empty())
-                        LOG_INFO("REFramework NOT loaded (this process uses Windows' own dinput8.dll); no warning: "
-                                 "[Hotfix] WarnMissingREFramework=false");
-                }
-            }
-
-            // The notice honours [Hotfix] WarnMissingREFramework (AMDNR 0.3.4); the state above stays as it is.
-            if ((state.postCodes & PostCode::REFrameworkMissing) && config->WarnMissingREFramework.value_or_default())
-            {
-                const std::string title = REFrameworkCheck::GameTitle(state.gameExe);
-                const bool confirmed = REFrameworkCheck::Confirmed(state.gameExe);
-                ImGuiToast notification { ImGuiToastType::Warning, 20000 };
-                notification.setTitle("REFramework not found");
-                notification.setContent(
-                    "%s needs REFramework with OptiScaler%s,\nor it crashes 15-60 s after launch.\n"
-                    "Put dinput8.dll from the REFramework nightly in the game folder.\nThe menu (%s) has the link.",
-                    title.c_str(), confirmed ? "" : " (probably)",
-                    Keybind::KeyNameFromVirtualKeyCode(config->ShortcutKey.value_or_default()).c_str());
-                ImGui::InsertNotification(notification);
-            }
-        }
-
         state.postDone = true;
     }
 
@@ -3024,15 +2473,8 @@ void MenuCommon::BeginMenuFrameIfNeeded(RenderMenuContext& ctx)
     auto& newFrame = ctx.newFrame;
 
     // New frame check
-    // The lamp is drawn while the menu is closed, which is the whole point of it. Tied to its own
-    // setting and nothing else: an overlay that appears because a scan is running, rather than
-    // because someone asked for it, is an overlay nobody asked for.
-    const bool scanIndicator = config->DlssNrScanMeter.value_or_default() &&
-                               DlssNr::ExposureScan::Where() != DlssNr::ExposureScan::Verdict::Off;
-
     if ((!config->DisableSplash.value_or_default() && now > splashStart && now < splashLimit) ||
-        config->ShowFps.value_or_default() || _isVisible || ImGui::notifications.size() > 0 || scanIndicator ||
-        (config->DlssNrCompare.value_or_default() != 0 && config->DlssNrCompareTags.value_or_default()))
+        config->ShowFps.value_or_default() || _isVisible || ImGui::notifications.size() > 0)
     {
         if (!_isUWP)
         {
@@ -3105,9 +2547,9 @@ void MenuCommon::RenderSplashWindow(RenderMenuContext& ctx)
                 else
                     ImGui::SetWindowFontScale(splashScale);
 
-                ImGui::Text("AMDNR - %s for menu",
+                ImGui::Text("OptiScaler - %s for menu",
                             Keybind::KeyNameFromVirtualKeyCode(config->ShortcutKey.value_or_default()).c_str());
-                ImGui::TextColored(toneMapColor(ImVec4(1.0f, 1.0f, 1.0f, 0.7f)), "%s", splashMessage.c_str());
+                ImGui::TextColored(toneMapColor(ImVec4(1.0f, 1.0f, 1.0f, 0.7f)), splashMessage.c_str());
 
                 splashSize = ImGui::GetWindowSize();
 
@@ -3217,74 +2659,8 @@ void MenuCommon::UpdateFrameTimeAverages(RenderMenuContext& ctx)
     }
 }
 
-// Labels for the comparison views.
-//
-// Drawn straight onto the foreground draw list, not as ImGui windows -- the last attempt made them
-// draggable windows and the clamping fought the split. Here each label is clipped to its own side of
-// the comparison, so in the wipe the moving split reveals and hides it exactly as it does the
-// pictures, and there is nothing to drag. Both wipe labels sit in the same top-left corner, each
-// clipped to its side, so whichever picture currently owns that corner is the one whose label shows.
-void MenuCommon::RenderNrCompareTags()
-{
-    auto* config = Config::Instance();
-
-    const uint32_t mode = config->DlssNrCompare.value_or_default();
-
-    if (mode == 0 || !config->DlssNrCompareTags.value_or_default())
-        return;
-
-    const ImVec2 screen = ImGui::GetIO().DisplaySize;
-
-    if (screen.x < 1.0f || screen.y < 1.0f)
-        return;
-
-    const bool swap = config->DlssNrCompareSwap.value_or_default();
-    const float split = mode == 1 ? 0.5f
-                                  : std::clamp(config->DlssNrCompareSplit.value_or_default(), 0.0f, 1.0f);
-    const float splitX = split * screen.x;
-
-    const float scale = std::clamp(config->DlssNrTagScale.value_or_default(), 0.5f, 5.0f);
-
-    // The left side is the untouched frame unless swapped -- matching the shader's
-    // showOriginal = (uv.x < split) != swap.
-    const char* leftText = swap ? "DLSS NR : ON" : "DLSS NR : OFF";
-    const char* rightText = swap ? "DLSS NR : OFF" : "DLSS NR : ON";
-
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-    ImFont* font = ImGui::GetFont();
-    const float fontSize = ImGui::GetFontSize() * scale;
-    const float margin = 10.0f * scale;
-
-    // Both labels flank the divider along the top: the left picture's label is right-aligned just
-    // left of the split, the right picture's is left-aligned just right of it. Each is clipped to its
-    // own side, so in the wipe the split reveals and hides them along with the images.
-    auto drawTag = [&](const char* text, float x, ImVec2 clipMin, ImVec2 clipMax)
-    {
-        const ImVec2 size = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text);
-
-        // Never let a label run off the visible frame as it grows.
-        x = std::min(std::max(x, 0.0f), screen.x - size.x);
-        float y = std::min(margin, screen.y - size.y - margin);
-        y = std::max(y, 0.0f);
-
-        dl->PushClipRect(clipMin, clipMax, true);
-        dl->AddText(font, fontSize, ImVec2(x + 2.0f, y + 2.0f), IM_COL32(0, 0, 0, 210), text);
-        dl->AddText(font, fontSize, ImVec2(x, y), IM_COL32(255, 255, 255, 255), text);
-        dl->PopClipRect();
-    };
-
-    const ImVec2 leftSize = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, leftText);
-
-    // Left picture's label: right edge a margin in from the split. Right picture's: left edge a margin
-    // out from the split.
-    drawTag(leftText, splitX - margin - leftSize.x, ImVec2(0.0f, 0.0f), ImVec2(splitX, screen.y));
-    drawTag(rightText, splitX + margin, ImVec2(splitX, 0.0f), ImVec2(screen.x, screen.y));
-}
-
 void MenuCommon::RenderPerformanceOverlay(RenderMenuContext& ctx)
 {
-    RenderNrCompareTags();
-
     auto& state = ctx.state;
     auto config = ctx.config;
     auto& io = ctx.io;
@@ -4077,67 +3453,6 @@ void MenuCommon::RenderPerformanceOverlay(RenderMenuContext& ctx)
     }
 }
 
-// Save report (AMDNR 0.3.4, CRASH-BTN): one zip for a bug report, written on a worker thread (misc/AmdnrReport);
-// greyed while a save runs. (0.3.4 MENU match1, the approved mock / D-3) Out of the header row: the first row of
-// Advanced > Logging and the last of the Neural tab's Diagnostics drawer, one state for both (one tab is drawn at a
-// time, so the result shows under the button the player is looking at).
-void MenuCommon::RenderSaveReportRow(const char* idSuffix)
-{
-    const char* suffix = (idSuffix != nullptr && *idSuffix) ? idSuffix : "report";
-    ImGui::PushID(suffix);
-    static bool reportLineHidden = false;
-    const AmdnrReport::Result report = AmdnrReport::LastResult();
-    const std::string buttonLabel = std::string("Save report##") + suffix;
-    ImGui::BeginDisabled(report.running);
-    if (DlssNr::NeuralUi::Button(buttonLabel.c_str()) && AmdnrReport::SaveAsync())
-        reportLineHidden = false;
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", "One zip for a bug report: the logs, OptiScaler.ini and a system summary,\n"
-                                "user names masked. Saved in the game folder, else on the Desktop,\n"
-                                "else in %TEMP%; nothing is uploaded. Send it on the Discord with\n"
-                                "what happened.");
-
-    // The Save report result: dim while it runs and once saved (the zip's path, wrapped, with Open folder), in
-    // orange when it failed; Hide removes it until the next save. The path is shown with the user folder name
-    // masked (a zip on the Desktop or in %TEMP% sits under C:\Users\<name>, which reads C:\Users\<user>, and
-    // players post menu screenshots); Open folder still gets the real path. The failure text is masked the same way
-    // (a filesystem exception's text can name a path).
-    if (report.running || (report.done && !reportLineHidden))
-    {
-        ImGui::PushTextWrapPos(0.0f);
-        if (report.running)
-            ImGui::TextDisabled("%s", "Saving the report...");
-        else if (report.ok)
-            ImGui::TextDisabled("Report saved: %s", AmdnrReport::MaskUserFolders(report.text).c_str());
-        else
-            ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.55f, 0.2f, 1.f)), "%s",
-                               AmdnrReport::MaskUserFolders(report.text).c_str());
-        ImGui::PopTextWrapPos();
-        if (!report.running)
-        {
-            if (report.ok)
-            {
-                const size_t slash = report.text.find_last_of("\\/");
-                if (slash != std::string::npos)
-                {
-                    if (DlssNr::NeuralUi::Button("Open folder##report"))
-                    {
-                        auto pIO = &ImGui::GetPlatformIO();
-                        if (pIO->Platform_OpenInShellFn)
-                            pIO->Platform_OpenInShellFn(ImGui::GetCurrentContext(),
-                                                        report.text.substr(0, slash).c_str());
-                    }
-                    ImGui::SameLine();
-                }
-            }
-            if (DlssNr::NeuralUi::Button("Hide##report"))
-                reportLineHidden = true;
-        }
-    }
-    ImGui::PopID();
-}
-
 void MenuCommon::RenderMainMenuHeaderMessages(RenderMenuContext& ctx)
 {
     auto& state = ctx.state;
@@ -4148,121 +3463,6 @@ void MenuCommon::RenderMainMenuHeaderMessages(RenderMenuContext& ctx)
 
     if (!_showMipmapCalcWindow && !_showHudlessWindow && !ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow))
         ImGui::SetWindowFocus();
-
-    // AMDNR's own two doors, where a player looks first: the Discord (support, reports, test
-    // builds) and the GitHub releases, with the copyright line on the same row. The addresses
-    // are in the buttons' hovers (the dimmed address line repeated them). Row 2 names the two
-    // neural runtimes' authors on every tab, Daniel's name linked (the condition of his
-    // permission to ship his runtime: prominent attribution); its hover holds the full credits.
-    // One line each, no box, opened in the default browser like the Guide button below.
-    {
-        static const char* const kDiscordUrl = "https://discord.gg/AMDNR";
-        static const char* const kGitHubUrl = "https://github.com/3zwr1/AMD-NR---OptiScaler";
-        static const char* const kDanielUrl = "https://github.com/danielblnc/DLSS-NR-on-AMD";
-        auto openUrl = [](const char* url)
-        {
-            auto pIO = &ImGui::GetPlatformIO();
-            auto ctx = ImGui::GetCurrentContext();
-            if (pIO->Platform_OpenInShellFn)
-                pIO->Platform_OpenInShellFn(ctx, url);
-        };
-        // (AMDNR 0.3.4, the approved mock) Row 1: "AMDNR [Discord] [GitHub] (c) 2026 3zwr1 - see ...", the buttons in
-        // the mock's style (18 px, grey, red-brown border), 13 px under the title bar as in the mock. The "AMDNR"
-        // label's hover holds the version and the build stamp that the title bar showed until 0.3.4. Save report is
-        // not here (the mock, D-3): it is the first row of Advanced > Logging and the last of Neural > Diagnostics
-        // (RenderSaveReportRow).
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImFloor(2.0f * MockPx()));
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("AMDNR");
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-            ImGui::SetTooltip("AMDNR %s\nOptiScaler %s", AMDNR_VERSION_STR, BuildInfo::ProductVersion());
-        ImGui::SameLine();
-        if (DlssNr::NeuralUi::Button("Discord"))
-            openUrl(kDiscordUrl);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-            ImGui::SetTooltip("Support, bug reports and test builds\n%s", kDiscordUrl);
-        ImGui::SameLine();
-        // The GitHub page also opens the guide (its README), which the footer's Guide button opened until 0.3.4.
-        if (DlssNr::NeuralUi::Button("GitHub"))
-            openUrl(kGitHubUrl);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-            ImGui::SetTooltip("Releases, source and the guide (the README: installation, the settings\n"
-                              "worth knowing and what to do if something goes wrong)\n%s",
-                              kGitHubUrl);
-        ImGui::SameLine();
-        // AMDNR's copyright notice (Licenses\AMDNR_NOTICE.txt); OptiScaler's own notices are unchanged.
-        ImGui::TextDisabled("%s", "(c) 2026 3zwr1 - see Licenses\\AMDNR_NOTICE.txt");
-
-        // Row 2: the runtime credits, one plain dim line as in the mock, on every tab (the condition of Daniel's
-        // permission to ship his runtime: prominent attribution). Each author's part opens that author's page (the
-        // hand cursor shows it); the hover holds every entry of the README's Credits section.
-        // (0.3.4 MENU match1) 7 px between the buttons' frames and this line's text, as the mock.
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - ImFloor(1.0f * MockPx()));
-        static const char* const kLmxxfUrl = "https://github.com/lmxxf/dlss5-on-amd-9070xt-porting";
-        auto creditPart = [&openUrl](const char* text, const char* url)
-        {
-            ImGui::TextDisabled("%s", text);
-            if (url != nullptr && ImGui::IsItemHovered())
-            {
-                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                if (ImGui::IsItemClicked())
-                    openUrl(url);
-            }
-        };
-        ImGui::BeginGroup();
-        creditPart("Neural runtimes: ", nullptr);
-        ImGui::SameLine(0.0f, 0.0f);
-        creditPart("DLSS-NR on AMD by Daniel Blanco (danielblnc)", kDanielUrl);
-        ImGui::SameLine(0.0f, 0.0f);
-        creditPart(" - ", nullptr);
-        ImGui::SameLine(0.0f, 0.0f);
-        creditPart("lmxxf by Kien (MIT)", kLmxxfUrl);
-        ImGui::EndGroup();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-        {
-            static const char* const kCredits[] = {
-                "DLSS-NR on AMD by Daniel Blanco (danielblnc), his runtime unmodified:",
-                "    github.com/danielblnc/DLSS-NR-on-AMD (click the name to open it)",
-                "lmxxf runtime by Kien (MIT): github.com/lmxxf/dlss5-on-amd-9070xt-porting",
-                "lmxxf on RDNA 3: AMDNR's RDNA 3 backend by 3zwr1",
-                "TheAutomatic: DLSS 5 AMD project, which the lmxxf integration builds on",
-                "Matheus: dlss-5-amd project",
-                "Dagherbou: OptiScaler_DLSSNR    wilsjo2: OptiScaler-DLSSNR-PreSR-Multipass",
-                "RenoDX by clshortfuse (MIT): the colour composition maths",
-                "Nukem9: dlssg-to-fsr3 (GPLv3, unmodified)",
-                "Coldwood1026: XeFGUnlock (GPL-3.0), the base of the XeFG multi-frame unlock",
-                "FSR Ray Regeneration by Zach Hembree (DarkHelmet), continued by burak113 (GPL-3.0)",
-                "OptiScaler by Overclockers (GPL-3.0): the base of AMDNR",
-                "AMDNR (c) 2026 3zwr1: Licenses\\AMDNR_NOTICE.txt; every licence is in the Licenses folder",
-            };
-            ImGui::BeginTooltip();
-            ImGui::TextDisabled("Credits");
-            for (const char* line : kCredits)
-                ImGui::TextUnformatted(line);
-            ImGui::EndTooltip();
-        }
-    }
-
-    // REFramework missing (0.3.3.2): shown until hidden for this session. No MessageBox. [Hotfix]
-    // WarnMissingREFramework=false (AMDNR 0.3.4) silences it for a player who runs the game without REFramework.
-    static bool refHidden = false;
-    if (!refHidden && (state.postCodes & PostCode::REFrameworkMissing) &&
-        config->WarnMissingREFramework.value_or_default())
-    {
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.55f, 0.2f, 1.f)), "%s",
-                           ("REFramework not found: " + REFrameworkCheck::Advice(state.gameExe, false)).c_str());
-        ImGui::PopTextWrapPos();
-        if (DlssNr::NeuralUi::Button("REFramework nightly"))
-        {
-            auto pIO = &ImGui::GetPlatformIO();
-            if (pIO->Platform_OpenInShellFn)
-                pIO->Platform_OpenInShellFn(ImGui::GetCurrentContext(), REFrameworkCheck::kNightlyUrl);
-        }
-        ImGui::SameLine();
-        if (DlssNr::NeuralUi::Button("Hide##ref"))
-            refHidden = true;
-    }
 
     if (config->MenuScale.has_value())
     {
@@ -4278,7 +3478,7 @@ void MenuCommon::RenderMainMenuHeaderMessages(RenderMenuContext& ctx)
         if (versionStatus.updateAvailable && !versionStatus.latestTag.empty())
         {
             ImGui::Spacing();
-            ImGui::TextColored(StatusWarn(), "AMDNR update available: %s (current %s)", versionStatus.latestTag.c_str(),
+            ImGui::TextColored(StatusWarn(), "Update available: %s (current %s)", versionStatus.latestTag.c_str(),
                                currentVersionText.c_str());
 
             if (!versionStatus.latestUrl.empty())
@@ -5179,13 +4379,6 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
 {
     auto& state = ctx.state;
     auto config = ctx.config;
-    // AMDNR: while external frame generation is in force (the Frame Gen tab's Compatibility box) this tab says so here.
-    if (state.externalFrameGeneration)
-    {
-        ImGui::TextWrapped("External FG is active. Set the multiplier in the game or unlocker, not OptiScaler.");
-        ImGui::TextDisabled("%s", "The Compatibility box of this tab turns it off.");
-        return;
-    }
     auto& menuResScale = ctx.menuResScale;
     auto& primaryGpu = *ctx.primaryGpu;
 
@@ -5376,11 +4569,10 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
 
     auto constexpr fgNvngxNukemsIndex = (uint32_t) FGNvngxReplacement::Nukems;
     nvngxOptions[fgNvngxNukemsIndex].set_disabled(!state.nukemsFgFileAvailable,
-                                                  "Missing amdnr_dlssg_fsr3.dll (Nukem's dlssg_to_fsr3) in the OptiScaler folder");
+                                                  "Missing dlssg_to_fsr3_amd_is_better.dll");
 
     auto constexpr fgNvngxArtursIndex = (uint32_t) FGNvngxReplacement::Arturs;
-    nvngxOptions[fgNvngxArtursIndex].set_disabled(!state.artursFgFileAvailable,
-                                                  std::string("Missing dlss-enabler-headless.dll\n\n") + kEnablerHowTo);
+    nvngxOptions[fgNvngxArtursIndex].set_disabled(!state.artursFgFileAvailable, "Missing dlss-enabler-headless.dll");
 
     auto constexpr fgNvngxFfxIndex = (uint32_t) FGNvngxReplacement::FFX;
     if (state.swapchainApi == API::Vulkan)
@@ -5394,10 +4586,7 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
     nvngxOptions[fgNvngxComboIndex].set_disabled(state.swapchainApi == API::Vulkan, "Unsupported API");
     nvngxOptions[fgNvngxComboIndex].set_disabled(
         !FfxApiProxy::IsFGReady(false) || !state.artursFgFileAvailable,
-        !state.artursFgFileAvailable
-            ? std::string(FfxApiProxy::IsFGReady(false) ? "" : "Missing amd_fidelityfx_framegeneration_dx12.dll\n") +
-                  "Missing dlss-enabler-headless.dll\n\n" + kEnablerHowTo
-            : std::string("Missing amd_fidelityfx_framegeneration_dx12.dll"));
+        "Missing amd_fidelityfx_framegeneration_dx12.dll\nor missing dlss-enabler-headless.dll");
 
     // TODO: Automatically switch to any other option
 
@@ -5462,13 +4651,6 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
             {
                 PopulateCombo("FG Output", config->FGOutput, outputOptions);
                 ShowTooltip("The FG that you will actually be using");
-                // AMDNR: why the FG output differs from the ini (a native XeSS FG present)
-                if (!State::Instance().fgNote.empty())
-                {
-                    ImGui::PushStyleColor(ImGuiCol_Text, toneMapColor(ImVec4(1.f, 0.8f, 0.3f, 1.f)));
-                    ImGui::TextWrapped("%s", State::Instance().fgNote.c_str());
-                    ImGui::PopStyleColor();
-                }
             }
 
             if (showNvngxFgDowndown)
@@ -5754,7 +4936,7 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
                                 }
 
                                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                                    ImGui::SetTooltip("%s", ftSourceInfos[i]);
+                                    ImGui::SetTooltip(ftSourceInfos[i]);
                             }
 
                             ImGui::EndCombo();
@@ -5868,26 +5050,6 @@ void MenuCommon::RenderFGModeSlider(RenderMenuContext& ctx, const char* label, i
         ShowTooltip("Frame Generation mode\nDefault follows the game's DLSS FG setting");
     else
         ShowTooltip("Frame Generation mode");
-}
-
-void MenuCommon::RenderFrameGenerationCompatibility(RenderMenuContext& ctx)
-{
-    auto& state = ctx.state;
-    auto config = ctx.config;
-
-    SectionTitle("Compatibility");
-
-    bool external = config->ExternalFrameGeneration.value_or_default();
-    if (ImGui::Checkbox("External frame generation / MFG unlocker", &external))
-        config->ExternalFrameGeneration = external;
-    ShowTooltip("Leaves Streamline, Reflex and FG control to the game/external mod."
-                "\nNR and NGX upscaling remain available. Save Settings and restart."
-                "\nDoes not install an unlocker or enable FG in unsupported games.");
-    ImGui::SameLine();
-    ImGui::TextDisabled("next game start");
-
-    if (external != state.externalFrameGeneration)
-        ImGui::TextWrapped("Save Settings and restart to change frame-generation ownership.");
 }
 
 void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
@@ -6169,12 +5331,8 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         if (state.activeFgInput == FGInput::Upscaler && currentFeature != nullptr)
             nativeAA = currentFeature->RenderWidth() == currentFeature->DisplayWidth();
 
-        // AMDNR: XeFG\AllowDilatedMV passes the motion-vector check alone (the same test as
-        // XeFG_Dx12::Activate); the fullscreen and HDR checks below still apply. Off by default.
-        bool allowDilatedMV = config->FGXeFGAllowDilatedMV.value_or_default();
-        const bool mvsAccepted = fgOutput->IsLowResMV() || nativeAA ||
-                                 (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs);
-        const bool correctMVs = mvsAccepted || ignoreChecks || allowDilatedMV;
+        const bool correctMVs = fgOutput->IsLowResMV() || nativeAA ||
+                                (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs) || ignoreChecks;
 
         if (!correctMVs || state.realExclusiveFullscreen)
         {
@@ -6194,21 +5352,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         else
         {
             if (!correctMVs)
-                ImGui::TextColored(StatusError(),
-                                   "Requires disabling dilated motion vectors (or 'Allow dilated motion vectors' below)");
-
-            // Shown while the game sends dilated MVs, and while it is on so it can be turned off.
-            if (!mvsAccepted || allowDilatedMV)
-            {
-                if (ImGui::Checkbox("Allow dilated motion vectors", &allowDilatedMV))
-                    config->FGXeFGAllowDilatedMV = allowDilatedMV;
-
-                ShowTooltip("Lets XeFG run with the game's dilated / display-resolution motion vectors\n"
-                            "(Intel's high-res MV mode). Only the motion-vector check is skipped;\n"
-                            "fullscreen and HDR checks still apply.\n"
-                            "Experimental: generated frames can show artefacts in some games.");
-            }
-
+                ImGui::TextColored(StatusError(), "Requires disabling dilated motion vectors");
 
             if (!ignoreChecks && state.realExclusiveFullscreen)
             {
@@ -7093,20 +6237,18 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
 
             if (!state.nukemsFgFileAvailable)
             {
-                ImGui::PushStyleColor(ImGuiCol_Text, StatusError());
-                ImGui::TextWrapped("Please put amdnr_dlssg_fsr3.dll (from the zip; Nukem's "
-                                   "dlssg_to_fsr3_amd_is_better.dll works too) into the OptiScaler folder");
-                ImGui::PopStyleColor();
+                ImGui::TextColored(StatusError(), "Please put dlssg_to_fsr3_amd_is_better.dll into OptiScaler folder");
             }
         }
         else if (activeNvngxFg == FGNvngxReplacement::Arturs)
         {
             SeparatorWithHelpMarker("Frame Generation (FSR3-MFG via DLSS Enabler)",
-                                    "DLSS Enabler 4.9.0 or newer by Artur Graniszewski, its version.dll\n"
-                                    "renamed to dlss-enabler-headless.dll (not included with AMDNR)");
+                                    "DLSS Enabler as dlss-enabler-headless.dll");
 
             if (!state.artursFgFileAvailable)
-                RenderEnablerMissing();
+            {
+                ImGui::TextColored(StatusError(), "Please put dlss-enabler-headless.dll into OptiScaler folder");
+            }
 
             ImGui::TextColored(StatusWarn(), "Using a subset of features from DLSS Enabler");
         }
@@ -7124,9 +6266,6 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             SeparatorWithHelpMarker("Frame Generation (Enabler + FFX)",
                                     "FFX for middle fake frames, and Enabler for the rest\n\n2x - FFX\n"
                                     "3x - Enabler\n4x - FFX + Enabler\n5x - Enabler\n6x - FFX + Enabler");
-
-            if (!state.artursFgFileAvailable)
-                RenderEnablerMissing();
         }
 
         if (state.activeFgInput == FGInput::NvngxFG)
@@ -8815,12 +7954,6 @@ void MenuCommon::RenderAdvancedSettings(RenderMenuContext& ctx)
 
             ImGui::EndTable();
         }
-
-        // AMDNR 0.3.4: the NR passes sit inside the upscaler's root-signature window
-        ImGui::TextDisabled("Can pause Neural Rendering on some frames");
-        ShowTooltip("With either restore on, a frame whose root signature cannot be restored\n"
-                    "skips the upscaler, and Neural Rendering skips that frame with it\n"
-                    "(its history restarts). Leave both off unless a game needs them.");
     }
 }
 
@@ -8830,10 +7963,6 @@ void MenuCommon::RenderLoggingSettings(RenderMenuContext& ctx)
 
     // LOGGING -----------------------------
     SectionTitle("Logging");
-
-    // AMDNR 0.3.4: one zip for a bug report, and the build the logs come from
-    RenderSaveReportRow("advanced");
-    ImGui::TextDisabled("AMDNR %s, OptiScaler %s", AMDNR_VERSION_STR, BuildInfo::ProductVersion());
 
     if (config->LogToConsole.value_or_default() || config->LogToFile.value_or_default() ||
         config->LogToNGX.value_or_default())
@@ -9939,10 +9068,8 @@ void MenuCommon::RenderKeybindSettings(RenderMenuContext& ctx)
         static auto fpsOverlay = Keybind("FPS Overlay", 11);
         static auto fpsOverlayCycle = Keybind("FPS Overlay Cycle", 12);
         static auto fgEnable = Keybind("Frame Generation", 13);
-        static auto dlssNrToggle = Keybind("Neural Rendering", 14);
 
         menu.Render(config->ShortcutKey);
-        dlssNrToggle.Render(config->DlssNrToggleKey);
         fpsOverlay.Render(config->FpsShortcutKey);
         fpsOverlayCycle.Render(config->FpsCycleShortcutKey);
         fgEnable.Render(config->FGShortcutKey);
@@ -10339,7 +9466,6 @@ const MenuCommon::MenuBox* MenuCommon::GetMenuBoxes(size_t& count)
           [](RenderMenuContext& c) { if (IsUpscalerActive(c.currentFeature)) RenderCard(c, RenderMagnifierSettings); } },
 
         { "fg_selection", "Frame Gen", "Frame Generation", [](RenderMenuContext& c) { RenderCard(c, RenderFrameGenerationSelection); } },
-        { "fg_compat", "Frame Gen", "Compatibility (external FG)", [](RenderMenuContext& c) { RenderCard(c, RenderFrameGenerationCompatibility); } },
         { "fg_fsrfg", "Frame Gen", "FSR FG Settings", nullptr, RenderFrameGenerationRuntimeSettings },
         { "fg_xefg", "Frame Gen", "XeFG Settings", nullptr, RenderFrameGenerationRuntimeSettings },
         { "fg_dlssg", "Frame Gen", "DLSSG Settings", nullptr, RenderFrameGenerationRuntimeSettings },
@@ -10548,254 +9674,8 @@ void MenuCommon::RenderCustomTabSettings(RenderMenuContext& ctx)
     }
 }
 
-// THE NEURAL RUNTIME CHOOSER. Two runtimes can carry DLSS Neural Rendering on AMD: danielblnc's
-// closed runtime and lmxxf's open-source HIP runtime. The first launch that finds either
-// one installed asks which, once, and records the answer as [DlssNr] NrBackend; the Neural tab
-// changes it later. A modal, because the answer changes which files the pass loads.
-// AMDNR 0.3.4: one radio row per runtime (its credit, installed or not, runs on this GPU or not), the file
-// names in the row's hover, no runtime versions. The rows come from the runtime table (RuntimeCaps::All(): name,
-// credit, ini value, files check, GPU check); a future runtime is one more table row.
-// AMDNR 0.3.4.2 (Assetto Corsa: the chooser opened by itself during loading and could not be answered at 3-10 fps):
-// the rules live in menu/RuntimeChooserSession.h. The row of the runtime running now is preselected until the player
-// picks, so "Use this runtime" works at once; keys 1 / 2, Enter and Esc work at any frame rate (UpdateManualInput);
-// the title bar X, Esc and closing the menu all mean "Decide later".
-static void ApplyChooserUse(Config* config, int row, const char* how)
-{
-    const auto runtimes = DlssNr::RuntimeCaps::All();
-    if (row < 0 || row >= static_cast<int>(runtimes.size()))
-        return;
-
-    config->DlssNrBackend = std::string(runtimes[row].iniValue); // "daniel" / "lmxxf", as before
-    config->SaveIni();
-    LOG_INFO("runtime chooser: {} chosen ({}); [DlssNr] NrBackend={} saved", runtimes[row].name, how,
-             runtimes[row].iniValue);
-}
-
-static void RenderNeuralRuntimeChooser(Config* config)
-{
-    const DWORD nowTick = GetTickCount();
-    const bool needed = DlssNr::AmdBridge::RuntimeChoiceNeeded();
-
-    if (!chooserSession.NeedsRender(needed))
-    {
-        // Answered, or no longer needed: ImGui must not keep the modal open unseen, as an open modal blocks every
-        // click on the menu behind it.
-        if (chooserSession.opened && ImGui::IsPopupOpen(kChooserTitle))
-        {
-            if (ImGui::BeginPopupModal(kChooserTitle, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-            {
-                ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
-            }
-        }
-        chooserSession.OnFrame(false, nowTick);
-        return;
-    }
-
-    if (chooserSession.OpenOnce())
-    {
-        LOG_INFO("runtime chooser: shown (files for both AMD neural runtimes present, [DlssNr] NrBackend not "
-                 "set); keys: 1 / 2 pick, Enter use, Esc or the menu key decide later");
-    }
-
-    if (!ImGui::IsPopupOpen(kChooserTitle))
-    {
-        if (!chooserSession.Wanted(needed))
-        {
-            // An Esc answer for a popup that is already gone: nothing to close.
-            chooserSession.TakeClose();
-            chooserSession.usePending = false;
-            chooserSession.OnFrame(false, nowTick);
-            return;
-        }
-        ImGui::OpenPopup(kChooserTitle);
-    }
-
-    bool keepOpen = true; // the title bar X
-    if (!ImGui::BeginPopupModal(kChooserTitle, &keepOpen, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        if (!keepOpen && chooserSession.DecideLater())
-        {
-            LOG_INFO("runtime chooser: decided later ({}); not shown again this session",
-                     MenuUi::LaterReasonName(MenuUi::LaterReason::TitleBarX));
-        }
-        chooserSession.OnFrame(false, nowTick);
-        return;
-    }
-    const auto& g = DlssNr::AmdBridge::GpuSupportInfo();
-    const bool gpuKnown = g.amd && g.known;
-    const bool lmxxfRdna3 = g.lmxxfOk && g.target.rfind("gfx11", 0) == 0;
-
-    struct ChooserRow
-    {
-        std::string label;  // radio label (unique in this popup)
-        std::string credit; // who made it
-        const char* files;  // hover: what it loads and from where
-        bool installed;     // what "Use this runtime" requires
-        std::string state;  // installed / not installed / partly installed
-        bool gpuOk;         // runs on this GPU (only said when the GPU is known)
-        bool experimental = false; // lmxxf on a handheld APU (GpuSupport::lmxxfExperimental): runs, slow, untested
-    };
-    const auto runtimes = DlssNr::RuntimeCaps::All();
-    std::vector<ChooserRow> rows;
-    rows.reserve(runtimes.size());
-    for (const auto& r : runtimes)
-    {
-        const bool lmxxf = r.id == DlssNr::AmdBridge::NeuralRuntime::Lmxxf;
-        const bool complete = r.installed();
-        ChooserRow row;
-        row.label = std::string(r.name) + " runtime";
-        row.credit = r.credit;
-        // lmxxf on RDNA 3 runs AMDNR's own backend: its credit stays on the row (0.3.3.2's chooser had it).
-        if (lmxxf && lmxxfRdna3)
-            row.credit += " - RDNA 3 backend by 3zwr1 (AMDNR)";
-        row.files = lmxxf ? "lmxxf's open-source HIP runtime: LmxxfNrRuntime.dll beside OptiScaler.dll and\n"
-                            "LmxxfNrRuntime.pak beside it (or DLSS5-AMD\\native-game-tiled-assets next to the game).\n"
-                            "Its edit is applied one frame late, carried by the motion vectors,\n"
-                            "so the frame never waits for the network."
-                          : "danielblnc's closed runtime: dlssnr_amd_pass1..3.dll and dlssnr_on_amd_weights.bin\n"
-                            "beside OptiScaler.dll.";
-        // What can be picked is unchanged from 0.3.3.2: danielblnc's pass DLL, or lmxxf's assets (the chooser only
-        // opens when both are there); a missing LmxxfNrRuntime.dll is named in the row.
-        row.installed = lmxxf ? DlssNr::AmdBridge::LmxxfAssetsPresent() : complete;
-        row.state = complete ? std::string("installed")
-                    : row.installed ? r.missing()
-                                    : "not installed (" + r.missing() + ")";
-        row.gpuOk = r.gpuOk(g);
-        row.experimental = lmxxf && g.lmxxfExperimental; // runtime work HB request 7 (C8)
-        rows.push_back(std::move(row));
-    }
-
-    bool installed[MenuUi::RuntimeChooserSession::kMaxRows] {};
-    for (int i = 0; i < static_cast<int>(std::size(rows)) && i < MenuUi::RuntimeChooserSession::kMaxRows; ++i)
-        installed[i] = rows[i].installed;
-    chooserSession.SetRows(static_cast<int>(std::size(rows)), installed);
-
-    // The runtime this process runs now (read only; danielblnc in the Assetto Corsa logs) is preselected.
-    const auto active = DlssNr::AmdBridge::ActiveRuntime();
-    int activeRow = -1;
-    for (int i = 0; i < static_cast<int>(runtimes.size()); ++i)
-    {
-        if (active != DlssNr::AmdBridge::NeuralRuntime::Unchosen && runtimes[i].id == active)
-            activeRow = i;
-    }
-    chooserSession.SetPreselect(activeRow);
-
-    // Answers given by key (UpdateManualInput) are applied before the rows are drawn.
-    if (const int row = chooserSession.TakeUse(false); row >= 0 || chooserSession.TakeClose())
-    {
-        if (row >= 0)
-            ApplyChooserUse(config, row, "Enter key");
-        ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-        chooserSession.OnFrame(false, nowTick);
-        return;
-    }
-    chooserSession.OnFrame(true, nowTick);
-
-    ImGui::TextUnformatted("Two AMD neural runtimes can carry DLSS Neural Rendering. Pick one.");
-    ImGui::TextDisabled("You can change this later under Neural > Neural runtime.");
-    ImGui::Spacing();
-    const int effectivePick = chooserSession.EffectivePick();
-    for (int i = 0; i < static_cast<int>(std::size(rows)); ++i)
-    {
-        const ChooserRow& row = rows[i];
-        // A fixed ID (###): the "(running now)" tag can appear while the row is being clicked.
-        const std::string radioLabel =
-            row.label + (i == activeRow ? " (running now)" : "") + "###chooser_row_" + std::to_string(i);
-        ImGui::BeginGroup();
-        if (ImGui::RadioButton(radioLabel.c_str(), effectivePick == i) && chooserSession.PickRow(i))
-            LOG_INFO("runtime chooser: row {} ({}) picked by click", i + 1, runtimes[i].name);
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s - %s%s%s", row.credit.c_str(), row.state.c_str(),
-                            !gpuKnown ? "" : (row.gpuOk ? ", runs on this GPU" : ", does not run on this GPU"),
-                            gpuKnown && row.gpuOk && row.experimental ? " (experimental)" : "");
-        ImGui::EndGroup();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", row.files);
-    }
-    if (gpuKnown)
-    {
-        ImGui::Spacing();
-        ImGui::TextDisabled("This GPU: %s (%s)", g.name.c_str(), g.target.c_str());
-        if (!g.danielOk && !g.lmxxfOk)
-        {
-            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
-            ImGui::TextColored(ImVec4(1.f, 0.55f, 0.2f, 1.f), "%s", g.note.c_str());
-            ImGui::PopTextWrapPos();
-        }
-    }
-    ImGui::Spacing();
-    // AMDNR 0.3.4.2: the keys work at any frame rate; clicks can be missed at a few frames per second.
-    ImGui::TextDisabled("Keys: 1 / 2 pick, Enter use, Esc or %s decide later",
-                        MenuCommon::KeyName(config->ShortcutKey.value_or_default()).c_str());
-    const float menuFps = ImGui::GetIO().Framerate;
-    if (menuFps > 0.0f && menuFps < 20.0f)
-        ImGui::TextDisabled("%s", "Low frame rate: use the keys if clicks are missed");
-    ImGui::Spacing();
-    const bool can = chooserSession.CanUse();
-    ImGui::BeginDisabled(!can);
-    if (DlssNr::NeuralUi::Button("Use this runtime", ImVec2(ImGui::GetFontSize() * 13.0f, 0.0f)) && can)
-    {
-        if (const int row = chooserSession.TakeUse(true); row >= 0)
-        {
-            ApplyChooserUse(config, row, "button");
-            ImGui::CloseCurrentPopup();
-        }
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (DlssNr::NeuralUi::Button("Decide later", ImVec2(ImGui::GetFontSize() * 10.0f, 0.0f)))
-    {
-        if (chooserSession.DecideLater())
-        {
-            LOG_INFO("runtime chooser: decided later ({}); not shown again this session",
-                     MenuUi::LaterReasonName(MenuUi::LaterReason::Button));
-        }
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
-}
-
-// AMDNR 0.3.4 (T11g): a tab another tab asked to open, e.g. "Open Upscaling" on the Neural tab; by the label of
-// upstream's sidebar tab. Menu thread only.
-void MenuCommon::RequestTab(MenuTab tab)
-{
-    switch (tab)
-    {
-    case MenuTab::Neural:
-        requestedMenuTab = "Neural";
-        break;
-    case MenuTab::Upscaling:
-        requestedMenuTab = "Upscaling";
-        break;
-    case MenuTab::FrameGen:
-        requestedMenuTab = "Frame Gen";
-        break;
-    case MenuTab::Image:
-        requestedMenuTab = "Textures";
-        break;
-    case MenuTab::Interface:
-        requestedMenuTab = "Menu";
-        break;
-    case MenuTab::Advanced:
-        requestedMenuTab = "Compatibility";
-        break;
-    }
-}
-
-// AMDNR: the Neural tab, the fork's headline feature (dlssnr/DlssNr_Menu.cpp draws it)
-static void RenderNeuralTabContents(Config* config, float menuResScale)
-{
-    ImGui::PushItemWidth(DlssNr::NeuralUi::ControlWidth());
-    DlssNr::RenderMenu(config, menuResScale);
-    ImGui::PopItemWidth();
-}
-
 void MenuCommon::RenderMainMenuTabs(RenderMenuContext& ctx)
 {
-    RenderNeuralRuntimeChooser(ctx.config);
-
     auto& state = ctx.state;
     auto config = ctx.config;
     auto& currentFeature = ctx.currentFeature;
@@ -10816,7 +9696,6 @@ void MenuCommon::RenderMainMenuTabs(RenderMenuContext& ctx)
     // clang-format off
     static const Tab tabs[] = {
         { "main", "Custom", RenderCustomTab },
-        { "main", "Neural", [](RenderMenuContext& c) { RenderNeuralTabContents(c.config, c.menuResScale); } },
         { "main", "Upscaling", RenderUpscalerStateMessage },
         { "main", "Frame Gen" },
         { "main", "Latency" },
@@ -11253,7 +10132,6 @@ void MenuCommon::RenderMainMenuBottomBar(RenderMenuContext& ctx)
     if (ImGui::Button(closeLabel))
     {
         _isVisible = false;
-        ChooserMenuClosed("Close button"); // AMDNR 0.3.4.2 (C1)
         hasGamepad = (io.BackendFlags | ImGuiBackendFlags_HasGamepad) > 0;
         io.BackendFlags &= 30;
         io.ConfigFlags = ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange | ImGuiConfigFlags_NoKeyboard;
@@ -11442,13 +10320,11 @@ void MenuCommon::RenderHudlessResourcesWindow(RenderMenuContext& ctx, ImGuiWindo
     auto fg = state.currentFG;
     if (_showHudlessWindow && config->FGHUDFix.value_or_default() && fg != nullptr && fg->IsActive())
     {
-        // Scaled with the menu (AMDNR 0.3.4)
-        const ImVec2 hudlessSize { 400.0f * ctx.menuResScale, 300.0f * ctx.menuResScale };
-        auto posX = (io.DisplaySize.x - hudlessSize.x) / 2.0f;
-        auto posY = (io.DisplaySize.y - hudlessSize.y) / 2.0f;
+        auto posX = (io.DisplaySize.x - 400.0f) / 2.0f;
+        auto posY = (io.DisplaySize.y - 300.0f) / 2.0f;
 
         ImGui::SetNextWindowPos(ImVec2 { posX, posY }, ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(hudlessSize);
+        ImGui::SetNextWindowSize(ImVec2 { 400.0f, 300.0f });
 
         if (ImGui::Begin("HUDless Resources", nullptr, flags))
         {
@@ -11675,128 +10551,6 @@ void KeyUp(UINT vKey)
     inputFps = vKey == Config::Instance()->FpsShortcutKey.value_or_default();
     inputFG = vKey == Config::Instance()->FGShortcutKey.value_or_default();
     inputFpsCycle = vKey == Config::Instance()->FpsCycleShortcutKey.value_or_default();
-    // The neural keys were missing here: titles whose input reaches us through the window
-    // procedure (not the raw-input poll) never saw the toggle fire.
-    const int nrKey = Config::Instance()->DlssNrToggleKey.value_or_default();
-    const int capKey = Config::Instance()->DlssNrCaptureKey.value_or_default();
-    if (nrKey != UnboundKey && vKey == static_cast<UINT>(nrKey)) inputDlssNr = true;
-    if (capKey != UnboundKey && vKey == static_cast<UINT>(capKey)) inputCapture = true;
-}
-
-// The lamp, and only the lamp.
-//
-// Red for dark, green for full light, with its reading beside it. No status sentence: the whole
-// point of a light meter is that it is read at a glance while playing, and a paragraph in the corner
-// of somebody's game is not that. Everything wordy lives in the menu, which is where someone has
-// already decided to stop and read.
-//
-// Drawn only when its own setting is on. An overlay that appears because a scan happens to be
-// running is an overlay nobody asked for.
-void RenderExposureScanIndicator(float alpha)
-{
-    using DlssNr::ExposureScan::Verdict;
-
-    if (!Config::Instance()->DlssNrScanMeter.value_or_default())
-        return;
-
-    if (DlssNr::ExposureScan::Where() == Verdict::Off)
-        return;
-
-    int which = 0;
-    float low = 0.0f, high = 0.0f;
-    const float now = DlssNr::ExposureScan::BestValue(&which, &low, &high);
-
-    // Nothing found yet, or no range to place it in: a dim lamp, which says "watching, no reading"
-    // without saying it in words.
-    const bool reading = now > 0.0f && high > low;
-
-    float lit = 0.0f;
-
-    if (reading)
-    {
-        // An exposure falls as the scene brightens, so the value reads backwards unless the buffer
-        // holds the reciprocal -- the same question the anchor asks, answered from the same setting,
-        // because a lamp contradicting the picture would be worse than no lamp.
-        lit = (high - now) / (high - low);
-
-        if (Config::Instance()->DlssNrScanInverted.value_or_default())
-            lit = 1.0f - lit;
-
-        lit = lit < 0.0f ? 0.0f : (lit > 1.0f ? 1.0f : lit);
-    }
-
-    // Red to amber to green. A straight red-to-green fade passes through a muddy brown at the
-    // midpoint, and the midpoint is where most of a session is spent.
-    const ImVec4 dark(0.90f, 0.22f, 0.20f, 1.0f);
-    const ImVec4 mid(0.95f, 0.75f, 0.20f, 1.0f);
-    const ImVec4 bright(0.35f, 0.88f, 0.38f, 1.0f);
-    const ImVec4 idle(0.45f, 0.45f, 0.45f, 1.0f);
-
-    ImVec4 lamp = idle;
-
-    if (reading)
-    {
-        const float t = lit < 0.5f ? lit * 2.0f : (lit - 0.5f) * 2.0f;
-        const ImVec4& a = lit < 0.5f ? dark : mid;
-        const ImVec4& b = lit < 0.5f ? mid : bright;
-        lamp = ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, 1.0f);
-    }
-
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 12.0f, vp->WorkPos.y + 12.0f),
-                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    ImGui::SetNextWindowBgAlpha(alpha);
-
-    if (ImGui::Begin("DlssNrExposureScan", nullptr,
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDecoration |
-                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing |
-                         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove))
-    {
-        const float r = ImGui::GetFontSize() * 0.38f;
-        const ImVec2 at = ImGui::GetCursorScreenPos();
-        const ImVec2 centre(at.x + r, at.y + ImGui::GetTextLineHeight() * 0.5f);
-
-        ImDrawList* draw = ImGui::GetWindowDrawList();
-        draw->AddCircleFilled(centre, r, ImGui::GetColorU32(lamp), 20);
-        draw->AddCircle(centre, r, ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.6f)), 20, 1.5f);
-
-        ImGui::Dummy(ImVec2(r * 2.0f + 6.0f, ImGui::GetTextLineHeight()));
-        ImGui::SameLine();
-
-        if (reading)
-            ImGui::TextColored(lamp, "%3.0f%%  %.5f", lit * 100.0f, now);
-        else
-            ImGui::TextColored(idle, "--");
-    }
-
-    ImGui::End();
-}
-
-// AMDNR 0.3.4.2 (H2): danielblnc's runtime and lmxxf's assets both installed and [DlssNr] NrBackend not set
-// (AmdBridge::RuntimeChoiceNeeded). Until 0.3.4.1 RenderMenu
-// opened the menu here by itself so the chooser was the first thing on screen, which trapped players over a loading
-// game (Assetto Corsa, F1 25). Now one notification per process says which runtime runs until the player picks and
-// how to open the menu (MenuUi::RuntimeChooserBoot); the chooser (RenderNeuralRuntimeChooser) appears the first time
-// the player opens the menu, and what runs meanwhile is the bridge's own rule, untouched. The runtime is named by the
-// Neural tab's own rule (RuntimeCaps::Menu(): the backend built, else the one the bridge will build), the key by its
-// configured name. The choice is polled only until the notice is posted, as the forced open was.
-static void RaiseNeuralChoiceNotice(Config* config, bool menuVisible)
-{
-    if (chooserBoot.notified)
-        return;
-    if (chooserBoot.OnFrame(DlssNr::AmdBridge::RuntimeChoiceNeeded(), menuVisible) != MenuUi::BootAction::Notify)
-        return;
-
-    const char* runtime = DlssNr::RuntimeCaps::Menu().name;
-    const std::string key = MenuCommon::KeyName(config->ShortcutKey.value_or_default());
-    const std::string text = MenuUi::BootNoticeText(runtime, key.c_str());
-    ImGuiToast toast { ImGuiToastType::Info, 15000 };
-    toast.setTitle("%s", "DLSS Neural Rendering");
-    toast.setContent("%s", text.c_str());
-    ImGui::InsertNotification(toast);
-    LOG_INFO("runtime chooser: a second AMD neural runtime's files are installed and [DlssNr] NrBackend is not set; "
-             "{} runs until the player picks; the chooser opens with the menu ({}), no longer by itself",
-             runtime, key);
 }
 
 bool MenuCommon::RenderMenu()
@@ -11807,10 +10561,6 @@ bool MenuCommon::RenderMenu()
     RenderMenuContext ctx { State::Instance(), Config::Instance(), ImGui::GetIO() };
     ctx.now = Util::MillisecondsNow();
     ctx.currentFeature = ctx.state.currentFeature;
-
-    // AMDNR 0.3.4.2 (H2): the first launch with both AMD neural runtimes and no choice no longer opens the menu by
-    // itself; one notification says what runs and how to open the menu.
-    RaiseNeuralChoiceNotice(ctx.config, _isVisible);
 
     // 1) Collect timing and input state before any ImGui drawing.
     UpdateRenderTiming(ctx);
@@ -11847,7 +10597,6 @@ bool MenuCommon::RenderMenu()
     RenderNotifications(ctx);
     UpdateFrameTimeAverages(ctx);
     RenderPerformanceOverlay(ctx);
-    RenderExposureScanIndicator(ctx.config->FpsOverlayAlpha.value_or_default());
 
     // 4) Draw the full settings menu last so popups and child windows keep their existing behavior.
     RenderMainMenuWindow(ctx);
@@ -11956,8 +10705,6 @@ void MenuCommon::Init(HWND InHwnd, bool isUWP)
     OptiInput::Initialize(_handle, isUWP);
 
     ApplyThemeStyle();
-    // A new context starts from a default style: the rescale has to run on it too (AMDNR 0.3.4).
-    lastMenuScale = 0.0f;
     _isInited = true;
 }
 

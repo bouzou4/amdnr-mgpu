@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "FrameLimit.h"
 
@@ -53,10 +52,6 @@ inline int FrameLimit::combined_sleep(int64_t ns)
 
     return status;
 }
-
-int FrameLimit::sleep_ns(int64_t ns) { return ns > 0 ? combined_sleep(ns) : 0; }
-
-uint64_t FrameLimit::now_ns() { return Util::GetTimestamp(); }
 
 float FrameLimit::targetFps()
 {

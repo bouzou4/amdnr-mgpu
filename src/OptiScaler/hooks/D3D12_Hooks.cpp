@@ -1,7 +1,5 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "D3D12_Hooks.h"
-#include <dlssnr/DlssNr_ExposureScan.h>
 
 #include <Util.h>
 #include <Config.h>
@@ -23,7 +21,6 @@
 #include <dxgi1_6.h>
 #include <d3d12shader.h>
 #include <misc/IdentifyGpu.h>
-#include <misc/DiagSwitches.h>
 
 #include "Hook_Utils.h"
 
@@ -1009,10 +1006,6 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
 
 static void HookToCommandList(ID3D12Device* InDevice)
 {
-    // [Hotfix] DiagNoD3D12Hooks (crash triage): no D3D12 detours at all.
-    if (DiagSwitches::NoD3D12Hooks())
-        return;
-
     if (s_SetComputeRootSignature.o_earlyHook != nullptr || s_SetGraphicsRootSignature.o_earlyHook != nullptr)
         return;
 
@@ -1523,7 +1516,7 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
 
     if (result == S_OK && ppDevice != nullptr && MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE && !nonPrimaryGpu)
     {
-        LOG_INFO("[CREATE] D3D12 device captured: {0:X}", (size_t) *ppDevice);
+        LOG_DEBUG("Device captured: {0:X}", (size_t) *ppDevice);
         State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
 
         if (desc.VendorId == VendorId::Intel && Config::Instance()->UESpoofIntelAtomics64.value_or_default())
@@ -1674,7 +1667,7 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
 
     if (result == S_OK && ppDevice != nullptr && MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
     {
-        LOG_INFO("[CREATE] D3D12 device captured: {0:X}", (size_t) *ppDevice);
+        LOG_DEBUG("Device captured: {0:X}", (size_t) *ppDevice);
         State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
 
         if (desc.VendorId == VendorId::Intel && Config::Instance()->UESpoofIntelAtomics64.value_or_default())
@@ -1840,7 +1833,7 @@ static ULONG hkD3D12DeviceRelease(IUnknown* device)
 
         if (refCount == 1)
         {
-            LOG_INFO("[CREATE] Set State::Instance().currentD3D12Device = nullptr, was: {:X}", (size_t) device);
+            LOG_DEBUG("Set State::Instance().currentD3D12Device = nullptr, was: {:X}", (size_t) device);
             State::Instance().currentD3D12Device = nullptr;
         }
     }
@@ -1896,16 +1889,8 @@ static HRESULT hkCreateCommittedResource(ID3D12Device* device, const D3D12_HEAP_
         }
     }
 
-    const HRESULT created = o_CreateCommittedResource(device, pHeapProperties, HeapFlags, pDesc,
-                                                      InitialResourceState, pOptimizedClearValue,
-                                                      riidResource, ppvResource);
-
-    // Where the exposure scan sees the game's resources. Silent and cheap for everything that does
-    // not match, and it does nothing at all unless Neural Rendering is running.
-    if (SUCCEEDED(created) && ppvResource != nullptr)
-        DlssNr::ExposureScan::NoteResource(pDesc, (ID3D12Resource*) *ppvResource);
-
-    return created;
+    return o_CreateCommittedResource(device, pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                                     pOptimizedClearValue, riidResource, ppvResource);
 }
 
 static bool skipPlacedResource = false;
@@ -1934,13 +1919,8 @@ static HRESULT hkCreatePlacedResource(ID3D12Device* device, ID3D12Heap* pHeap, U
         }
     }
 
-    const HRESULT created = o_CreatePlacedResource(device, pHeap, HeapOffset, pDesc, InitialState,
-                                                   pOptimizedClearValue, riid, ppvResource);
-
-    if (SUCCEEDED(created) && ppvResource != nullptr)
-        DlssNr::ExposureScan::NoteResource(pDesc, (ID3D12Resource*) *ppvResource);
-
-    return created;
+    return o_CreatePlacedResource(device, pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid,
+                                  ppvResource);
 }
 
 VALIDATE_HOOK(hkSetResidencyPriority, PFN_SetResidencyPriority)
@@ -2360,10 +2340,6 @@ static HRESULT hkD3D12GetInterface(REFCLSID rclsid, REFIID riid, void** ppvDebug
 
 static void HookToDevice(ID3D12Device* InDevice)
 {
-    // [Hotfix] DiagNoD3D12Hooks (crash triage): no D3D12 detours at all.
-    if (DiagSwitches::NoD3D12Hooks())
-        return;
-
     if (o_CreateSampler != nullptr || InDevice == nullptr)
         return;
 
@@ -2422,37 +2398,21 @@ static void HookToDevice(ID3D12Device* InDevice)
         if (o_SetResidencyPriority != nullptr)
             DetourAttach(&(PVOID&) o_SetResidencyPriority, hkSetResidencyPriority);
 
-        // The resource creation hooks were installed only for the Unreal atomics spoof, which meant
-        // that in every other game they were absent -- and the exposure scan, which needs to see the
-        // game's resources, silently saw nothing at all. Neural Rendering now asks for them too.
-        //
-        // The two conditions are kept apart on purpose: the spoof also needs CheckFeatureSupport and
-        // GetResourceAllocationInfo, which the scan has no use for, and attaching a detour nobody
-        // asked for is how a hook becomes a bug report in a game nobody was thinking about.
-        const bool wantSpoof = Config::Instance()->UESpoofIntelAtomics64.value_or_default();
-        const bool wantScan = Config::Instance()->DlssNrEnabled.value_or_default();
-
-        if (wantSpoof)
+        if (Config::Instance()->UESpoofIntelAtomics64.value_or_default())
         {
             LOG_DEBUG("UE spoofing for Intel Atomics64 enabled, applying detours");
 
             if (o_CheckFeatureSupport != nullptr)
                 DetourAttach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
 
-            if (o_GetResourceAllocationInfo != nullptr)
-                DetourAttach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
-        }
-
-        if (wantSpoof || wantScan)
-        {
-            if (!wantSpoof)
-                LOG_DEBUG("DLSS-NR wants the resource creation hooks, applying detours");
-
             if (o_CreateCommittedResource != nullptr)
                 DetourAttach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
 
             if (o_CreatePlacedResource != nullptr)
                 DetourAttach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
+
+            if (o_GetResourceAllocationInfo != nullptr)
+                DetourAttach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
         }
 
         auto detourResult = DetourTransactionCommit();
@@ -2538,10 +2498,6 @@ static void UnhookDevice()
 
 void D3D12Hooks::Hook()
 {
-    // [Hotfix] DiagNoD3D12Hooks (crash triage): no D3D12 detours at all.
-    if (DiagSwitches::NoD3D12Hooks())
-        return;
-
     std::lock_guard<std::mutex> lock(hookMutex);
 
     LOG_DEBUG("");
@@ -2559,10 +2515,6 @@ void D3D12Hooks::Hook()
 
 void D3D12Hooks::HookAgility(HMODULE module)
 {
-    // [Hotfix] DiagNoD3D12Hooks (crash triage): no D3D12 detours at all.
-    if (DiagSwitches::NoD3D12Hooks())
-        return;
-
     std::lock_guard<std::mutex> lock(agilityMutex);
 
     if (module == nullptr || o_D3D12GetInterface != nullptr)

@@ -1,11 +1,8 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include <pch.h>
-#include <dlssnr/amd/AmdBridge.h>
 
 #include "IFeature_VkwDx12.h"
 
 #include <Config.h>
-#include <dlssnr/DlssNr.h>
 #include <SysUtils.h>
 
 #include <proxies/DXGI_Proxy.h>
@@ -1013,17 +1010,9 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     uint64_t lastFrameToWaitFor = (_frameCount > 1) ? (_frameCount - 1) : 0;
     if (Dx12Fence->GetCompletedValue() < lastFrameToWaitFor)
     {
-        // Only wait for N-1 frame, not current frame. The wait stays unbounded, but it says so
-        // every two seconds: a game that stops here (Indiana Jones with the lmxxf runtime) used
-        // to leave no line at all, and this is the one place a stuck D3D12 queue shows.
+        // Only wait for N-1 frame, not current frame
         Dx12Fence->SetEventOnCompletion(lastFrameToWaitFor, Dx12FenceEvent);
-        unsigned waitedSeconds = 0;
-        while (WaitForSingleObject(Dx12FenceEvent, 2000) == WAIT_TIMEOUT)
-        {
-            waitedSeconds += 2;
-            LOG_WARN("Vulkan bridge: D3D12 frame {} has not completed after {} s (fence at {}) - the D3D12 queue is "
-                     "stuck behind something; still waiting", lastFrameToWaitFor, waitedSeconds, Dx12Fence->GetCompletedValue());
-        }
+        WaitForSingleObject(Dx12FenceEvent, INFINITE);
     }
 
     Dx12CommandAllocator[frame]->Reset();
@@ -1651,8 +1640,6 @@ bool IFeature_VkwDx12::CopyBackOutput(VkCommandBuffer InCmdBuffer)
     if (result != S_OK)
     {
         LOG_ERROR("Dx12CommandList->Close failed: {0:x}", result);
-        // AMDNR (0.3.3.2): the list is never executed, the NR backend must not wait for it
-        DlssNr::AmdBridge::ListDiscarded(Dx12CommandList[frame]);
         return false;
     }
 
@@ -1737,11 +1724,7 @@ void IFeature_VkwDx12::AbortPendingInterop(VkCommandBuffer InCmdBuffer, uint32_t
     // ProcessVulkanTextures resets the command list before validation/copy setup. Close it on every aborted Evaluate so
     // the same command-list slot can be Reset safely on the next frame. No D3D12 queue wait is queued before success.
     if (Dx12CommandList[InFrame] != nullptr)
-    {
         Dx12CommandList[InFrame]->Close();
-        // AMDNR: closed and never executed, the NR backend must not wait for it
-        DlssNr::AmdBridge::ListDiscarded(Dx12CommandList[InFrame]);
-    }
 
     auto virtualCommandBuffer = Vulkan_wDx12::RemoveVirtualCommandBuffer(InCmdBuffer);
     if (virtualCommandBuffer != VK_NULL_HANDLE)
@@ -1844,7 +1827,6 @@ void IFeature_VkwDx12::ReleaseSharedResources()
 void IFeature_VkwDx12::ReleaseSyncResources()
 {
     LOG_FUNC();
-
     for (uint32_t i = 0; i < VKDX12_BUFFER_COUNT; i++)
     {
         SAFE_DESTROY_VK(vkDestroySemaphore, VulkanDevice, vkSemaphoreTextureCopy[i], nullptr);
@@ -2024,29 +2006,6 @@ bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevi
     VulkanGIPA = InGIPA;
     VulkanGDPA = InGDPA;
 
-    // (0.3.3.2, C3-D) The D3D12 colour and motion vectors every upscaler here - and the neural pass - see
-    // are this bridge's own copies, taken COMMON -> NON_PIXEL_SHADER_RESOURCE before Evaluate and back
-    // after (ProcessVulkanTextures, CopyBackOutput), in every engine. Unreal's RENDER_TARGET default
-    // describes the game's own colour: set as the volatile value by an inner upscaler on its first UE
-    // frame, it made that upscaler transition the copy from a state it is not in, and AmdBridge handed
-    // the backends the same wrong state for the NR input. Stated here as the D3D11 bridge states it
-    // (IFeature_Dx11wDx12::Init). A value from the ini still wins.
-    if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
-        State::Instance().gameEngine == GameEngineType::Unreal ||
-        State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
-    {
-        auto& cfg = *Config::Instance();
-        const bool colourFromIni = cfg.ColorResourceBarrier.value_for_config().has_value();
-        const bool motionFromIni = cfg.MVResourceBarrier.value_for_config().has_value();
-        if (!colourFromIni)
-            cfg.ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        if (!motionFromIni)
-            cfg.MVResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        LOG_INFO("Vulkan bridge on an Unreal title: colour and motion vectors are the bridge's own copies in "
-                 "NON_PIXEL_SHADER_RESOURCE, not RENDER_TARGET{}",
-                 colourFromIni || motionFromIni ? " (an ini ColorResourceBarrier / MVResourceBarrier is kept)" : "");
-    }
-
     // Load external memory functions
     if (!LoadVulkanExternalMemoryFunctions())
     {
@@ -2098,70 +2057,9 @@ bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevi
 
     SetInitParameters(InParameters);
 
-    // The list has to be recording, and what is recorded on it has to run.
-    //
-    // Same defect the D3D11 bridge had: every list here is closed the moment it is created, and the
-    // note this replaces said non-DLSS upscalers do not use the list during Init. True when written.
-    // DLSS and Ray Reconstruction are the only features whose InitInternal touches the argument --
-    // NVSDK_NGX_D3D12_CreateFeature records the model's weight upload and history initialisation onto
-    // it and requires the caller to submit it afterwards. Recorded onto a closed list it is silently
-    // discarded, CreateFeature still answers Success, and the model runs on state that was never
-    // uploaded.
-    //
-    // Latent here today only because no DLSS-on-12 variant is wired to the Vulkan provider yet. It
-    // stops being latent the moment one is.
-    HRESULT prep = Dx12CommandAllocator[0]->Reset();
-
-    if (prep != S_OK)
-        LOG_WARN("Init: allocator reset before feature creation failed: {:X}", (UINT) prep);
-
-    prep = Dx12CommandList[0]->Reset(Dx12CommandAllocator[0], nullptr);
-
-    if (prep != S_OK)
-        LOG_WARN("Init: command list reset before feature creation failed: {:X}", (UINT) prep);
-
-    const bool initialised = dx12Feature->Init(_dx11on12Device, Dx12CommandList[0], InParameters);
-
-    SetInit(initialised);
-
-    if (Dx12CommandList[0]->Close() == S_OK && Dx12CommandQueue != nullptr)
-    {
-        ID3D12CommandList* lists[] = { Dx12CommandList[0] };
-        Dx12CommandQueue->ExecuteCommandLists(1, lists);
-
-        // A fence of its own, created and destroyed here.
-        //
-        // Dx12Fence on this bridge is signalled with _frameCount and waited on against
-        // lastFrameToWaitFor, and _fenceValue belongs to the texture-copy fences. Borrowing either
-        // for a one-time init would perturb a scheme that works; a local fence cannot.
-        ID3D12Fence* initFence = nullptr;
-
-        if (_dx11on12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&initFence)) == S_OK &&
-            Dx12CommandQueue->Signal(initFence, 1) == S_OK)
-        {
-            if (initFence->GetCompletedValue() < 1)
-            {
-                HANDLE done = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-
-                if (done != nullptr)
-                {
-                    if (initFence->SetEventOnCompletion(1, done) == S_OK)
-                        WaitForSingleObject(done, INFINITE);
-
-                    CloseHandle(done);
-                }
-            }
-
-            LOG_INFO("Init: feature creation work submitted and waited on");
-        }
-
-        SAFE_RELEASE(initFence);
-    }
-    else
-    {
-        LOG_WARN("Init: could not submit the feature creation work; a feature that records during "
-                 "creation will be missing it");
-    }
+    // Non-DLSS upscalers don't use the cmdList during Init
+    // We have more than one cmdList so unsure how that would even work
+    SetInit(dx12Feature->Init(_dx11on12Device, Dx12CommandList[0], InParameters));
 
     return IsInited();
 }
@@ -2235,26 +2133,7 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
             InParameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) vkReactive.Dx12Resource);
 
         LOG_DEBUG("Dispatch!!");
-        if (dx12Feature->GetUpscalerType() != Upscaler::DLSSD)
-            DlssNr::EvaluateBeforeUpscale(cmdList, InParameters, Dx12CommandQueue, _frameCount);
         dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
-        DlssNr::AmdBridge::Restore(InParameters);
-
-        // The parameter block still holds the D3D12 resources written above -- the Vulkan handles are
-        // not put back until after this -- so the pass reads exactly what the upscaler just wrote.
-        static bool reportedNrOffer = false;
-
-        if (!reportedNrOffer)
-        {
-            reportedNrOffer = true;
-            LOG_INFO("DLSS-NR: the Vulkan bridge reached the hand-off (upscale ok: {}, enabled: {})",
-                     dx12EvalResult, Config::Instance()->DlssNrEnabled.value_or_default());
-        }
-
-        if (dx12EvalResult && Config::Instance()->DlssNrEnabled.value_or_default())
-            DlssNr::EvaluateAfterUpscale(cmdList, InParameters, Dx12CommandQueue,
-                                         dx12Feature->GetUpscalerType() == Upscaler::DLSSD,
-                                         _frameCount);
 
     } while (false);
 

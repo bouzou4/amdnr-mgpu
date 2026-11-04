@@ -870,27 +870,6 @@ const std::vector<GameConfig> gameConfigs = {
         .quirks = { ForceCreateD3D12Device },
     },
 
-    // AMDNR (ported from its Quirks.h table): Resident Evil Requiem (+ demo) FSR-RR defaults and the REFramework
-    // check; PRAGMATA's REFramework check
-    {
-        .exes = { "re9.exe", "re9demo.exe" },
-        .quirks = { SkinSmoothingDefault, RrBiasMaskDefaultOff, NeedsREFramework },
-    },
-    {
-        .exes = { "pragmata.exe" },
-        .quirks = { NeedsREFramework },
-    },
-    // AMDNR: Grand Theft Auto V (legacy)
-    {
-        .exes = { "gta5.exe" },
-        .quirks = { SkipD3D11FeatureLevelElevation },
-    },
-    // AMDNR: Stellar Blade
-    {
-        .ueExes = { "sb" },
-        .defaults = { OnNonNvidia(RestoreComputeSignature = true), ExtendedStateRestore = true },
-    },
-
 };
 
 bool MatchesExe(const GameConfig& game, const std::string& exeName)

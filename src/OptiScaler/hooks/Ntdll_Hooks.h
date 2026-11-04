@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "SysUtils.h"
 #include <Util.h>
@@ -96,11 +95,8 @@ class NtdllHooks
 
         auto result = o_LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
 
-        if (NT_SUCCESS(result) && ModuleHandle != nullptr && *ModuleHandle != nullptr)
-        {
+        if (NT_SUCCESS(result))
             LibraryLoadHooks::AfterLoadLibrary((HMODULE) *ModuleHandle);
-            LibraryLoadHooks::AfterLoad(name, (HMODULE) *ModuleHandle);
-        }
 
         return result;
     }
@@ -163,12 +159,7 @@ class NtdllHooks
             }
         }
 
-        {
-            const auto status = o_NtLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
-            if (status == 0 && ModuleHandle != nullptr && *ModuleHandle != nullptr)
-                LibraryLoadHooks::AfterLoad(name, (HMODULE) *ModuleHandle);
-            return status;
-        }
+        return o_NtLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
     }
 
     static NTSTATUS NTAPI hkLdrUnloadDll(PVOID lpLibrary)

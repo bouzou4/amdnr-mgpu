@@ -1,5 +1,3 @@
-// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -31,7 +29,7 @@ LRESULT CALLBACK ExternalRawInputSinkWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             std::unique_lock lock(_state.Mutex);
             if (hwnd == _state.ExternalRawInputSinkHwnd)
             {
-                HandleRawInputLocked(reinterpret_cast<HRAWINPUT>(lParam), GetMessageTime());
+                HandleRawInputLocked(reinterpret_cast<HRAWINPUT>(lParam));
                 _state.ExternalRawInputSinkMessageCount++;
             }
         }
@@ -199,7 +197,7 @@ void PumpExternalRawInputSinkLocked()
 
         if (msg.message == WM_INPUT)
         {
-            HandleRawInputLocked(reinterpret_cast<HRAWINPUT>(msg.lParam), msg.time);
+            HandleRawInputLocked(reinterpret_cast<HRAWINPUT>(msg.lParam));
             _state.ExternalRawInputSinkMessageCount++;
             DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
         }
@@ -258,33 +256,10 @@ void ResetRawInputSanitizeCacheLocked()
 
 RawSanitizeAction GetRawKeyboardSanitizeActionLocked(const RAWKEYBOARD& keyboard)
 {
-    const int vk = NormalizeRawKeyboardVirtualKey(keyboard);
-
-    // AMDNR 0.3.4.2: the menu key that closed the menu stays away from the game until it is released
-    // (HoldKeyUntilReleased), also through raw input. Its raw break ends the hold (a game registered with
-    // RIDEV_NOLEGACY gets no WM_KEYUP to end it) and is withheld too: the game never saw the make, so it is owed
-    // nothing (the blocked-down mark of that make, when the menu was open then, goes with it).
-    if (_state.HeldKeyVk > 0 && vk > 0 && IsHeldKeyLocked(vk))
-    {
-        if ((keyboard.Flags & RI_KEY_BREAK) != 0)
-        {
-            _state.RawKeyboardBlockedDown[vk] = false;
-            EndKeyHoldLocked("its raw key-up");
-        }
-        else
-        {
-            // The make of that press: from here the hold waits for its break, as the queued key-down does. A game
-            // registered with RIDEV_NOLEGACY has no key messages at all, so this is the only place the late make of
-            // the press that closed the menu can be seen.
-            _state.HeldKeyAwaitingLatePair = false;
-            _state.HeldKeyLastDownMs = GetTickCount();
-        }
-
-        return RawSanitizeAction::SanitizeAll;
-    }
-
     if (!ShouldBlockKeyboardInputLocked())
         return RawSanitizeAction::Pass;
+
+    const int vk = NormalizeRawKeyboardVirtualKey(keyboard);
 
     // Unknown key while menu is open: safest is to hide it from the game.
     if (vk <= 0 || vk >= 256)
@@ -563,37 +538,38 @@ void TrackRawInputDeviceRegistrationLocked(const RAWINPUTDEVICE& device)
     }
 }
 
-// `time`: the WM_INPUT message time (AMDNR 0.3.4.2; was GetTickCount when parsed, which hid a late pump).
-void UpdateStateFromRawMouseLocked(const RAWMOUSE& mouse, DWORD time)
+void UpdateStateFromRawMouseLocked(const RAWMOUSE& mouse)
 {
     AccumulateExternalRawMouseDeltaLocked(mouse);
 
+    const DWORD time = GetTickCount();
+
     if (mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
-        SetMouseDown(0, time, ShouldBlockMouseInputLocked(), InputEventSource::Raw);
+        SetMouseDown(0, time, ShouldBlockMouseInputLocked());
 
     if (mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
         SetMouseUpStateOnly(0, time);
 
     if (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)
-        SetMouseDown(1, time, ShouldBlockMouseInputLocked(), InputEventSource::Raw);
+        SetMouseDown(1, time, ShouldBlockMouseInputLocked());
 
     if (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)
         SetMouseUpStateOnly(1, time);
 
     if (mouse.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)
-        SetMouseDown(2, time, ShouldBlockMouseInputLocked(), InputEventSource::Raw);
+        SetMouseDown(2, time, ShouldBlockMouseInputLocked());
 
     if (mouse.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)
         SetMouseUpStateOnly(2, time);
 
     if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)
-        SetMouseDown(3, time, ShouldBlockMouseInputLocked(), InputEventSource::Raw);
+        SetMouseDown(3, time, ShouldBlockMouseInputLocked());
 
     if (mouse.usButtonFlags & RI_MOUSE_BUTTON_4_UP)
         SetMouseUpStateOnly(3, time);
 
     if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)
-        SetMouseDown(4, time, ShouldBlockMouseInputLocked(), InputEventSource::Raw);
+        SetMouseDown(4, time, ShouldBlockMouseInputLocked());
 
     if (mouse.usButtonFlags & RI_MOUSE_BUTTON_5_UP)
         SetMouseUpStateOnly(4, time);
@@ -638,7 +614,7 @@ int NormalizeRawKeyboardVirtualKey(const RAWKEYBOARD& keyboard)
     return vk;
 }
 
-void UpdateStateFromRawKeyboardLocked(const RAWKEYBOARD& keyboard, DWORD time)
+void UpdateStateFromRawKeyboardLocked(const RAWKEYBOARD& keyboard)
 {
     const int vk = NormalizeRawKeyboardVirtualKey(keyboard);
 
@@ -646,14 +622,15 @@ void UpdateStateFromRawKeyboardLocked(const RAWKEYBOARD& keyboard, DWORD time)
         return;
 
     const bool released = (keyboard.Flags & RI_KEY_BREAK) != 0;
+    const DWORD time = GetTickCount();
 
     if (released)
-        SetKeyUpStateOnly(vk, time, InputEventSource::Raw);
+        SetKeyUpStateOnly(vk, GetTickCount());
     else
-        SetKeyDown(vk, time, ShouldBlockKeyboardInputLocked(), InputEventSource::Raw, false);
+        SetKeyDown(vk, GetTickCount(), ShouldBlockKeyboardInputLocked());
 }
 
-void UpdateStateFromRawInputLocked(const RAWINPUT& input, DWORD time)
+void UpdateStateFromRawInputLocked(const RAWINPUT& input)
 {
     _state.ReceivedRawInputThisFrame = true;
     _state.ReceivedAnyInputThisFrame = true;
@@ -662,13 +639,13 @@ void UpdateStateFromRawInputLocked(const RAWINPUT& input, DWORD time)
     {
     case RIM_TYPEMOUSE:
     {
-        UpdateStateFromRawMouseLocked(input.data.mouse, time);
+        UpdateStateFromRawMouseLocked(input.data.mouse);
         break;
     }
 
     case RIM_TYPEKEYBOARD:
     {
-        UpdateStateFromRawKeyboardLocked(input.data.keyboard, time);
+        UpdateStateFromRawKeyboardLocked(input.data.keyboard);
         break;
     }
 
@@ -679,7 +656,7 @@ void UpdateStateFromRawInputLocked(const RAWINPUT& input, DWORD time)
     }
 }
 
-bool HandleRawInputLocked(HRAWINPUT rawInputHandle, DWORD eventTime)
+bool HandleRawInputLocked(HRAWINPUT rawInputHandle)
 {
     if (rawInputHandle == nullptr)
         return false;
@@ -729,7 +706,7 @@ bool HandleRawInputLocked(HRAWINPUT rawInputHandle, DWORD eventTime)
         (input->header.dwType == RIM_TYPEMOUSE &&
          decision.Action == RawSanitizeAction::SanitizeMouseKeepAllowedButtonUps);
 
-    UpdateStateFromRawInputLocked(*input, eventTime);
+    UpdateStateFromRawInputLocked(*input);
 
     return mustReachGame;
 }

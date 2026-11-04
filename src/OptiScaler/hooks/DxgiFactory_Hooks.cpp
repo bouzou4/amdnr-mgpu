@@ -1,6 +1,5 @@
 #include "pch.h"
 #include "DxgiFactory_Hooks.h"
-#include "DxgiSwapchainSizing.h"
 
 #include "D3D11_Hooks.h"
 #include "D3D12_Hooks.h"
@@ -8,7 +7,6 @@
 #include <Config.h>
 
 #include <misc/IdentifyGpu.h>
-#include <misc/DiagSwitches.h>
 #include <spoofing/Dxgi_Spoofing.h>
 
 #include <misc/HiddenWindow.h>
@@ -19,8 +17,6 @@
 #include <d3d11.h>
 #include <magic_enum.hpp>
 #include <detours/detours.h>
-
-#pragma intrinsic(_ReturnAddress)
 
 // #define DETAILED_SC_LOGS
 
@@ -286,7 +282,6 @@ void DxgiFactoryHooks::HookToFactory(IDXGIFactory* pFactory)
     IDXGIFactory2* factory2 = nullptr;
     if (pFactory->QueryInterface(IID_PPV_ARGS(&factory2)) == S_OK)
     {
-        void** factory2VTable = *reinterpret_cast<void***>(factory2);
         factory2->Release();
 
         if (o_CreateSwapChainForHwnd == nullptr)
@@ -303,13 +298,6 @@ void DxgiFactoryHooks::HookToFactory(IDXGIFactory* pFactory)
 
             if (o_CreateSwapChainForCoreWindow != nullptr)
                 DetourAttach(&(PVOID&) o_CreateSwapChainForCoreWindow, DxgiFactoryHooks::CreateSwapChainForCoreWindow);
-        }
-
-        if (o_CreateSwapChainForComposition == nullptr)
-        {
-            o_CreateSwapChainForComposition = (PFN_CreateSwapChainForComposition) factory2VTable[24];
-            if (o_CreateSwapChainForComposition != nullptr)
-                DetourAttach(&(PVOID&) o_CreateSwapChainForComposition, DxgiFactoryHooks::CreateSwapChainForComposition);
         }
     }
 
@@ -350,7 +338,6 @@ void DxgiFactoryHooks::HookToFactory(IDXGIFactory* pFactory)
         o_EnumAdapters1 = nullptr;
         o_CreateSwapChainForHwnd = nullptr;
         o_CreateSwapChainForCoreWindow = nullptr;
-        o_CreateSwapChainForComposition = nullptr;
         o_EnumAdapterByLuid = nullptr;
         o_EnumAdapterByGpuPreference = nullptr;
     }
@@ -413,23 +400,6 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
 {
     *ppSwapChain = nullptr;
 
-    // [Hotfix] DiagNoSwapchainWrap (crash triage): hand the game DXGI's swapchain as it is.
-    if (DiagSwitches::NoSwapchainWrap())
-    {
-        HRESULT result;
-        {
-            ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
-            ScopedSkipParentWrapping skipParentWrapping {};
-            result = o_CreateSwapChain(realFactory, pDevice, pDesc, ppSwapChain);
-        }
-
-        if (result == S_OK && *ppSwapChain != nullptr)
-            DiagProbe::Swapchain("CreateSwapChain (not wrapped: DiagNoSwapchainWrap)", *ppSwapChain,
-                                 _ReturnAddress());
-
-        return result;
-    }
-
     if (State::Instance().vulkanCreatingSC)
     {
         LOG_WARN("Vulkan is creating swapchain!");
@@ -457,15 +427,10 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
         return res;
     }
 
-    DXGI_SWAP_CHAIN_DESC localDesc = *pDesc;
-    const bool sizeToWindow = ResolveWindowSizedSwapchain(localDesc);
-
-    if ((localDesc.BufferDesc.Height != 0 && localDesc.BufferDesc.Height < 100) ||
-        (localDesc.BufferDesc.Width != 0 && localDesc.BufferDesc.Width < 100))
+    if ((pDesc->BufferDesc.Height != 0 && pDesc->BufferDesc.Height < 100) ||
+        (pDesc->BufferDesc.Width != 0 && pDesc->BufferDesc.Width < 100))
     {
-        LOG_WARN("Overlay call! Width: {}, Height: {}, Format: {}, Count: {}, Hwnd: {:X}, Windowed: {}",
-                 pDesc->BufferDesc.Width, pDesc->BufferDesc.Height, (UINT) pDesc->BufferDesc.Format,
-                 pDesc->BufferCount, (SIZE_T) pDesc->OutputWindow, pDesc->Windowed);
+        LOG_WARN("Overlay call!");
 
         ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
         ScopedSkipParentWrapping skipParentWrapping {};
@@ -474,9 +439,8 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
         return res;
     }
 
-    if (sizeToWindow)
-        LOG_INFO("CreateSwapChain: 0x0 size-to-window descriptor, Hwnd: {:X}, Count: {}, wrapping normally",
-                 (SIZE_T) pDesc->OutputWindow, pDesc->BufferCount);
+    DXGI_SWAP_CHAIN_DESC localDesc {};
+    memcpy(&localDesc, pDesc, sizeof(DXGI_SWAP_CHAIN_DESC));
 
     LOG_DEBUG("Width: {}, Height: {}, Format: {}, Count: {}, Flags: {:X}, Hwnd: {:X}, Windowed: {}, SkipWrapping: {}",
               localDesc.BufferDesc.Width, localDesc.BufferDesc.Height, (UINT) localDesc.BufferDesc.Format,
@@ -730,19 +694,6 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
 
         if (SUCCEEDED(result) && ppSwapChain != nullptr && *ppSwapChain != nullptr)
         {
-            if (sizeToWindow)
-            {
-                // Keep the dimensions actually created by DXGI authoritative for menu sizing.
-                DXGI_SWAP_CHAIN_DESC resolvedDesc {};
-                if ((*ppSwapChain)->GetDesc(&resolvedDesc) == S_OK)
-                {
-                    LOG_INFO("CreateSwapChain: resolved size-to-window swapchain to {}x{}",
-                             resolvedDesc.BufferDesc.Width, resolvedDesc.BufferDesc.Height);
-                    localDesc.BufferDesc.Width = resolvedDesc.BufferDesc.Width;
-                    localDesc.BufferDesc.Height = resolvedDesc.BufferDesc.Height;
-                }
-            }
-
             State::Instance().currentSwapchainDesc = localDesc;
             State::Instance().swapchainInteropApi = SwapchainInteropApi::None;
 
@@ -809,30 +760,6 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
         _skipFGSwapChainCreation = true;
     }
 
-    // [Hotfix] DiagNoSwapchainWrap (crash triage): hand the game DXGI's swapchain as it is.
-    if (DiagSwitches::NoSwapchainWrap())
-    {
-        HRESULT result;
-        {
-            ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
-            ScopedSkipParentWrapping skipParentWrapping {};
-            result = o_CreateSwapChainForHwnd(realFactory, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput,
-                                              ppSwapChain);
-        }
-
-        if (result == S_OK && *ppSwapChain != nullptr)
-            DiagProbe::Swapchain("CreateSwapChainForHwnd (not wrapped: DiagNoSwapchainWrap)", *ppSwapChain,
-                                 _ReturnAddress());
-
-        if (firstCall)
-        {
-            _skipFGSwapChainCreation = false;
-            firstCall = false;
-        }
-
-        return result;
-    }
-
     if (State::Instance().vulkanCreatingSC)
     {
         LOG_WARN("Vulkan is creating swapchain!");
@@ -872,7 +799,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
 
     if ((pDesc->Height != 0 && pDesc->Height < 100) || (pDesc->Width != 0 && pDesc->Width < 100))
     {
-        LOG_WARN("Overlay call! Width: {}, Height: {}", pDesc->Width, pDesc->Height);
+        LOG_WARN("Overlay call!");
         HRESULT result;
 
         {
@@ -1234,14 +1161,6 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForCoreWindow(IDXGIFactory2* realFactor
                                                        const DXGI_SWAP_CHAIN_DESC1* pDesc,
                                                        IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
 {
-    // [Hotfix] DiagNoSwapchainWrap (crash triage): hand the game DXGI's swapchain as it is.
-    if (DiagSwitches::NoSwapchainWrap())
-    {
-        ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
-        ScopedSkipParentWrapping skipParentWrapping {};
-        return o_CreateSwapChainForCoreWindow(realFactory, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
-    }
-
     if (State::Instance().vulkanCreatingSC)
     {
         LOG_WARN("Vulkan is creating swapchain!");
@@ -1263,7 +1182,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForCoreWindow(IDXGIFactory2* realFactor
 
     if (pDesc->Height < 100 || pDesc->Width < 100)
     {
-        LOG_WARN("Overlay call! Width: {}, Height: {}", pDesc->Width, pDesc->Height);
+        LOG_WARN("Overlay call!");
 
         ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
         return realFactory->CreateSwapChainForCoreWindow(pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
@@ -1352,70 +1271,6 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForCoreWindow(IDXGIFactory2* realFactor
     return result;
 }
 
-
-HRESULT DxgiFactoryHooks::CreateSwapChainForComposition(IDXGIFactory2* realFactory, IUnknown* pDevice,
-                                                        const DXGI_SWAP_CHAIN_DESC1* pDesc,
-                                                        IDXGIOutput* pRestrictToOutput,
-                                                        IDXGISwapChain1** ppSwapChain)
-{
-    // Always call the trampoline, including pass-through/error cases. Calling the detoured virtual
-    // method here re-enters this hook. Keep the composition descriptor intact: notably, a desktop
-    // VSync override must not turn its FLIP_SEQUENTIAL swap effect into FLIP_DISCARD.
-    // [Hotfix] DiagNoSwapchainWrap (crash triage) also passes the composition swapchain through unwrapped.
-    const bool passThrough = DiagSwitches::NoSwapchainWrap() || State::Instance().vulkanCreatingSC ||
-                             _skipFGSwapChainCreation ||
-                             pDevice == nullptr || pDesc == nullptr || ppSwapChain == nullptr ||
-                             pDesc->Width < 100 || pDesc->Height < 100;
-    if (pDesc != nullptr && (pDesc->Width < 100 || pDesc->Height < 100))
-        LOG_WARN("Composition overlay/helper call! Width: {}, Height: {}", pDesc->Width, pDesc->Height);
-
-    HRESULT result;
-    {
-        ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
-        ScopedSkipParentWrapping skipParentWrapping {};
-        result = o_CreateSwapChainForComposition(realFactory, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
-    }
-    if (passThrough || FAILED(result) || *ppSwapChain == nullptr)
-        return result;
-
-    WrappedIDXGISwapChain4* existing = nullptr;
-    if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&existing)) == S_OK)
-    {
-        existing->Release();
-        return result;
-    }
-
-    DXGI_SWAP_CHAIN_DESC1 resolved {};
-    if (FAILED((*ppSwapChain)->GetDesc1(&resolved)))
-        return result; // Do not install a wrapper with unknown dimensions/flags.
-
-    // A composition chain has no native HWND. Use only an eligible window in this process, and
-    // defer overlay initialization to Present if no unambiguous window exists yet. Do not borrow
-    // another application's foreground window. HWND association remains a best-effort fallback.
-    const HWND window = FindCompositionWindow();
-    IDXGISwapChain1* const created = *ppSwapChain;
-    auto* wrapped = new WrappedIDXGISwapChain4(created, pDevice, window, resolved.Flags, false, true);
-    *ppSwapChain = wrapped;
-
-    // Preserve the returned COM/proxy chain: the wrapper owns its original reference. Unwrapping it
-    // here can leak an outer proxy and bypass another provider's presentation path.
-    State::Instance().currentRealSwapchain = created;
-    State::Instance().currentSwapchain = wrapped;
-    State::Instance().currentWrappedSwapchain = wrapped;
-    State::Instance().swapchainInteropApi = SwapchainInteropApi::None;
-    State::Instance().SCAllowTearing = (resolved.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-    State::Instance().SCLastFlags = resolved.Flags;
-    State::Instance().realExclusiveFullscreen = false;
-    State::Instance().screenWidth = (float) resolved.Width;
-    State::Instance().screenHeight = (float) resolved.Height;
-    DXGI_SWAP_CHAIN_DESC legacy {};
-    if (SUCCEEDED(created->GetDesc(&legacy)))
-        State::Instance().currentSwapchainDesc = legacy;
-    LOG_INFO("Wrapped composition swapchain {}x{}, window {:X}; plain presentation, no FG swapchain replacement",
-             resolved.Width, resolved.Height, (SIZE_T) window);
-    return result;
-}
-
 HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnknown* pDevice,
                                                DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain)
 {
@@ -1448,13 +1303,10 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnkno
         return res;
     }
 
-    DXGI_SWAP_CHAIN_DESC localDesc = *pDesc;
-    ResolveWindowSizedSwapchain(localDesc);
-
-    if ((localDesc.BufferDesc.Height != 0 && localDesc.BufferDesc.Height < 100) ||
-        (localDesc.BufferDesc.Width != 0 && localDesc.BufferDesc.Width < 100))
+    if ((pDesc->BufferDesc.Height != 0 && pDesc->BufferDesc.Height < 100) ||
+        (pDesc->BufferDesc.Width != 0 && pDesc->BufferDesc.Width < 100))
     {
-        LOG_WARN("Overlay call! Width: {}, Height: {}", pDesc->BufferDesc.Width, pDesc->BufferDesc.Height);
+        LOG_WARN("Overlay call!");
 
         ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
         ScopedSkipParentWrapping skipParentWrapping {};
@@ -1462,6 +1314,9 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnkno
         auto res = o_DLSSGCreateSwapChain(realFactory, pDevice, pDesc, ppSwapChain);
         return res;
     }
+
+    DXGI_SWAP_CHAIN_DESC localDesc {};
+    memcpy(&localDesc, pDesc, sizeof(DXGI_SWAP_CHAIN_DESC));
 
     LOG_DEBUG("Width: {}, Height: {}, Format: {}, Count: {}, Flags: {:X}, Hwnd: {:X}, Windowed: {}, SkipWrapping: {}",
               localDesc.BufferDesc.Width, localDesc.BufferDesc.Height, (UINT) localDesc.BufferDesc.Format,
@@ -1745,7 +1600,7 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForHwnd(IDXGIFactory2* realFactory
 
     if ((pDesc->Height != 0 && pDesc->Height < 100) || (pDesc->Width != 0 && pDesc->Width < 100))
     {
-        LOG_WARN("Overlay call! Width: {}, Height: {}", pDesc->Width, pDesc->Height);
+        LOG_WARN("Overlay call!");
         HRESULT result;
 
         {
@@ -2040,7 +1895,7 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForCoreWindow(IDXGIFactory2* realF
 
     if (pDesc->Height < 100 || pDesc->Width < 100)
     {
-        LOG_WARN("Overlay call! Width: {}, Height: {}", pDesc->Width, pDesc->Height);
+        LOG_WARN("Overlay call!");
 
         ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
         return realFactory->CreateSwapChainForCoreWindow(pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);

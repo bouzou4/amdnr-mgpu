@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 
 #include "OptiTypes.h"
@@ -41,8 +40,6 @@ std::string UpscalerDisplayName(Upscaler upscaler, API api)
 
     switch (upscaler)
     {
-    case Upscaler::FSR_RR:
-        return "FSR Ray Regeneration";
     case Upscaler::FSR21:
         return "FSR 2.1.2";
 
@@ -123,9 +120,6 @@ std::string UpscalerShortName(Upscaler upscaler)
 
     case Upscaler::DLSSD:
         return "DLSSD";
-
-    case Upscaler::FSR_RR:
-        return "FSR-RR";
     }
 
     return "????";
@@ -160,8 +154,6 @@ std::string UpscalerToCode(Upscaler upscaler)
         return "dlssd";
     case Upscaler::FSR31: // DX11 only
         return "fsr31";
-    case Upscaler::FSR_RR:
-        return "fsr_rr";
     default: // Upscaler::Reset and unknown
         return "";
     }
@@ -178,7 +170,6 @@ Upscaler CodeToUpscaler(const std::string& code)
         { "dlss", Upscaler::DLSS },         { "dlss_12", Upscaler::DLSS_on12 },
         { "dlssd", Upscaler::DLSSD },       { "fsr31", Upscaler::FSR31 },
         { "fsr31_12", Upscaler::FFX_on12 }, // for compat reasons
-        { "fsr_rr", Upscaler::FSR_RR },
     };
 
     auto it = mapping.find(code);

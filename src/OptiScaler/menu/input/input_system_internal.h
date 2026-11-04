@@ -1,15 +1,10 @@
-﻿// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
 #include "input_system.h"
-#include "EdgeReplay.h"    // AMDNR 0.3.4.2: MenuInput::TapBitGate
-#include "InputDiagRate.h" // AMDNR 0.3.4.2: MenuInput::DiagLineLimiter, EveryMs
 
 #include <Windows.h>
 
 #include <array>
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -117,61 +112,6 @@ struct ButtonState
     bool BlockedDown = false;
 
     DWORD LastMessageTime = 0;
-
-    // AMDNR 0.3.4.2 (Assetto Corsa menu): the press edge and what the poll saw, for the menu key latch
-    // (KeyPressLatch.h), the click / nav key replay (EdgeReplay.h) and the runtime chooser keys.
-    std::uint32_t PressCount = 0;   // press edges so far (never cleared)
-    std::uint32_t PressCountAtLastPoll = 0; // PressCount when the poll last read this key (IsMissedTap)
-    DWORD PressTimeMs = 0;          // event time of the freshest press edge since the last EndFrame
-    InputEventSource PressSource = InputEventSource::None;
-    bool PressRepeat = false;       // that press is a WM_KEYDOWN autorepeat
-    bool PressPosValid = false;     // mouse: that press came with a client position (WM_*BUTTONDOWN)
-    POINT PressPos {};
-    bool PolledDown = false;        // the poll's last physical reading
-    bool LastPollDownValid = false;
-    DWORD LastPollDownMs = 0;       // last poll that saw it down (or a tap the poll found)
-    bool PollDownBeforeValid = false;
-    DWORD PollDownBeforeMs = 0;     // LastPollDownMs as it was before this frame's first poll
-};
-
-// AMDNR 0.3.4.2: counters of the menu input diagnostics (OptiInput::EndFrame, one line per second while the menu is
-// visible and a summary when it closes).
-struct MenuInputDiagCounters
-{
-    std::uint32_t Frames = 0;
-    std::uint64_t FrameMsSum = 0;
-    std::uint32_t FocusedFrames = 0;
-    std::uint32_t ForegroundOtherFrames = 0; // frames whose foreground window was not the game's
-    DWORD ForegroundOtherPid = 0;
-    std::array<std::uint32_t, InputEventSourceCount> MouseDowns {};
-    std::array<std::uint32_t, InputEventSourceCount> KeyDowns {};
-    std::uint32_t Replayed = 0;  // edge pairs replayed into ImGui (clicks and nav keys)
-    std::uint32_t Stale = 0;     // edge pairs dropped as not fresh
-    std::uint32_t MaxMsgAgeMs = 0; // largest age of a message / raw press when OptiInput saw it (the pump's lag)
-    std::uint32_t Moves = 0;       // frames the mouse position fed to ImGui changed
-    std::uint32_t ImGuiClicks = 0; // io.MouseClicked, any button
-    std::uint32_t HoveredFrames = 0;
-
-    void Add(const MenuInputDiagCounters& o)
-    {
-        Frames += o.Frames;
-        FrameMsSum += o.FrameMsSum;
-        FocusedFrames += o.FocusedFrames;
-        ForegroundOtherFrames += o.ForegroundOtherFrames;
-        if (o.ForegroundOtherPid != 0)
-            ForegroundOtherPid = o.ForegroundOtherPid;
-        for (std::size_t i = 0; i < InputEventSourceCount; ++i)
-        {
-            MouseDowns[i] += o.MouseDowns[i];
-            KeyDowns[i] += o.KeyDowns[i];
-        }
-        Replayed += o.Replayed;
-        Stale += o.Stale;
-        MaxMsgAgeMs = MaxMsgAgeMs > o.MaxMsgAgeMs ? MaxMsgAgeMs : o.MaxMsgAgeMs;
-        Moves += o.Moves;
-        ImGuiClicks += o.ImGuiClicks;
-        HoveredFrames += o.HoveredFrames;
-    }
 };
 
 struct InputState
@@ -426,31 +366,6 @@ struct InputState
 
     std::wstring TextInput;
 
-    // AMDNR 0.3.4.2 (Assetto Corsa menu).
-    int MenuKeyVk = 0;                  // SetMenuKey: its edges are recorded
-    bool MenuKeyTapWatch = false;       // SetMenuKey: the poll reads its "pressed since the last call" bit
-    std::array<KeyEdgeRecord, MaxMenuKeyEdges> MenuKeyEdges {};
-    std::size_t MenuKeyEdgeHead = 0;    // oldest record
-    std::size_t MenuKeyEdgeCount = 0;
-    std::size_t MenuKeyEdgesDropped = 0;
-    bool PollRanThisFrame = false;      // the poll ran since the last EndFrame
-    MenuInput::TapBitGate TapGate {};
-    int HeldKeyVk = 0;                  // HoldKeyUntilReleased (0 = none)
-    DWORD HeldKeyLastDownMs = 0;        // last time the held key was seen down (hold start, poll)
-    bool HeldKeyAwaitingLatePair = false; // the hold started with the key already up: it waits for the late pair
-    std::array<bool, 256> FedKeyDown {};           // FeedImGui: level ImGui was given last frame
-    std::array<std::uint32_t, 256> ReplayedKeyCount {};
-    std::array<bool, 5> FedMouseDown {};
-    std::array<std::uint32_t, 5> ReplayedMouseCount {};
-    POINT LastFedMousePos { LONG_MIN, LONG_MIN };
-    MenuInputDiagCounters DiagWindow {}; // since the last per-second line
-    MenuInputDiagCounters DiagOpen {};   // since the menu opened (lines already written)
-    std::uint64_t DiagOpenStartMs = 0;
-    std::uint64_t DiagLastEndFrameMs = 0;
-    bool DiagMenuVisible = false;        // menu visibility the diagnostics last saw
-    MenuInput::DiagLineLimiter DiagLimiter {};
-    MenuInput::EveryMs NoInputWarnCheck {};
-
     std::recursive_mutex Mutex;
 };
 
@@ -562,33 +477,9 @@ class ScopedHookBypass
     ScopedHookBypass& operator=(ScopedHookBypass&&) = delete;
 };
 
-// Crash-triage kill switches ([Hotfix] DiagNoInputHooks / DiagInputHooksSkip, see Config.h).
-// A skipped group counts as "installed" for the HooksInstalled bookkeeping, so nothing retries it.
-namespace DiagHookGroup
-{
-constexpr uint32_t Message = 1u << 0;   // PeekMessageA/W, GetMessageA/W
-constexpr uint32_t KeyState = 1u << 1;  // GetAsyncKeyState, GetKeyState, GetKeyboardState
-constexpr uint32_t MsgPos = 1u << 2;    // GetMessagePos, GetMouseMovePointsEx
-constexpr uint32_t Clip = 1u << 3;      // ClipCursor, GetClipCursor
-constexpr uint32_t SendPost = 1u << 4;  // SendInput, mouse_event, PostMessageA/W, SendMessageA/W
-constexpr uint32_t Hid = 1u << 5;       // CreateFileA/W, ReadFile, DeviceIoControl, CloseHandle
-constexpr uint32_t Raw = 1u << 6;       // GetRawInputData, GetRawInputBuffer, RegisterRawInputDevices
-constexpr uint32_t WinHook = 1u << 7;   // SetWindowsHookExA/W, UnhookWindowsHookEx
-constexpr uint32_t Cursor = 1u << 8;    // Get/SetCursorPos, Get/SetPhysicalCursorPos (+ IAT fallback)
-constexpr uint32_t XInput = 1u << 9;    // XInputGetState(Ex), XInputGetKeystroke, XInputSetState
-constexpr uint32_t DInput = 1u << 10;   // DirectInput8Create / DirectInputCreate*
-constexpr uint32_t GameInput = 1u << 11; // GameInputCreate
-constexpr uint32_t Subclass = 1u << 12; // WndProc subclass of the game window
-// AMDNR 0.3.4.2: not hook groups; the same key turns the two 0.3.4.2 menu input changes off ("minimal" leaves them on).
-constexpr uint32_t MenuPressLatch = 1u << 13;  // "presslatch": the menu key toggles on release again (0.3.4.1)
-constexpr uint32_t MenuClickReplay = 1u << 14; // "clickreplay": no click / nav key replay, no tap bit for them
-} // namespace DiagHookGroup
-
-bool DiagInputDisabled();
-bool DiagSkipHookGroup(uint32_t group);
-
 // Dynamic input hook installation may run without the state mutex
 std::mutex& GetDetourTransactionMutex();
+
 // Lifecycle
 bool InstallHooks();
 bool RemoveHooks();
@@ -666,10 +557,9 @@ bool IsKeyboardMessage(UINT msg);
 bool IsMouseVirtualKey(int vk);
 bool ShouldBlockMouseWindowMessageLocked(HWND hwnd, UINT msg);
 int MouseMessageToButton(UINT msg, WPARAM wParam);
-// AMDNR 0.3.4.2: every key / button edge carries its source (and a key-down its autorepeat bit).
-void SetKeyDown(int vk, DWORD messageTime, bool blocked, InputEventSource source, bool repeat);
-bool SetKeyUp(int vk, DWORD messageTime, InputEventSource source);
-void SetMouseDown(int button, DWORD messageTime, bool blocked, InputEventSource source);
+void SetKeyDown(int vk, DWORD messageTime, bool blocked);
+bool SetKeyUp(int vk, DWORD messageTime);
+void SetMouseDown(int button, DWORD messageTime, bool blocked);
 bool SetMouseUp(int button, DWORD messageTime);
 void ClearTransientState();
 void UpdateMousePositionFromClient(HWND hwnd, LPARAM lParam);
@@ -681,12 +571,8 @@ BOOL RealGetCursorPosSafe(LPPOINT point);
 void SetMouseDownFromRawState(int button, DWORD messageTime, bool blocked);
 void SetMouseUpFromRawState(int button, DWORD messageTime);
 void ResetButtonBlockedStateLocked();
-void SetKeyUpStateOnly(int vk, DWORD messageTime, InputEventSource source);
+void SetKeyUpStateOnly(int vk, DWORD messageTime);
 void SetMouseUpStateOnly(int button, DWORD messageTime);
-// AMDNR 0.3.4.2: HoldKeyUntilReleased's key, while it is held back from the game (MenuInput::HoldStillActive: 3 s
-// after it was last seen down, or the shorter late-pair window when the hold started with the key already up).
-bool IsHeldKeyLocked(int vk);
-void EndKeyHoldLocked(const char* why);
 
 // Raw input
 RawSanitizeAction GetRawInputSanitizeActionLocked(const RAWINPUT& input, USHORT* allowedMouseButtonUpFlags);
@@ -700,10 +586,9 @@ void SanitizeRawMouseAllLocked(RAWINPUT& input);
 void SanitizeRawMouseKeepAllowedButtonUpsLocked(RAWINPUT& input, USHORT allowedButtonUpFlags);
 void SanitizeRawKeyboardLocked(RAWINPUT& input);
 int NormalizeRawKeyboardVirtualKey(const RAWKEYBOARD& keyboard);
-// Returns true when this packet must still reach the game -- a key release it is owed, because it
-// saw the matching press before the menu opened. Everything else returns false and may be withheld.
-// `eventTime`: the WM_INPUT message time (AMDNR 0.3.4.2; was GetTickCount when parsed).
-bool HandleRawInputLocked(HRAWINPUT rawInputHandle, DWORD eventTime);
+// Returns true when this packet must still reach the game because it contains an input release
+// the game is owed. The GetRawInputData hook sanitizes the packet before the game receives it.
+bool HandleRawInputLocked(HRAWINPUT rawInputHandle);
 
 // Win32 hook tracking
 bool IsTrackedWindowsHookType(int hookType);

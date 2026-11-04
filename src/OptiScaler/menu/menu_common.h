@@ -1,34 +1,9 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 #include "SysUtils.h"
 #include <Config.h>
 
 #include <imgui/imgui.h>
-
-// AMDNR 0.3.4 menu look: the main window's palette, taken from the owner-approved mock
-// (the owner-approved menu mock, APPROVED_MOCK.png). MenuCommon::ThemeColor() hands
-// them out; the helpers that draw by hand (dlssnr/menu/NeuralUi.h) use it.
-enum class MenuColor : int
-{
-    Text,         // #e6e4df labels
-    Dim,          // #8d8a84 credits, status lines, inactive tabs, footer
-    Tag,          // #7d7a74 the short word after a row ("running", "1.00x cost")
-    Section,      // #e05a5a section titles
-    Rule,         // #3a2226 the 1 px lines (sections, tab row, footer) and the window border
-    Frame,        // #26262a slider track, combo box, button
-    FrameHovered, // #2e2e33
-    FrameActive,  // #35353b
-    Fill,         // #7a1f2b slider fill
-    FillActive,   // #8f1d2c slider fill while hovered or dragged
-    Value,        // #dddddd the value inside a slider
-    CheckOutline, // #777777 an unticked checkbox
-    CheckOn,      // #c73a45 a ticked checkbox, the active tab's underline
-    ButtonBorder, // #4a2a30
-    Selected,     // #8f1d2c a selected button, the title bar
-    White,        // #ffffff the active tab, the title text
-    Count
-};
 
 class ScopedIndent
 {
@@ -232,10 +207,6 @@ class MenuCommon
     static void RenderNotifications(RenderMenuContext& ctx);
     static void UpdateFrameTimeAverages(RenderMenuContext& ctx);
     static void RenderPerformanceOverlay(RenderMenuContext& ctx);
-
-    // AMDNR: labels for the Neural Rendering comparison views. Drawn every frame, into the frame plane,
-    // so a screenshot keeps them and the wipe reveals and hides them like the images.
-    static void RenderNrCompareTags();
     static void RenderMainMenuWindow(RenderMenuContext& ctx);
 
     // RenderMainMenuWindow section helpers. These keep the main window flow readable
@@ -261,8 +232,6 @@ class MenuCommon
     static void RenderActiveUpscalerSettings(RenderMenuContext& ctx);
     static void RenderFrameGenerationSelection(RenderMenuContext& ctx);
     static void RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx);
-    // AMDNR: Frame Gen > Compatibility, the external FG / MFG unlocker switch
-    static void RenderFrameGenerationCompatibility(RenderMenuContext& ctx);
     static void RenderFGModeSlider(RenderMenuContext& ctx, const char* label, int maxInterpolationCount,
                                    CustomOptional<int>* countConfig, const char* tooltip = nullptr);
     static void RenderFsrCommonSettings(RenderMenuContext& ctx);
@@ -293,38 +262,6 @@ class MenuCommon
     static void UpdateManualInput(HWND targetHwnd);
 
   public:
-    // The main window's tabs, in their order (AMDNR 0.3.4, T11g).
-    enum class MenuTab
-    {
-        Neural,
-        Upscaling,
-        FrameGen,
-        Image,
-        Interface,
-        Advanced,
-    };
-    // Selects a tab of the main window on the next frame, e.g. an "Open Upscaling" button on the Neural tab
-    // (AMDNR 0.3.4, T11g). Menu thread only.
-    static void RequestTab(MenuTab tab);
-
-    // AMDNR 0.3.4 menu look: a palette colour through the menu's HDR tone map (MenuHdrCheck tone-maps the style
-    // colours; a colour drawn by hand must get the same, or it glows in an HDR game). With [Menu] LightTheme=true the
-    // light style's own colours stand in (the mock has no light variant). Menu thread only.
-    static ImVec4 ThemeColor(MenuColor c);
-    // The same with the current style alpha applied (a greyed row), ready for an ImDrawList call.
-    static ImU32 ThemeColorU32(MenuColor c);
-    // AMDNR 0.3.4 menu look: one mock px at the current font size (the menu font is 14 px at Menu Scale 1.0, which
-    // draws the mock's 12.5 px CSS text; a [Menu] FontSize override and the Menu Scale scale it). Every hand-drawn
-    // size of the main window is in mock px times this (DlssNr::NeuralUi::Px). Menu thread only.
-    static float MockPx();
-    // AMDNR 0.3.4 (the approved mock, D-3): the Save report button and its result block (Saving / Report saved with
-    // Open folder / Hide, or the orange failure), shared state; drawn first in Advanced > Logging and last in the
-    // Neural tab's Diagnostics drawer. idSuffix keeps the two places' IDs apart. Menu thread only.
-    static void RenderSaveReportRow(const char* idSuffix);
-
-    // The Neural Rendering toggle-key binder, for the Neural tab; and a key's display name.
-    static void RenderDlssNrToggleKeybind();
-    static std::string KeyName(int virtualKey);
     static void Dx11Inited() { _dx11Ready = true; }
     static void Dx12Inited() { _dx12Ready = true; }
     static void VulkanInited() { _vulkanReady = true; }

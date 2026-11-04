@@ -1,5 +1,3 @@
-// Copyright (c) 2026 3zwr1 (AMDNR)
-// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -64,9 +62,6 @@ void ClearXInputHookPointersLocked()
 
 void UpdateXInputIntegration()
 {
-    if (DiagSkipHookGroup(DiagHookGroup::XInput))
-        return;
-
     {
         std::unique_lock lock(_state.Mutex);
 

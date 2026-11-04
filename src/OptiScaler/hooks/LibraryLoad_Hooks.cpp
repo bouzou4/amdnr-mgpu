@@ -1,4 +1,3 @@
-// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "LibraryLoad_Hooks.h"
 
@@ -34,46 +33,7 @@
 #include <misc/IdentifyGpu.h>
 #include <low_latency/input/input_uell.h>
 
-#include <algorithm>
-#include <mutex>
-#include <string>
-#include <vector>
-
 // #define LOG_LIB_OPERATIONS
-
-// [SLINIT] D3 (0.3.3, NBA 2K27 "slInit error 0x18" report): while the game's slInit runs, each
-// Streamline plugin DLL it loads - from where, and whether OptiScaler hooked it. INFO, so the shipped
-// LogLevel=2 keeps it; silent outside slInit (State::slInitInProgress). Streamline loads every sl.*.dll
-// in its plugin folder, including plugins nothing here hooks, and those get a line too.
-static bool SlInitLoadDiagnostics() { return State::Instance().slInitInProgress.load(std::memory_order_relaxed); }
-
-static void LogSlInitPluginLoad(const char* plugin, const std::string& path, HMODULE module, bool hooked,
-                                const char* why = "")
-{
-    if (!SlInitLoadDiagnostics())
-        return;
-
-    if (module == nullptr)
-        LOG_INFO("[SLINIT] {} load failed: {}", plugin, path);
-    else
-        LOG_INFO("[SLINIT] {} loaded from {}: {}{}", plugin, path, hooked ? "hooked" : "not hooked", why);
-}
-
-// (0.3.4.2, diagnostics) True the first time an overlay dll name reaches LoadLibraryCheckW in this process: its
-// "Overlay dll" line is INFO once per distinct name (a game or an overlay may load the same dll again and again;
-// a support log has to name the overlays), DEBUG after. Streamline_Hooks' FirstSlEvaluateOfFeature pattern.
-static bool FirstOverlayDllName(const std::string& dllName)
-{
-    static std::mutex seenMutex;
-    static std::vector<std::string> seen;
-
-    std::scoped_lock lock(seenMutex);
-    if (std::find(seen.begin(), seen.end(), dllName) != seen.end())
-        return false;
-
-    seen.push_back(dllName);
-    return true;
-}
 
 HMODULE LibraryLoadHooks::LoadLibraryCheckA(std::string libName, LPCSTR lpLibFullPath)
 {
@@ -94,16 +54,6 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
     auto path = std::filesystem::path(libName).lexically_normal();
     auto normalizedPath = path.wstring();
     to_lower_in_place(normalizedPath);
-
-    if (State::Instance().externalFrameGeneration)
-    {
-        const auto filename = std::filesystem::path(normalizedPath).filename().wstring();
-        const bool streamline = filename.starts_with(L"sl.") && filename.ends_with(L".dll");
-        const bool otaFg = normalizedPath.contains(L"\\versions\\") &&
-            (normalizedPath.contains(L"\\sl_") || normalizedPath.contains(L"\\dlssg\\"));
-        if (streamline || otaFg || filename == L"nvngx_dlssg.dll")
-            return nullptr; // not handled: preserve the original loader/unlocker's path
-    }
 
     std::filesystem::path localSlPath(Config::Instance()->MainDllPath.value());
     localSlPath = localSlPath / L"streamline"; // Hardcoded streamline folder
@@ -227,26 +177,7 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
             LOG_ERROR("Trying to load dll as sl.dlss: {}", libNameA);
         }
 
-        LogSlInitPluginLoad("sl.dlss", libNameA, dlssModule, StreamlineHooks::isDlssHooked());
-
         return dlssModule;
-    }
-
-    // sl.dlss_d.dll - Ray Reconstruction, hooked only when FSR Ray Regeneration can serve it
-    if (shouldHookSl && (CheckDllNameW(&libName, &slDlssdNamesW) ||
-                         (normalizedPath.contains(L"\\versions\\") && normalizedPath.contains(L"\\sl_dlss_d_"))))
-    {
-        auto dlssdModule = NtdllProxy::LoadLibraryExW_Ldr(lpLibFullPath, NULL, 0);
-
-        if (dlssdModule != nullptr)
-            StreamlineHooks::hookDlssd(dlssdModule);
-        else
-            LOG_ERROR("Trying to load dll as sl.dlss_d: {}", libNameA);
-
-        LogSlInitPluginLoad("sl.dlss_d", libNameA, dlssdModule, StreamlineHooks::isDlssdHooked(),
-                            StreamlineHooks::isDlssdHooked() ? "" : " (FSR Ray Regeneration cannot serve it here)");
-
-        return dlssdModule;
     }
 
     // sl.dlss_g.dll
@@ -263,21 +194,13 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
             const bool localDlssg = pathInsideLocalSlPath && State::Instance().activeFgOutput == FGOutput::DLSSG;
 
             if (!localDlssg && dlssgModule != State::Instance().optiSlDLSSG)
-            {
                 StreamlineHooks::hookDlssg(dlssgModule);
-                LogSlInitPluginLoad("sl.dlss_g", libNameA, dlssgModule, StreamlineHooks::isDlssgHooked());
-            }
             else
-            {
                 StreamlineHooks::hookLocalDlssg(dlssgModule);
-                LogSlInitPluginLoad("sl.dlss_g", libNameA, dlssgModule, StreamlineHooks::isLocalDlssgHooked(),
-                                    " (as OptiScaler's own copy)");
-            }
         }
         else
         {
             LOG_ERROR("Trying to load dll as sl.dlss_g: {}", libNameA);
-            LogSlInitPluginLoad("sl.dlss_g", libNameA, dlssgModule, false);
         }
 
         return dlssgModule;
@@ -294,12 +217,10 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
         if (reflexModule != nullptr && reflexModule != State::Instance().optiSlReflex)
         {
             StreamlineHooks::hookReflex(reflexModule);
-            LogSlInitPluginLoad("sl.reflex", libNameA, reflexModule, StreamlineHooks::isReflexHooked());
         }
         else
         {
             LOG_ERROR("Trying to load dll as sl.reflex: {}", libNameA);
-            LogSlInitPluginLoad("sl.reflex", libNameA, reflexModule, false, " (OptiScaler's own copy)");
         }
 
         return reflexModule;
@@ -322,9 +243,6 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
             LOG_ERROR("Trying to load dll as sl.pcl: {}", libNameA);
         }
 
-        LogSlInitPluginLoad("sl.pcl", libNameA, pclModule, pclModule != State::Instance().optiSlPCL &&
-                                                                StreamlineHooks::isPclHooked());
-
         return pclModule;
     }
 
@@ -345,27 +263,7 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
             LOG_ERROR("Trying to load dll as sl.common: {}", libNameA);
         }
 
-        LogSlInitPluginLoad("sl.common", libNameA, commonModule,
-                            commonModule != State::Instance().optiSlCommon && StreamlineHooks::isCommonHooked());
-
         return commonModule;
-    }
-
-    // Any other Streamline plugin (sl.nis, sl.deepdvc, sl.dlss_nr, a newer one...), or a known one
-    // this function does not hook here (inside OptiScaler\streamline without Nvngx FG input): loaded by
-    // the normal path, so its line says so. Under the ntdll hook a pass-through name can appear twice.
-    if (SlInitLoadDiagnostics())
-    {
-        const auto fileName = path.filename().wstring();
-        std::wstring lowerName = fileName;
-        to_lower_in_place(lowerName);
-
-        const bool slPlugin = (lowerName.starts_with(L"sl.") && lowerName.ends_with(L".dll")) ||
-                              (normalizedPath.contains(L"\\versions\\") && normalizedPath.contains(L"\\sl_"));
-        if (slPlugin)
-            LOG_INFO("[SLINIT] Streamline plugin {} passes through: not hooked ({})", libNameA,
-                     shouldHookSl ? "OptiScaler has no hook for this plugin"
-                                  : "inside OptiScaler\\streamline, hooked only under Nvngx FG input");
     }
 
     // Make EOS block separate as it's the only one having issues with non-OptiFG FGs
@@ -406,11 +304,7 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         auto module = NtdllProxy::LoadLibraryExW_Ldr(libName.c_str(), NULL, 0);
 
-        // (0.3.4.2, diagnostics) INFO once per distinct overlay dll name, DEBUG after (FirstOverlayDllName).
-        if (FirstOverlayDllName(dllName))
-            LOG_INFO("Overlay dll: {}, module: {:X}", wstring_to_string(libName), (size_t) module);
-        else
-            LOG_DEBUG("Overlay dll: {}, module: {:X}", wstring_to_string(libName), (size_t) module);
+        LOG_DEBUG("Overlay dll: {}, module: {:X}", wstring_to_string(libName), (size_t) module);
 
         if (module != nullptr)
         {
@@ -1184,22 +1078,8 @@ HMODULE LibraryLoadHooks::LoadNvngxDlss(std::wstring originalPath)
 //     return nullptr;
 // }
 
-void LibraryLoadHooks::AfterLoad(std::wstring_view name, HMODULE module)
-{
-    if (module == nullptr)
-        return;
-
-    // A game's own XeSS-FG provider (Cyberpunk ships one) gets the MFG unlock the moment
-    // it is mapped, exactly like the copy the proxy loads.
-    if (EndsWithInsensitive(name, L"libxess_fg.dll"))
-        XeFGUnlock::ApplyToModule(module, false);
-}
-
 void LibraryLoadHooks::CheckModulesInMemory()
 {
-    // Copies of the XeSS-FG provider that were mapped before the loader was hooked.
-    XeFGUnlock::ApplyToAllLoaded();
-
     const auto isLocalStreamlineModule = [](HMODULE module) -> bool
     {
         if (module == nullptr)
@@ -1249,15 +1129,6 @@ void LibraryLoadHooks::CheckModulesInMemory()
         }
     }
 
-    if (!StreamlineHooks::isDlssdHooked())
-    {
-        HMODULE slDlssd = GetDllNameWModule(&slDlssdNamesW);
-        if (slDlssd != nullptr)
-        {
-            LOG_DEBUG("sl.dlss_d.dll already in memory");
-            StreamlineHooks::hookDlssd(slDlssd);
-        }
-    }
     // DLSS-G
     {
         std::unique_lock lock1(StreamlineHooks::mutexHookDlssg, std::try_to_lock);
