@@ -77,7 +77,8 @@ Probe* Get()
             path[strcspn(path, "\r\n")] = 0;
         }
         auto* pr = new Probe;
-        pr->fp = fopen(path, "w");
+        // one file per process: a launcher or crash handler loading the same dll must not truncate it
+        pr->fp = fopen((std::string(path) + "." + std::to_string(GetCurrentProcessId())).c_str(), "w");
         if (!pr->fp)
             return nullptr;
         LARGE_INTEGER f;
@@ -138,7 +139,7 @@ void Mark(uint64_t frame, Col c)
         r.frame = frame;
         r.t[Present] = t;
         r.t[LastExec] = s_lastExec.load();
-        if (frame % 600 == 0)
+        if (frame % 30 == 0)
             fflush(p->fp);
         return;
     }

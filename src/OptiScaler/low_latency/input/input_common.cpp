@@ -634,7 +634,7 @@ static void ll_trace(const char* what, uint64_t a, uint64_t b)
                 return nullptr;
             path[strcspn(path, "\r\n")] = 0;
         }
-        return fopen(path, "w");
+        return fopen((std::string(path) + "." + std::to_string(GetCurrentProcessId())).c_str(), "w");
     }();
     if (!fp)
         return;
@@ -644,7 +644,7 @@ static void ll_trace(const char* what, uint64_t a, uint64_t b)
     QueryPerformanceCounter(&t);
     std::scoped_lock lock(m);
     fprintf(fp, "%s,%lld,%llu,%llu\n", what, t.QuadPart, a, b);
-    if (++n % 256 == 0)
+    if (++n % 64 == 0)
         fflush(fp);
 }
 
