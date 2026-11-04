@@ -1487,6 +1487,34 @@ void NrEngine::Quiesce()
     WaitIdle();
 }
 
+bool NrEngine::Shutdown()
+{
+    if (_worker.joinable())
+        _worker.join();
+    for (int i = 0; i < 2000 && _pendingList.load() != nullptr; i++)
+        Sleep(1);
+    std::lock_guard lock(_mutex);
+    if (_pendingList.load() != nullptr)
+        return Log(OptiLog_Warn, "hot reload: a game list with NR work is not submitted yet"), false;
+    if (_ctx != nullptr)
+        DrainJob();
+    if (_event != nullptr)
+    {
+        WaitIdle();
+        if (_presentFence && _presentFence->GetCompletedValue() < _presentCounter &&
+            SUCCEEDED(_presentFence->SetEventOnCompletion(_presentCounter, _event)))
+            WaitForSingleObject(_event, 5000);
+    }
+    if (_ctx != nullptr)
+    {
+        _rt.api.Drain(_ctx);
+        _rt.api.Destroy(_ctx);
+        _ctx = nullptr;
+    }
+    _state = State::Idle;
+    return true;
+}
+
 bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
 {
     if (_termCopy && _termCopy->GetDesc().Width == bd.Width && _termCopy->GetDesc().Height == bd.Height &&
