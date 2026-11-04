@@ -41,15 +41,15 @@ struct NrSettings
     int32_t passes = 1; // Full only: DLSS5_MULTI_PASS 1..3, the network run N times per frame
     int32_t Passes() const { return model == 0 ? passes : 1; }
     bool History() const { return temporal && Passes() == 1; } // the runtime's history needs one pass
-    // NVIDIA NGX style, 0 = NVIDIA's default look; < 0 auto: 2 before / after upscaling (a third of style 0's tone
-    // shift on scene colour, as much detail), 0 at the display placements
-    int32_t style = -1;
+    // NVIDIA NGX style, 0 = NVIDIA's default look; < 0 auto (option): 2 before / after upscaling (a third of style 0's
+    // tone shift on scene colour, as much detail), 0 at the display placements
+    int32_t style = 0;
     bool display = false; // the multi-GPU display engine (presented frames)
     int32_t Style() const { return style >= 0 ? style : placement == Placement::Terminal || display ? 0 : 2; }
     float strength = 1.0f;
-    // Network colour share: 0 its luma on the game's chroma, 1 its colour; < 0 auto (0 before the game's tone mapper,
-    // where its colour change is graded on top, 1 at the display-referred placements)
-    float colorStrength = -1.0f;
+    // Network colour share: 1 its colour change as it is (faithful), 0 its luma on the game's chroma; < 0 auto (option):
+    // 0 before / after upscaling, 1 at the display placements
+    float colorStrength = 1.0f;
     float ColorStrength(bool preTonemap) const { return colorStrength >= 0 ? colorStrength : preTonemap ? 0.0f : 1.0f; }
     float uiLow = 0.004f;  // terminal: back buffer vs HUD-less difference where UI starts (encoded units)
     float uiHigh = 0.02f;  // and where it is fully UI

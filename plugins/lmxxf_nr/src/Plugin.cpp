@@ -52,9 +52,9 @@ NrSettings ReadSettings()
     s.size = (NetworkSize) std::clamp(g_api->GetInt(g_plugin, "NetworkSize", 0), 0, 2);
     s.model = std::clamp(g_api->GetInt(g_plugin, "Model", 0), 0, 1);
     s.passes = std::clamp(g_api->GetInt(g_plugin, "MultiPass", 1), 1, 3);
-    s.style = std::clamp(g_api->GetInt(g_plugin, "Style", -1), -1, 2);
+    s.style = std::clamp(g_api->GetInt(g_plugin, "Style", 0), -1, 2);
     s.strength = std::clamp(g_api->GetFloat(g_plugin, "Strength", 1.0f), 0.0f, 2.0f);
-    s.colorStrength = std::min(g_api->GetFloat(g_plugin, "ColorStrength", -1.0f), 1.0f);
+    s.colorStrength = std::min(g_api->GetFloat(g_plugin, "ColorStrength", 1.0f), 1.0f);
     s.motion = g_api->GetBool(g_plugin, "MotionVectors", true);
     s.exposure = g_api->GetBool(g_plugin, "Exposure", true);
     s.serialize = g_api->GetBool(g_plugin, "Serialize", false);
@@ -272,7 +272,7 @@ void DrawTab(void*)
     if (g_api->SliderFloat("Colour", &g_ui.colorStrength, -1.0f, 1.0f, g_ui.colorStrength < 0 ? "auto" : "%.2f"))
         changed = true;
     g_api->ItemTooltip("Share of the network's colour change: 0 keeps the game's chroma with the network's luma, 1 takes its "
-                       "colour. Auto: 0 before / after upscaling (the game grades on top), 1 at the display placements");
+                       "colour (default, faithful). Auto: 0 before / after upscaling, 1 at the display placements");
     if (g_api->Checkbox("Move the edit with motion vectors", &g_ui.motion))
         changed = true;
     if (g_api->Checkbox("Network history from motion vectors", &g_ui.temporal))
