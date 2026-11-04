@@ -29,6 +29,7 @@ cbuffer C : register(b0)
     float PaperWhite; // 2 and 3: linear value of paper white
     uint UseNorm;     // Norm bound (upscale placements): the guard can bypass Apply
     float ExpoMul;    // Stats: game exposure * ExpoMul = net units per scene unit (1 / pre-exposure); 0 = auto
+    float ColorStrength; // 0: network luma on the game's chroma, 1: the network's colour edit as it is
 };
 
 static const float kGuard = 1.5; // fed median above this after mapping: bypass
@@ -151,9 +152,15 @@ void Stats(uint3 gt : SV_GroupThreadID)
         Dst[uint2(0, 0)] = float4(scale, gsHigh[0] / 4096.0, autoScale, 0);
 }
 
-float3 Edit(float2 uv)
+// Network space edit at uv for colour c: below ColorStrength 1 part of it is the network's luma ratio on c's own chroma
+float3 Edit(float2 uv, float3 c)
 {
-    return Enh.SampleLevel(Lin, uv * EnhUvScale, 0).rgb - Fed.SampleLevel(Lin, uv * FedUvScale, 0).rgb;
+    float3 enh = Enh.SampleLevel(Lin, uv * EnhUvScale, 0).rgb, fed = Fed.SampleLevel(Lin, uv * FedUvScale, 0).rgb;
+    float3 e = enh - fed;
+    if (ColorStrength >= 1)
+        return e;
+    float r = clamp((Luma(enh) + 1e-3) / (Luma(fed) + 1e-3), 0, 4);
+    return lerp(ToNet(max(ToLinear(c), 0)) * (r - 1), e, saturate(ColorStrength));
 }
 
 // The network's edit (Enh - Fed), moved by the motion vectors when it is a frame old, added to Src in linear
@@ -172,7 +179,7 @@ void Apply(uint3 id : SV_DispatchThreadID)
         prev = -1; // guard: bypassed
     if (all(prev >= 0) && all(prev <= 1))
     {
-        float3 e = Edit(prev);
+        float3 e = Edit(prev, c.rgb);
         if (all(isfinite(e)) && all(isfinite(c.rgb)))
             o.rgb = AddEdit(c.rgb, Strength * e);
     }
@@ -190,7 +197,7 @@ void ApplyTerminal(uint3 id : SV_DispatchThreadID)
     float3 h = Aux[id.xy].rgb;
     float3 d = abs(b.rgb - h);
     float ui = smoothstep(UiLow, UiHigh, max(d.r, max(d.g, d.b)));
-    float3 e = Edit(uv);
+    float3 e = Edit(uv, b.rgb);
     float3 o = b.rgb;
     if (ui < 1 && all(isfinite(e)))
         o = lerp(AddEdit(b.rgb, Strength * e), b.rgb, ui);
@@ -213,8 +220,9 @@ struct ShaderConstants
     float paperWhite;
     uint32_t useNorm;
     float expoMul;
+    float colorStrength;
 };
-static_assert(sizeof(ShaderConstants) == 80);
+static_assert(sizeof(ShaderConstants) == 84);
 
 // Flicker meter, tools/seq_metrics.py on the GPU: per pixel of the feed, the change of the network's answer against
 // the change of its input (display encoding), on still pixels and on visible moving pixels (warped with the vectors).

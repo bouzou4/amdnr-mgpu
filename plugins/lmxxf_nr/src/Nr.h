@@ -42,8 +42,16 @@ struct NrSettings
     int32_t passes = 1; // Full only: DLSS5_MULTI_PASS 1..3, the network run N times per frame
     int32_t Passes() const { return model == 0 ? passes : 1; }
     bool History() const { return temporal && Passes() <= 2; } // 3 passes: the runtime's history needs no prediction
-    int32_t style = 0; // NVIDIA NGX style, 0 = NVIDIA's default look
+    // NVIDIA NGX style, 0 = NVIDIA's default look; < 0 auto (option): 2 before / after upscaling (a third of style 0's
+    // tone shift on scene colour, as much detail), 0 at the display placements
+    int32_t style = 0;
+    bool display = false; // the multi-GPU display engine (presented frames)
+    int32_t Style() const { return style >= 0 ? style : placement == Placement::Terminal || display ? 0 : 2; }
     float strength = 1.0f;
+    // Network colour share: 1 its colour change as it is (faithful), 0 its luma on the game's chroma; < 0 auto (option):
+    // 0 before / after upscaling, 1 at the display placements
+    float colorStrength = 1.0f;
+    float ColorStrength(bool preTonemap) const { return colorStrength >= 0 ? colorStrength : preTonemap ? 0.0f : 1.0f; }
     float uiLow = 0.004f;  // terminal: back buffer vs HUD-less difference where UI starts (encoded units)
     float uiHigh = 0.02f;  // and where it is fully UI
     bool motion = true; // move the one frame old edit with the motion vectors
@@ -198,9 +206,11 @@ class NrEngine
     // Frame dump on <dumpDir>\lmxxf_nr_dump.trigger: the network output, what it was fed, and the result
     void MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result = nullptr,
                    D3D12_RESOURCE_STATES resultState = D3D12_RESOURCE_STATE_COPY_SOURCE, ID3D12Resource* source = nullptr,
-                   ID3D12Resource* hudless = nullptr);
+                   ID3D12Resource* hudless = nullptr, ID3D12Resource* hudResult = nullptr,
+                   D3D12_RESOURCE_STATES hudResultState = D3D12_RESOURCE_STATE_COMMON);
     void FinishDump();
-    ComPtr<ID3D12Resource> _dumpTex[5];
+    bool EnsureHudCopies(const D3D12_RESOURCE_DESC& d);
+    ComPtr<ID3D12Resource> _dumpTex[6];
     bool _dumpArmed = false;
     uint64_t _dumpGameValue = 0, _dumpOwnValue = 0;
     uint32_t _dumpCount = 0;
@@ -214,6 +224,7 @@ class NrEngine
     uint64_t _presentValue[kPresentLists] = {};
     uint64_t _presentCounter = 0;
     ComPtr<ID3D12Resource> _termCopy, _termOut;
+    ComPtr<ID3D12Resource> _hudCopy, _hudOut; // the game's FG swapchain: its HUD-less input before / after the edit
     uint64_t _hudlessMissing = 0;
     uint32_t _hudlessStreak = 0; // presents in a row without a usable HUD-less colour
     ComPtr<ID3D12DescriptorHeap> _heap;

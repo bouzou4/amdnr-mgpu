@@ -50,6 +50,11 @@ class PluginApi
     static void SetGameFg(const char* source, ID3D12Resource* hudless, uint32_t hudlessState, bool generating);
     // The game's HUD-less colour for this present (consumed), and whether the game's FG generates frames now
     static ID3D12Resource* TakeGameHudless(uint32_t* state, bool* generating);
+    // The same at the game's Present on its own FG swapchain (paired with this frame there, generating or not)
+    static ID3D12Resource* PeekGameHudless(uint32_t* state, bool* generating);
+    // Present callbacks ran at the game's FG swapchain Present: the presents it makes are not called back again
+    static void NoteFgSwapchainPresent();
+    static bool FgSwapchainPresenting();
     static void RunPresentCallbacks(OptiPresentFrame* frame);
 
     // Adapter override and unhooked device creation (D3D12CreateDevice hooks)
