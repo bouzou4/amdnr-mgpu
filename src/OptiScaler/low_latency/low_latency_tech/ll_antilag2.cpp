@@ -67,7 +67,9 @@ bool AntiLag2::init(IUnknown* pDevice)
             Amdxc64Hooks::giveGameAl2Proxy = true;
             if (init_return == S_OK)
             {
-                LOG_INFO("FSR Anti-Lag 2.0 DX12 initialized");
+                const auto luid = device->GetAdapterLuid();
+                LOG_INFO("FSR Anti-Lag 2.0 DX12 initialized on adapter LUID {:08X}:{:08X}", (uint32_t) luid.HighPart,
+                         luid.LowPart);
                 return true;
             }
             else

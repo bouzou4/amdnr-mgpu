@@ -24,6 +24,8 @@ struct Settings
     bool temporal = false;     // send the render card's motion vectors; NR keeps a network history
     double uiGate = 0.90;      // HUD-less: above this share of differing pixels the pair is wrong: no NR that frame
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
+    int lowLatency = 0;        // 1: Present throttles on the render card, 2: and paces the next frame (Pacer)
+    bool earlySend = false;    // the send copy is queued before the wait for the display card
     int dred = 0;              // DRED on the display device: 1 breadcrumbs + page faults, 2 page faults only
     bool forwardOutputs = true; // the render adapter's EnumOutputs returns the display card's outputs
 };
@@ -70,6 +72,7 @@ struct Env
     std::function<void()> nrQuiesce; // NR's queued work is done: the resources it was given may be freed
     std::function<std::string()> nrStatus;
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
+    std::function<void(ID3D12Device*)> hookExecute; // latency probe: the game queue's submits
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it
 };
 

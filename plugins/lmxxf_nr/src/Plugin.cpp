@@ -4,6 +4,7 @@
 #include "Nr.h"
 #include "Presets.h"
 #include "mgpu/MgpuCore.h"
+#include "mgpu/MgpuLatency.h"
 
 #include <detours/detours.h>
 
@@ -39,6 +40,7 @@ const char* const kPasses[] = { "1", "2 (about 2x the network)", "3 (2 run + 1 p
 
 void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
 {
+    Mgpu::Latency::NoteExecute(queue);
     Engine().OnExecute(queue, count, lists);
 }
 
