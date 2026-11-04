@@ -5,6 +5,7 @@
 
 #include <Util.h>
 #include <resource.h>
+#include <BuildInfo.h>
 #include <proxies/KernelBase_Proxy.h>
 #include <proxies/Ntdll_Proxy.h>
 
@@ -744,7 +745,7 @@ bool Install(bool withDump)
 
         // dump=pending: the writer thread loads dbghelp after DllMain and writes "DUMP ready" or "DUMP unavailable".
         const std::string start = std::format("{} pid={} START {} {} proxy={} tick={} dump={}\r\n", LocalNow(),
-                                              GetCurrentProcessId(), exe, VER_PRODUCT_NAME, proxy, GetTickCount64(),
+                                              GetCurrentProcessId(), exe, BuildInfo::ProductName(), proxy, GetTickCount64(),
                                               dumpArmed ? "pending" : "off");
         DWORD written = 0;
         WriteFile(g_log, start.data(), static_cast<DWORD>(start.size()), &written, nullptr);

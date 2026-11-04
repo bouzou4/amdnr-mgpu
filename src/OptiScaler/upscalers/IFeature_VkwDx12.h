@@ -12,7 +12,7 @@
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
-#include <vulkan/vulkan.hpp>
+#include <vulkan/vulkan.h>
 
 #ifdef VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan_win32.h>
@@ -58,7 +58,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     VkInstance VulkanInstance = VK_NULL_HANDLE;
     VkQueue VulkanGraphicsQueue = VK_NULL_HANDLE;
     std::map<uint32_t, QUERY_INDEX_BUFFERS> VulkanQueueCommandBuffers;
-    uint32_t ActiveQueueFamilyIndex = 9999;
+    uint32_t ActiveQueueFamilyIndex = UINT32_MAX;
 
     PFN_vkGetInstanceProcAddr VulkanGIPA = nullptr;
     PFN_vkGetDeviceProcAddr VulkanGDPA = nullptr;
@@ -85,23 +85,10 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     ID3D12Fence* dx12FenceTextureCopy[VKDX12_BUFFER_COUNT] {};
     HANDLE vkSHForTextureCopy[VKDX12_BUFFER_COUNT] {};
     ULONG _fenceValue = 0;
+    uint64_t pendingResourceCopyValue = 0;
+    std::mutex EvaluateMutex;
 
-    // [DlssNr] AmdVkLateCopyWait (opt-in, off by default): the D3D12 queue Wait on the game's texture
-    // copies, held from ProcessVulkanTextures and queued by FlushCopyWait in CopyBackOutput, between
-    // Close and ExecuteCommandLists. It lives for one Evaluate: cleared when Evaluate starts, dropped
-    // by the guard in Evaluate when the call ends without reaching the Execute; ReleaseSyncResources
-    // clears its fence pointer. With the key off it is never set. Not owned: it points at
-    // dx12FenceTextureCopy[frame], which ReleaseSyncResources releases (and clears this first).
-    // "Held" is _copyWaitHeld, never the fence pointer: a hold whose fence is null (a partial
-    // CreateSharedFenceSemaphore failure) still counts as held, so it can never be skipped as
-    // "nothing held" and let the bridge list run without its Wait (FlushCopyWait fails it instead).
-    bool _copyWaitHeld = false;
-    ID3D12Fence* _copyWaitFence = nullptr;
-    UINT64 _copyWaitValue = 0;
-    uint32_t _copyWaitDrops = 0;
-
-    bool FlushCopyWait();
-    void DropCopyWait(bool frameEnded);
+    std::vector<DetailedGpuTime> detailedGpuTimes;
 
     // Copy shaders
     std::unique_ptr<ResourceCopy_Vk> ColorCopy = nullptr;
@@ -126,7 +113,8 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
                                  VK_TEXTURE2D_RESOURCE_C* OutResource, ResourceCopy_Vk* InCopyShader, bool InCopy,
                                  bool InDepth);
     bool ProcessVulkanTextures(VkCommandBuffer InCmdList, const NVSDK_NGX_Parameter* InParameters);
-    bool CopyBackOutput();
+    bool CopyBackOutput(VkCommandBuffer InCmdBuffer);
+    void AbortPendingInterop(VkCommandBuffer InCmdBuffer, uint32_t InFrame);
 
     void ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
                          D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState);
@@ -163,6 +151,53 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     API Api() const override { return API::DX12; }
     bool IsWithDx12() override { return true; }
 
+    std::optional<double> ReadUpscalerTime(void* unused) override
+    {
+        if (auto feature = dx12Feature.get(); feature && Dx12CommandQueue && UpscalerTime)
+        {
+            auto dx12UpscalerTime = feature->ReadUpscalerTime(Dx12CommandQueue);
+
+            feature->ReadDetailedGpuTimes(Dx12CommandQueue, detailedGpuTimes);
+
+            // Count up shader times that are included in upscalerWithInterop but not in dx12UpscalerTime
+            double deductedUpscalerTime = 0.0;
+            for (const auto& time : detailedGpuTimes)
+            {
+                if (!time.includedInUpscalerTime)
+                    deductedUpscalerTime += time.time;
+            }
+
+            auto upscalerWithInterop = UpscalerTime->ReadInteropGpuTime();
+
+            if (dx12UpscalerTime)
+            {
+                if (upscalerWithInterop)
+                {
+                    const double interopTime = *upscalerWithInterop - *dx12UpscalerTime - deductedUpscalerTime;
+
+                    if (std::isfinite(interopTime) && interopTime > 0.0)
+                    {
+                        detailedGpuTimes.push_back({ "Interop", interopTime, true });
+                        return *dx12UpscalerTime + interopTime;
+                    }
+                }
+
+                // Vulkan timing has issue use Dx12 timing.
+                return dx12UpscalerTime;
+            }
+
+            return upscalerWithInterop;
+        }
+
+        return std::nullopt;
+    };
+
+    void ReadDetailedGpuTimes(void* unused, std::vector<DetailedGpuTime>& detailedGpuTimes) override
+    {
+        // We already queried and prepared detailedGpuTimes in ReadUpscalerTime
+        detailedGpuTimes = this->detailedGpuTimes;
+    };
+
     feature_version Version() final
     {
         return CallFeature([](auto f) { return f->Version(); }, feature_version {});
@@ -173,10 +208,10 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
         return CallFeature([](auto f) { return f->JitterCount(); }, size_t {});
     }
 
-    void TickFrozenCheck() override
+    void TickFrozenCheck(uint32_t presentPerEval = 1) override
     {
         if (auto feature = dx12Feature.get(); feature)
-            return feature->TickFrozenCheck();
+            return feature->TickFrozenCheck(presentPerEval);
     };
 
     bool IsFrozen() override

@@ -11,7 +11,7 @@
 #include <include/spdlog_sink/debug_sink.h>
 
 #include "Util.h"
-#include "resource.h" // VER_PRODUCT_NAME for the session header
+#include "BuildInfo.h" // product name for the session header
 #include "misc/LogRotationNames.h" // FB-L8: the previous logs' names
 
 #include <algorithm>
@@ -392,7 +392,7 @@ void BeginLogSession()
     _sessionHeader = std::format("{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} local, tick {}, pid {}, exe=\"{}\", {}",
                                  kSessionTag, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
                                  now.wMilliseconds, GetTickCount64(), GetCurrentProcessId(), wstring_to_string(exe),
-                                 VER_PRODUCT_NAME);
+                                 BuildInfo::ProductName());
 
     // This exe's marker as the last session left it, before it is rewritten below
     const std::wstring ownMarker = SessionMarkerPath(logDir, exe);

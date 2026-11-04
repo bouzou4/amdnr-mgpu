@@ -5,6 +5,7 @@
 #include <dlssnr/amd/AmdBridge.h>
 #include <proxies/FfxApi_Proxy.h>
 #include "FFXFeature_Dx12.h"
+#include <misc/DeferredRelease.h>
 #include "MathUtils.h"
 
 using namespace OptiMath;
@@ -15,13 +16,27 @@ NVSDK_NGX_Parameter* FFXFeatureDx12::SetParameters(NVSDK_NGX_Parameter* InParame
     return InParameters;
 }
 
-FFXFeatureDx12::FFXFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
+FFXFeatureDx12::FFXFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters,
+                               const std::string& customUpscaler)
     : FFXFeature(InHandleId, InParameters), IFeature_Dx12(InHandleId, InParameters),
       IFeature(InHandleId, SetParameters(InParameters))
 {
+    // Regular dlls go first, so their name lookups don't find the custom dll
     FfxApiProxy::InitFfxDx12();
 
-    _moduleLoaded = FfxApiProxy::IsSRReady();
+    if (customUpscaler.empty())
+    {
+        _moduleLoaded = FfxApiProxy::IsSRReady();
+    }
+    else
+    {
+        _customUpscaler = FfxApiProxy::LoadCustomUpscalerDx12(customUpscaler);
+        _moduleLoaded = _customUpscaler != nullptr;
+
+        if (!_moduleLoaded)
+            ImGui::InsertNotification(
+                { ImGuiToastType::Error, 10000, "Can't load custom upscaler %s", customUpscaler.c_str() });
+    }
 
     if (_moduleLoaded)
         LOG_INFO("amd_fidelityfx_dx12.dll methods loaded!");
@@ -37,57 +52,6 @@ bool FFXFeatureDx12::InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSD
         return true;
 
     return InitFFX(InParameters);
-}
-
-bool CreateBufferResourceWithSize(ID3D12Device* device, ID3D12Resource* source, D3D12_RESOURCE_STATES state,
-                                  ID3D12Resource** target, UINT width, UINT height)
-{
-    if (device == nullptr || source == nullptr)
-        return false;
-
-    auto inDesc = source->GetDesc();
-
-    if (*target != nullptr)
-    {
-        auto bufDesc = (*target)->GetDesc();
-
-        if (bufDesc.Width != width || bufDesc.Height != height || bufDesc.Format != inDesc.Format ||
-            bufDesc.Flags != inDesc.Flags)
-        {
-            (*target)->Release();
-            (*target) = nullptr;
-        }
-        else
-        {
-            return true;
-        }
-    }
-
-    D3D12_HEAP_PROPERTIES heapProperties;
-    D3D12_HEAP_FLAGS heapFlags;
-    HRESULT hr = source->GetHeapProperties(&heapProperties, &heapFlags);
-
-    if (hr != S_OK)
-    {
-        LOG_ERROR("GetHeapProperties result: {:X}", (UINT64) hr);
-        return false;
-    }
-
-    inDesc.Width = width;
-    inDesc.Height = height;
-
-    hr = device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &inDesc, state, nullptr,
-                                         IID_PPV_ARGS(target));
-
-    if (hr != S_OK)
-    {
-        LOG_ERROR("CreateCommittedResource result: {:X}", (UINT64) hr);
-        return false;
-    }
-
-    LOG_DEBUG("Created new one: {}x{}", inDesc.Width, inDesc.Height);
-
-    return true;
 }
 
 bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
@@ -166,75 +130,6 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
             ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        }
-
-        // WAR for FSR 4's autoexposure shader reading entire underlying resource
-        // instead of what's specified by renderSize or color's FfxApiResourceDescription.
-        // Only linear has this issue
-        if (Version().major >= 4 && AutoExposure() && !Config::Instance()->FsrNonLinearPQ.value_or_default() &&
-            !Config::Instance()->FsrNonLinearSRGB.value_or_default() &&
-            !Config::Instance()->FsrNonLinearColorSpace.value_or_default())
-        {
-            D3D12_RESOURCE_DESC desc = paramColor->GetDesc();
-
-            const auto diffW = static_cast<int>(desc.Width) - static_cast<int>(params.renderSize.width);
-            const auto diffH = static_cast<int>(desc.Height) - static_cast<int>(params.renderSize.height);
-
-            // Seemingly it may only be happening when both axes are 1 pixel too big
-            // But let's be conservative here and also trigger when just one axis is too big
-            const bool validW = (diffW >= 0 && diffW <= 2);
-            const bool validH = (diffH >= 0 && diffH <= 2);
-            const bool isPadded = (diffW > 0 || diffH > 0);
-
-            if (validW && validH && isPadded)
-            {
-                static size_t count = 0;
-                const size_t index = count % 2;
-
-                CreateBufferResourceWithSize(Device, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                             &smallerColor[index], params.renderSize.width, params.renderSize.height);
-
-                if (smallerColor[index])
-                {
-                    ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
-
-                    ResourceBarrier(InCommandList, smallerColor[index], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                    D3D12_RESOURCE_STATE_COPY_DEST);
-
-                    D3D12_BOX srcBox {};
-                    srcBox.left = 0;
-                    srcBox.top = 0;
-                    srcBox.right = params.renderSize.width;
-                    srcBox.bottom = params.renderSize.height;
-                    srcBox.front = 0;
-                    srcBox.back = 1;
-
-                    D3D12_TEXTURE_COPY_LOCATION dstLocation {};
-                    dstLocation.pResource = smallerColor[index];
-                    dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                    dstLocation.SubresourceIndex = 0;
-
-                    D3D12_TEXTURE_COPY_LOCATION srcLocation {};
-                    srcLocation.pResource = paramColor;
-                    srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                    srcLocation.SubresourceIndex = 0;
-
-                    InCommandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, &srcBox);
-
-                    // The source goes back to where it came from (it used to stay in COPY_SOURCE, and the restore
-                    // below then transitioned the scratch copy instead). The copy stays in NPSR, which its next use
-                    // (NPSR -> COPY_DEST above) assumes.
-                    ResourceBarrier(InCommandList, sourceColor, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    ResourceBarrier(InCommandList, smallerColor[index], D3D12_RESOURCE_STATE_COPY_DEST,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-                    paramColor = smallerColor[index];
-                }
-
-                count++;
-            }
         }
 
         params.color = ffxApiGetResourceDX12(paramColor, FFX_API_RESOURCE_STATE_COMPUTE_READ);
@@ -591,6 +486,19 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
         params.upscaleSize.height = TargetHeight();
     }
 
+    if (_customAutoExposure)
+    {
+        if (_autoExposure->Dispatch(InCommandList, paramColor, params.renderSize.width, params.renderSize.height,
+                                    params.preExposure, params.frameTimeDelta / 1000.0f, params.reset))
+        {
+            params.exposure = ffxApiGetResourceDX12(_autoExposure->Exposure(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        }
+        else
+        {
+            LOG_ERROR("Auto exposure dispatch failed");
+        }
+    }
+
     LOG_DEBUG("Dispatch!!");
     auto result = FfxApiProxy::D3D12_Dispatch(&_context, &params.header);
 
@@ -657,9 +565,18 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
     {
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 
+        auto& versions =
+            _customUpscaler != nullptr ? _customUpscaler->versions : State::Instance().ffxUpscalerVersionsDx12;
+
         LOG_INFO("[CREATE] FFX QueryVersions, device {:X}", (size_t) Device);
-        QueryVersionsDx12(Device);
-        LOG_INFO("[CREATE] FFX QueryVersions done: {} versions", State::Instance().ffxUpscalerVersionIds.size());
+
+        if (!QueryVersionsDx12(Device, _customUpscaler) || versions.ids.empty())
+        {
+            LOG_ERROR("No FFX upscalers reported!");
+            return false;
+        }
+
+        LOG_INFO("[CREATE] FFX QueryVersions done: {} versions", versions.ids.size());
 
         InitFlags();
 
@@ -669,15 +586,39 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
 
         _contextDesc.header.pNext = &backendDesc.header;
 
-        if (Config::Instance()->FfxUpscalerIndex.value_or_default() < 0 ||
-            Config::Instance()->FfxUpscalerIndex.value_or_default() >= State::Instance().ffxUpscalerVersionIds.size())
-            Config::Instance()->FfxUpscalerIndex.set_volatile_value(0);
+        auto& upscalerIndex =
+            Config::Instance()->FfxUpscalerIndexFor(_customUpscaler != nullptr ? _customUpscaler->name : "");
+
+        if (upscalerIndex.value_or_default() < 0 || upscalerIndex.value_or_default() >= versions.ids.size())
+            upscalerIndex.set_volatile_value(0);
+
+        parse_version(versions.names[upscalerIndex.value_or_default()]);
 
         ffxOverrideVersion override = { 0 };
         override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-        override.versionId =
-            State::Instance().ffxUpscalerVersionIds[Config::Instance()->FfxUpscalerIndex.value_or_default()];
+        override.versionId = versions.ids[upscalerIndex.value_or_default()];
         backendDesc.header.pNext = &override.header;
+
+        // FSR4's own auto exposure reads the whole color texture instead of just renderSize. On UE the padding
+        // outside the view can hold garbage that makes it think the scene is very bright and black out the frame.
+        // Run our own auto exposure instead and hand FSR4 the result as a regular exposure texture.
+        // Only linear input is affected, color space changes recreate the feature.
+        _customAutoExposure = false;
+        auto& cfg = *Config::Instance();
+
+        if (Version().major >= 4 && AutoExposure() && !cfg.FsrNonLinearPQ.value_or_default() &&
+            !cfg.FsrNonLinearSRGB.value_or_default() && !cfg.FsrNonLinearColorSpace.value_or_default())
+        {
+            if (_autoExposure == nullptr)
+                _autoExposure = std::make_unique<AE_Dx12>("AutoExposure", Device);
+
+            if (_autoExposure->IsInit())
+            {
+                _customAutoExposure = true;
+                _contextDesc.flags &= ~FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+                LOG_INFO("Using OptiScaler auto exposure instead of FSR's");
+            }
+        }
 
         LOG_DEBUG("_createContext!");
 
@@ -686,7 +627,10 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
 
             LOG_INFO("[CREATE] FFX CreateContext, version index {}",
                      Config::Instance()->FfxUpscalerIndex.value_or_default());
-            auto ret = FfxApiProxy::D3D12_CreateContext(&_context, &_contextDesc.header, NULL);
+            auto ret =
+                _customUpscaler != nullptr
+                    ? FfxApiProxy::D3D12_CreateContext(&_customUpscaler->module, &_context, &_contextDesc.header, NULL)
+                    : FfxApiProxy::D3D12_CreateContext(&_context, &_contextDesc.header, NULL);
             LOG_INFO("[CREATE] FFX CreateContext returned {}", FfxApiProxy::ReturnCodeToString(ret));
 
             if (ret != FFX_API_RETURN_OK)
@@ -696,10 +640,7 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
             }
         }
 
-        auto version =
-            State::Instance().ffxUpscalerVersionNames[Config::Instance()->FfxUpscalerIndex.value_or_default()];
         _name = "FSR";
-        parse_version(version);
     }
 
     SetInit(true);

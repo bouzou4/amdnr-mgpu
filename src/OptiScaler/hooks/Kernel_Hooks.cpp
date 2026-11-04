@@ -5,8 +5,6 @@
 #include "Streamline_Hooks.h"
 #include "LibraryLoad_Hooks.h"
 
-#include <fsr4/FSR4ModelSelection.h>
-
 #include <Util.h>
 #include <State.h>
 #include <Config.h>
@@ -14,6 +12,7 @@
 
 #include <cwctype>
 #include <misc/IdentifyGpu.h>
+#include <fsr4/FSR4DriverProvider.h>
 
 #include "Hook_Utils.h"
 
@@ -185,6 +184,16 @@ HMODULE WINAPI KernelHooks::hk_K32_GetModuleHandleW(LPCWSTR lpModuleName)
             }
 
             return original;
+        }
+
+        // The driver dlls only hand out their providers when they see signed FFX SDK dlls loaded,
+        // when Opti uses its own FFX dlls the driver dll stands in for them
+        if (_wcsnicmp(lpModuleName, L"amd_fidelityfx_", 15) == 0)
+        {
+            if (auto original = o_K32_GetModuleHandleW(lpModuleName); original != nullptr)
+                return original;
+
+            return FSR4DriverDll::SdkModuleStandIn(lpModuleName, Util::GetCallerModule(_ReturnAddress()));
         }
     }
 
@@ -433,7 +442,10 @@ VALIDATE_HOOK(hk_K32_FreeLibrary, Kernel32Proxy::PFN_FreeLibrary)
 BOOL KernelHooks::hk_K32_FreeLibrary(HMODULE lpLibrary)
 {
     if (lpLibrary == nullptr)
-        return STATUS_INVALID_PARAMETER;
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
 
 #ifdef _DEBUG
     // LOG_TRACE("{:X}", (size_t) lpLibrary);
@@ -447,5 +459,9 @@ BOOL KernelHooks::hk_K32_FreeLibrary(HMODULE lpLibrary)
             return result.value() == TRUE;
     }
 
-    return o_K32_FreeLibrary(lpLibrary);
+    auto freeResult = o_K32_FreeLibrary(lpLibrary);
+
+    LibraryLoadHooks::AfterFreeLibrary(lpLibrary);
+
+    return freeResult;
 }

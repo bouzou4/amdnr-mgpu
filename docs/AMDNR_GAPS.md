@@ -8,7 +8,7 @@ This fork is a modified AMDNR. It is not the original AMDNR and is not endorsed 
 
 | Path | What it is |
 |---|---|
-| `src/` | Upstream OptiScaler `c983a500335134ecff512bfcdadcf912d1286547` (2026-09-01), added as a squashed `git subtree` from the `optiscaler` remote (https://github.com/optiscaler/OptiScaler). Its submodules are registered in the top-level `.gitmodules` at `src/external/*`. |
+| `src/` | Upstream OptiScaler `5eb4bfabf3c93cdb7e96b37065441f5c8000ccc7` (2026-11-03), a squashed `git subtree` from the `optiscaler` remote (https://github.com/optiscaler/OptiScaler). First added at `c983a500` (2026-09-01), then pulled to `5eb4bfab` (section 6). Its submodules are registered in the top-level `.gitmodules` at `src/external/*`. |
 | `src/OptiScaler/` on top of that | AMDNR's published 0.3.4.2 sources, ported as a verbatim commit ("Port AMDNR 0.3.4.2 published sources ..."), then the build and gap commits. |
 | `main/AMDNR-source/` | AMDNR's snapshot, untouched, for reference and for diffing against AMDNR 0.5.0. |
 | `third_party/directx_agility_sdk/` | Agility SDK 1.615.1 headers (MIT), see 4. |
@@ -20,7 +20,7 @@ Why a subtree under `src/` and not OptiScaler's history as the branch root:
 - Upstream OptiScaler updates come in with `git subtree pull --prefix=src --squash optiscaler <commit>`. The squash commit message records the exact upstream commit (`git-subtree-split:`).
 - AMDNR's code is a separate commit on top of the upstream tree, so when AMDNR 0.5.0 lands, its tree can be diffed against `c983a500` + the port commit, and the gap commits below can be dropped one by one.
 
-Why `c983a500`: it is the upstream commit closest to the 0.3.4.2 snapshot by blob match, so the 98 upstream files AMDNR modified apply as whole files without a three-way port.
+Why `c983a500` first: it is the upstream commit closest to the 0.3.4.2 snapshot by blob match, so the 98 upstream files AMDNR modified apply as whole files without a three-way port. Diffs that isolate AMDNR's own changes to upstream files are still taken against `c983a500` (`git diff c983a500:OptiScaler/<f> <branch>:src/OptiScaler/<f>`).
 
 The subtree carries upstream's own binaries (prebuilt FFX `.lib` files, `dxcompiler.dll`, `D3D12Core.dll`, `freetype.lib`) because the build links them. They are upstream's, unchanged. No AMDNR, lmxxf or NVIDIA binary is in the tree.
 
@@ -101,3 +101,93 @@ The base is the 0.3.4.2 snapshot; the released binary is 0.3.5.8R13. Rebuilt fro
 2. Diff it against `c983a500` + the port commit; take its versions of every file in 3.1 and 3.2, and drop the stand-ins (each carries an "AMDNR gap" banner; `git grep "AMDNR gap"` lists them).
 3. Re-enable the excluded project items (`ExcludedFromBuild`) and restore the dropped `ClCompile` entries.
 4. If it is based on a newer OptiScaler, `git subtree pull --prefix=src --squash optiscaler <its base>` first.
+
+## 6. Upstream sync
+
+Branch `mgpu/base-next` is `mgpu/base` plus `git subtree pull --prefix=src --squash optiscaler 5eb4bfab`. That is upstream master of 2026-11-03, 335 commits after `c983a500`.
+
+### 6.1 Method
+
+- Every conflicted file was re-merged three-way with `c983a500` as the base.
+  - Ours is `mgpu/base` (AMDNR's port plus the gap commits). Theirs is `5eb4bfab`.
+  - Each hunk then shows AMDNR's delta (`c983a500` -> ours) next to upstream's (`c983a500` -> `5eb4bfab`).
+  - The resolution is upstream's file with AMDNR's delta applied again.
+- A newer upstream commit was tried as the base where AMDNR's file is closer to it than to `c983a500`.
+  - It was dropped. It reads upstream's later changes, which AMDNR does not have, as AMDNR deletions. It lost `FrameLimit::targetFps` and `ContextData::lastEvalFrame`.
+  - So `c983a500` stays the base for every file.
+- 55 files conflicted, about 270 hunks (`menu/menu_common.cpp` alone had 127). Files that merged cleanly were checked by the build and by a search for duplicate definitions.
+- Where upstream fixed something AMDNR had already fixed, upstream's code is taken and AMDNR's is dropped. 6.3 lists those cases.
+
+### 6.2 Dropped from our commits
+
+| Commit | Why |
+|---|---|
+| `639853fb` (FSR 4 spoof backport) | Upstream now contains `8f2a9435`. `spoofing/Dxgi_Spoofing.cpp` is upstream's file again. |
+
+### 6.3 AMDNR code replaced by upstream's version of the same feature
+
+| AMDNR | Upstream | Decision |
+|---|---|---|
+| `DLSSFeatureDx11on12` (`upscalers/dlss/DLSSFeature_Dx11On12.*`) and `DLSSFeatureVkOn12` (`DLSSFeature_VkOn12.*`) | `DLSSFeatureDx11On12` and `DLSSFeatureVkOnDx12` (`435609d4`), with the `Upscaler::DLSS_on12` cases in both providers | Upstream's classes and provider cases are kept. AMDNR's duplicate `case DLSS_on12` blocks, its two `VkOn12` files and their project entries are removed. Upstream also leaves `SupportsUpscaleSize` unset on these classes, which was AMDNR's point. |
+| `DLSSFeature::_dlssInitedDx11/Dx12/Vk`: one static flag per API | `_dlssInited` is a per-instance member | Upstream's. It fixes the same shared-flag bug, where a D3D11 init hid the D3D12 one. |
+| `FrameLimit::sleep(fgActive, outputPerBase)`: the FG multiplier passed in | `sleep(fgActive)` reads `CurrentFG()->GetInterpolatedFrameCount() + 1`. Upstream also adds `targetFps()` (Dynamic MFG). | Upstream's. The call in `FG_Hooks.cpp` goes back to one argument. AMDNR's `sleep_ns` / `now_ns` stay, because `InterleavePacing.h` uses them. They now run on `Util::GetTimestamp`. |
+| `Util::IsSubpath`: never throws, empty result counts as inside | Lexically relative, case-insensitive, never throws, empty result counts as not inside | Upstream's. AMDNR's comment asked for an audit of the callers before the empty case changed; upstream has now made that change. |
+| No automatic FSR 4 INT8 on integrated RDNA 3 (`IdentifyGpu.cpp`) | Per-ASIC model table. Phoenix, Hawk Point and Krackan get a model on purpose. | Upstream's. AMDNR's exclusion worked around a crash (SOTTR, 780M) in the 0.3.x driver path. `[FSR] Fsr4ForceModel` went away with upstream's FSR 4 rework. |
+| `AmdVkLateCopyWait`: Vulkan bridge, opt-in, off by default | The bridge records every copy-back step that can fail before it queues the D3D12 Wait (`AbortPendingInterop`, `CancelAndDrainQueuedWait`) | Upstream's. The hold / flush / drop code is removed.<br>The `[DlssNr] AmdVkLateCopyWait` key still parses and the Neural tab still mentions it, but it has no effect.<br>`AmdBridge::ListDiscarded` is now called from `AbortPendingInterop` and from the failed-Close path, so the NR backend still hears about a discarded bridge list. |
+| `FSR4Upgrade.cpp` denoiser log line (P25: "no driver override for the denoiser" logs as INFO, not ERROR) | `FSR4Upgrade.cpp` is deleted; the driver provider moved to `fsr4/FSR4DriverProvider.cpp` (`37c40ef7`) | Upstream's. The log-level change is not applied again. |
+| `FSRFG_Dx12.cpp`: log text "FSR FG swapchain already created" | Upstream removed the block | Upstream's. |
+| `Vulkan_Hooks.cpp`: surface -> window map (`_surfaceHwnd`, AMDNR 0.3.4.1) | `_surfaceWindows`, `VulkanHooks::SurfaceWindow`, `OnOtherWindow` | Upstream's. It fixes the same vkd3d-proton helper-window problem. |
+| `Streamline_Hooks.cpp`: system caps pointer read again on every call (0.3.3 F6) | The same fix, plus an `IsWritableMemory` check | Upstream's. |
+| `input_system_raw.cpp`: "a repeat is not a blocked press" | The same fix | Upstream's. |
+| `input_system_windows_hooks.cpp`: low-level hook pass-through | Upstream now always passes low-level hook events through | AMDNR's is kept. It has the same default, plus the `[Hotfix] MenuLowLevelHookPassThrough` kill switch and a log line for the first blocked event. |
+| Product name in `resource.h` (`VER_PRODUCT_NAME`) | Moved behind `OPTISCALER_BUILD_METADATA` and read through `BuildInfo::ProductName()` | AMDNR's name ("AMD-NR v... / OptiScaler v... (build)") is kept inside the guard. `AmdBridge.cpp`, `Logger.cpp`, `CrashReport.cpp` and `dllmain.cpp` now call `BuildInfo::ProductName()`. |
+| Quirk table in `misc/Quirks.h` | Moved to `misc/GameConfigs.cpp` (`a45a18b5`) and split into config defaults and quirks | Upstream's CONTROL Resonant entry is taken as is. It sets `SimulateWaitableObject` and `DisableOTA`, and no longer sets the `FGPreserveSwapChain` default (upstream "Remove PreserveSwapChain config default from Control Resonant").<br>AMDNR's enum members are appended to upstream's enum: `PathTracedRayReconstruction`, `SkinSmoothingDefault`, `RrBiasMaskDefaultOff`, `NeedsREFramework`.<br>AMDNR's table edits become new `GameConfigs.cpp` entries:<ul><li>RE Requiem (and its demo): its quirks.</li><li>PRAGMATA: `NeedsREFramework`.</li><li>`gta5.exe`: `SkipD3D11FeatureLevelElevation`.</li><li>Stellar Blade: `OnNonNvidia(RestoreComputeSignature = true), ExtendedStateRestore = true`.</li></ul>Onimusha's entry is already upstream. |
+
+### 6.4 AMDNR deltas applied again on upstream's new code
+
+| File | Decision |
+|---|---|
+| `inputs/NVNGX_DLSS_Dx12.cpp` | The NR call sites (`AmdBridge::Restore`, then `EvaluateAfterUpscale` or `UpscalerSkipped`) sit before upstream's new `UpscalerInputsDx12::UpscaleEnd`, so FG and HUDfix resource tracking see the NR output. |
+| `inputs/NVNGX_DLSS.h` | `rayReconstruction` sits next to upstream's new `lastEvalFrame`. |
+| `upscalers/FeatureProvider_Dx12.cpp` | AMDNR's rule that an RR handle keeps its backend on Reset runs after upstream's custom-DLSS check (`CustomProviders::IsDlss`). |
+| `upscalers/ffx/FFXFeature.cpp`, `FFXFeature_Dx12.cpp` | Upstream moved the version lists to `State::ffxUpscalerVersionsDx12` and to the custom FFX modules. AMDNR's provider log (`FFX upscaler provider N: name (id)`) and its `[CREATE]` lines are added again on the new structures.<br>Upstream removed the FSR 4 autoexposure padding workaround when it replaced FSR 4's autoexposure with its own. AMDNR's barrier fix lived inside that workaround, so it is gone too. |
+| `upscalers/IFeature_VkwDx12.cpp` | Upstream's reworked interop: async copy-back, parameter restore, `StartInterop` timing. AMDNR's NR calls stay inside the evaluate. |
+| `upscalers/IFeature_Dx11wDx12.cpp` | AMDNR's command-list recreation after a failed Close uses upstream's `commandFrame` index. |
+| `hooks/D3D12_Hooks.cpp` | The `DiagSwitches::NoD3D12Hooks` early return comes before upstream's `o_earlyHook` check. |
+| `hooks/Ntdll_Hooks.h` | In `LdrLoadDll`, both upstream's `AfterLoadLibrary` and AMDNR's `AfterLoad` run. AMDNR's is the XeFG unlock, a no-op in this base. |
+| `hooks/LibraryLoad_Hooks.cpp` | `XeFGUnlock::ApplyToAllLoaded` and the hook for an already-loaded `sl.dlss_d` are kept, next to upstream's moved `isLocalStreamlineModule`. |
+| `hooks/DxgiFactory_Hooks.cpp` | AMDNR's window-sized swapchain resolution (`ResolveWindowSizedSwapchain`) runs on a local copy, then upstream's size check, which allows a zero size. |
+| `nvapi/NvApiHooks.cpp` | AMDNR's external-FG pass-through comes first, then upstream's Reflex Sync hook. |
+| `hooks/Streamline_Hooks.cpp` | Upstream's per-copy plugin slots (`pluginSlots`, `hookPlugin`, `onModuleFreed`) and its DLSS-G state fill are taken.<ul><li>AMDNR's 6X cap (`DlssgReportedMaxGenerated = 5`) clamps both the maximum and the presented count.</li><li>AMDNR's `externalFrameGeneration` / `DiagNoStreamlineHooks` guards moved into `hookPlugin`.</li><li>AMDNR's `PatchPluginJson` is kept over upstream's `HasPluginJson`, because it fails closed.</li><li>AMDNR's `sl.dlss_d` hooks stay outside the slot system with a single detour, so they lack upstream's protection against several loaded copies.</li><li>Tags are read on D3D12 and Vulkan (upstream). AMDNR's RR probes stay D3D12-only.</li></ul> |
+| `hooks/Vulkan_Hooks.cpp` | Upstream's rewritten `vkCreateDevice`, with AMDNR's `SkipOwnVulkanObjects` handling applied again.<br>New in neither side: OptiScaler's own devices also get no FG, which this combination of the two needs.<br>The NR NVX device extensions are added before upstream's spoof scope. |
+| `menu/input/*` | AMDNR's diagnostics (`DiagHookGroup`, the skip switches), held-key handling and event-time plumbing are applied again on upstream's code: its blocking policy (`ShouldBlock*InputLocked`, `HandleBlockingFocusGainLocked`), the DirectInput per-vtable trampolines and `USE_HID_HOOKS`. |
+| `framegen/xefg/XeFG_Dx12.cpp` | AMDNR's `XeFGPacing` calls (no-ops in this base) sit next to upstream's Dynamic MFG restart and `release_xefg_xell`. The `createdHere` failure cleanup stays; upstream moved the "swapchain already exists" block out. |
+| `dllmain.cpp` | AMDNR's native XeSS FG guard runs after upstream's XeFG input passthrough. |
+| `wrapped/wrapped_swapchain.cpp` | In `SetColorSpace1`, AMDNR's colour-space log runs after upstream's HDR state and theme update. |
+| `State.h`, `Config.h`, `Config.cpp`, `OptiScaler.ini` | Both sides' members and keys are kept.<br>`[XeFG] InterpolationCount` has no upper bound (upstream); AMDNR's `MaxInterpolatedFrames` keeps its own.<br>The process exclusion list has both sides' additions. |
+| `misc/AmdnrReport.cpp`, `dlssnr/amd/PresentExperimental.h` | Use upstream's new names: `dxgiIsDxvk`, `d3d12IsVkd3dProton`, `hdrOutputActive`. |
+| `OptiScaler.sln`, `.vcxproj`, `.filters` | Upstream dropped the Win32 configurations, so the `dlssnr_forwarder` project no longer has them either. |
+| `menu/menu_common.cpp` | Upstream and AMDNR redesigned the main menu separately (upstream: sidebar tabs, cards, Custom and plugin tabs, theme rework; AMDNR: its own palette and `NeuralUi` widgets), and diff3 gave 127 hunks that did not line up. The file was rebuilt from upstream and AMDNR's delta applied again function by function.<ul><li>About 130 of AMDNR's 224 delta hunks only restyled upstream sections (palette, `NeuralUi` widgets in upstream sections, status pills, footer graph). Upstream's look is kept and those are dropped.</li><li>The Neural tab is an upstream sidebar tab right after Custom and draws `DlssNr::RenderMenu`. `MenuCommon::RequestTab` maps to upstream's tab labels.</li><li>Ported: the menu-key latch and toggle debounce; the NR toggle and capture keys; the toggle toast; the first-launch runtime chooser; the REFramework warning; the exposure-scan lamp; the NR compare tags on the overlay; the Save report row; AMDNR credits and update notice; the " - Neural" suffix in the upscaler combo; a Neural Rendering keybind row; a Frame Gen "Compatibility (external FG)" box; the Root Signatures note.</li><li>Not ported, because the backing code is stubbed in this base (3.3) or upstream replaced it: the FSR-RR menu rows; the XeFG 7X-10X ceiling, unlock and pacing rows; AMDNR's V-Sync, render-resolution and init-flag sections (upstream has its own); the NVIDIA NR GPU-time row.</li><li>The build line shows `BuildInfo::ProductVersion()`, because upstream keeps `VER_BUILD_DATE` / `VER_BUILD_COMMIT` in one translation unit.</li></ul> |
+| `menu/menu_common.h` | Upstream's header (it keeps `RenderThemeSettings`, which the auto-merge had dropped), plus AMDNR's declarations. `ScopedCollapsingHeader` is upstream's, so the Neural tab's folds look like upstream's. |
+| `menu/menu_overlay_dx.cpp` | Both sides fixed command allocator reuse. Upstream's fence wait (up to 2 s) is kept; AMDNR's skip-when-busy round robin is dropped. AMDNR's overlay timing warning stays, and its skip counter now counts upstream's wait failures. |
+| `menu/menu_overlay_vk.cpp` | AMDNR's Proton helper-window fallback (`ResolveMenuWindow`) runs first, then upstream's `OnOtherWindow` check. |
+
+### 6.5 Toolchain
+
+- Upstream's `external/directx_agility_sdk` is unchanged (`D3D12Core.dll` 1.615), so the vendored Agility SDK 1.615.1 headers stay as they are.
+- Submodule changes: `FidelityFX-SDK-v2` -> `7539ae8b` (v2.4.0) and `vulkan` -> `8864cdc8`.
+- `TemporalStability.h` is unchanged, so `split_raw_literals.py` did not need to run.
+
+### 6.6 What users get from the newer upstream
+
+- FFX SDK 2.4 with per-feature DLLs. When a per-feature DLL is missing, the older SDK DLL is used.
+- FSR 4 rework:
+  - the driver provider is listed next to the SDK one (the `*` entry);
+  - live switching between the FP8 and INT8 models, with the model picked automatically per ASIC;
+  - FSR 4 upscaling and FG on Vulkan, and FSR 4 swapchain upgrades on D3D12;
+  - FSR 4 paths for Pascal and RDNA 1 / 2.
+- Custom upscaler and FG DLLs (`custom/<name>/ffx|ffx_vk|dlss|dlssg`) and the Plugin API: ASI plugins and custom DLLs get a menu tab, settings and logging. Assessment: `docs/PLUGIN_API_ASSESSMENT.md`.
+- Frame generation: XeFG Dynamic MFG; OptiFG, DLSSG and FSR FG on Vulkan; reprojection; a rework of low-latency input and output.
+- FPS overlay presets, reworked frametime reporting, and the upscale ratio on the overlay.
+- Per-game defaults are split from quirks (`GameConfigs.cpp`). CONTROL Resonant gets `SimulateWaitableObject`, OTA off and no `FGPreserveSwapChain` default.
+- Fixes to GPU detection and FSR 4 availability, plus many crash fixes: DLSSG on Vulkan and D3D11, RTSS, swapchains with more than 8 buffers, and two D3D11-on-12 upscalers at once.

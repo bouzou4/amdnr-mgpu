@@ -46,6 +46,13 @@ std::string Util::WhoIsTheCaller(void* returnAddress)
     return "";
 }
 
+std::filesystem::path Util::ModulePath(HMODULE module)
+{
+    wchar_t path[MAX_PATH] = { 0 };
+    GetModuleFileNameW(module, path, MAX_PATH);
+    return std::filesystem::path(path);
+}
+
 HMODULE Util::GetCallerModule(void* returnAddress)
 {
     HMODULE hModule = NULL;
@@ -371,6 +378,18 @@ std::filesystem::path Util::ExePath()
     return exe;
 }
 
+// ReShade checks for "d3d12" in its own name so also accept d3d12-ReShade64.dll
+std::filesystem::path Util::ReShadePath()
+{
+    auto dir = ExePath().parent_path();
+    auto rsFile = dir / L"ReShade64.dll";
+
+    if (!std::filesystem::exists(rsFile) && std::filesystem::exists(dir / L"d3d12-ReShade64.dll"))
+        rsFile = dir / L"d3d12-ReShade64.dll";
+
+    return rsFile;
+}
+
 static BOOL CALLBACK EnumWindowsCallback(HWND handle, LPARAM lParam)
 {
     const auto isMainWindow = [handle]()
@@ -485,40 +504,62 @@ bool Util::GetFileVersion(std::wstring dllPath, version_t* fileVersionOut, versi
     return true;
 }
 
+// ProductVersion string from the version resource, falling back to FileVersion
+std::string Util::GetFileVersionString(std::wstring dllPath)
+{
+    DWORD handle = 0;
+    DWORD versionSize = GetFileVersionInfoSizeW(dllPath.c_str(), &handle);
+    if (versionSize == 0)
+        return {};
+
+    std::vector<BYTE> versionInfo(versionSize);
+    if (!GetFileVersionInfoW(dllPath.c_str(), handle, versionSize, versionInfo.data()))
+        return {};
+
+    struct LANGANDCODEPAGE
+    {
+        WORD wLanguage;
+        WORD wCodePage;
+    }* lpTranslate = nullptr;
+
+    UINT cbTranslate = 0;
+    if (!VerQueryValueW(versionInfo.data(), L"\\VarFileInfo\\Translation", (LPVOID*) &lpTranslate, &cbTranslate) ||
+        cbTranslate < sizeof(LANGANDCODEPAGE))
+    {
+        return {};
+    }
+
+    for (const wchar_t* name : { L"ProductVersion", L"FileVersion" })
+    {
+        std::wstring query = std::format(L"\\StringFileInfo\\{:04x}{:04x}\\{}", lpTranslate[0].wLanguage,
+                                         lpTranslate[0].wCodePage, name);
+
+        LPWSTR value = nullptr;
+        UINT size = 0;
+
+        if (VerQueryValueW(versionInfo.data(), query.c_str(), reinterpret_cast<LPVOID*>(&value), &size) && value &&
+            size > 1)
+        {
+            return wstring_to_string(value);
+        }
+    }
+
+    return {};
+}
+
 bool Util::IsSubpath(const std::filesystem::path& path, const std::filesystem::path& base)
 {
-    // NEVER THROWS (0.3.3). This runs for every DLL load (LibraryLoadHooks::LoadLibraryCheckW),
-    // including each Streamline plugin load inside the game's slInit, where an exception escaping
-    // the loader hook can end as slInit error 0x18. The throwing overload of relative() raised
-    // filesystem_error for a path it could not resolve; the error_code overload reports it, and
-    // an error answers "not inside".
-    //
-    // Otherwise the answer is exactly what it was, on purpose: an empty result - relative() found
-    // no relation, e.g. the two paths are on different drives - still counts as inside, as the old
-    // `*rel.begin()` of an empty path did (it read neither "." nor ".."). Changing that, and the
-    // case question, reverses the answer at the callers (LibraryLoad_Hooks.cpp: LoadLibraryCheckW's
-    // local-Streamline test, the LoadCustomAmdxc64OnRdna2 driver-store match, CheckModulesInMemory's
-    // isLocalStreamlineModule; Util::FindFilePath) and waits for an audit of all four (0.3.4). The
-    // empty case is tested explicitly here rather than by dereferencing begin() == end().
-    try
-    {
-        std::error_code ec;
-        const auto rel = std::filesystem::relative(path, base, ec);
-        if (ec)
-            return false;
+    auto lowerPath = path.lexically_normal().wstring();
+    auto lowerBase = base.lexically_normal().wstring();
+    to_lower_in_place(lowerPath);
+    to_lower_in_place(lowerBase);
 
-        if (rel.empty())
-            return true;
-
-        // A copy: the element lives in the iterator, which is a temporary here.
-        const auto first = *rel.begin();
-        return first != "." && first != "..";
-    }
-    catch (const std::exception&)
-    {
-        // Allocation failure while building the paths: same answer as an error.
+    auto rel = std::filesystem::path(lowerPath).lexically_relative(lowerBase);
+    if (rel.empty())
         return false;
-    }
+
+    auto first = *rel.begin();
+    return first != "." && first != "..";
 }
 
 std::optional<std::filesystem::path> Util::FindFilePath(const std::filesystem::path& startDir,
@@ -582,17 +623,40 @@ std::optional<std::filesystem::path> Util::FindFilePath(const std::filesystem::p
         return foundPath;
     }
 
-    // 3) Unreal-Engine/WinGDK fallback: check for Win64 or WinGDK in parent
+    // 3) Unreal-Engine/WinGDK fallback: check for Win64 or WinGDK in parent (and for other special games)
     std::filesystem::path parent = startDir.parent_path().parent_path();
     uint32_t cnt = 0;
     for (const char* folder : { "Win64", "WinGDK", "Win64MasterMasterSteamPGO" })
     {
         if (std::filesystem::exists(parent / folder) && std::filesystem::is_directory(parent / folder))
         {
-            // Move up two more levels from 'parent' to reach UE project root but one level for KCD2
+            // Move up two more levels from 'parent' to reach UE project root, but one level for KCD2
             std::filesystem::path gameRoot;
             if (cnt < 2)
-                gameRoot = parent.parent_path().parent_path();
+            {
+                do
+                {
+                    // Check one below Win64, old UE games have binaries here
+                    gameRoot = parent.parent_path();
+
+                    if (std::filesystem::exists(gameRoot / "Binaries") &&
+                        std::filesystem::is_directory(gameRoot / "Binaries"))
+                    {
+                        gameRoot = gameRoot.parent_path();
+                        break;
+                    }
+
+                    // Check two below Win64, newer UE games have binaries here
+                    gameRoot = gameRoot.parent_path();
+
+                    if (std::filesystem::exists(gameRoot / "Binaries") &&
+                        std::filesystem::is_directory(gameRoot / "Binaries"))
+                    {
+                        gameRoot = gameRoot.parent_path();
+                        break;
+                    }
+                } while (false);
+            }
             else
                 gameRoot = parent.parent_path();
 
@@ -608,6 +672,52 @@ std::optional<std::filesystem::path> Util::FindFilePath(const std::filesystem::p
         }
 
         cnt++;
+    }
+
+    // 4) Optional extended search for special games. Search for Plugins and its subdirectories
+    if (State::Instance().gameQuirks & GameQuirk::ExtendedSearch)
+
+    {
+        std::filesystem::path ancestor = startDir;
+        for (uint32_t level = 0; level < 4 && !ancestor.empty(); ++level)
+        {
+            std::vector<std::filesystem::path> pluginRoots;
+            std::error_code ec;
+            if (std::filesystem::is_directory(ancestor, ec) && !ec)
+            {
+                std::filesystem::recursive_directory_iterator it(
+                    ancestor, std::filesystem::directory_options::skip_permission_denied, ec);
+                const std::filesystem::recursive_directory_iterator end;
+                while (!ec && it != end)
+                {
+                    if (it.depth() >= 5)
+                        it.disable_recursion_pending();
+                    std::error_code entryEc;
+                    if (it->is_directory(entryEc) && !entryEc && it->path().filename() == L"Plugins")
+                    {
+                        pluginRoots.push_back(it->path());
+                        it.disable_recursion_pending();
+                    }
+                    it.increment(ec);
+                }
+            }
+            for (const auto& pluginRoot : pluginRoots)
+            {
+                LOG_INFO(L"Extended search: searching at {}", pluginRoot.wstring());
+                if (auto foundPath = SearchDirectoryBFS(pluginRoot))
+                {
+                    LOG_INFO(L"{} found by extended search at {}", fileName.wstring(), foundPath.value().wstring());
+                    return foundPath;
+                }
+            }
+
+            if (!pluginRoots.empty())
+                break;
+            const auto parentPath = ancestor.parent_path();
+            if (parentPath == ancestor)
+                break;
+            ancestor = parentPath;
+        }
     }
 
     // Not found anywhere
@@ -939,4 +1049,27 @@ std::map<Util::Luid, std::filesystem::path> Util::GetDriverStore()
         NtdllProxy::FreeLibrary_Ldr(hGdi32);
 
     return result;
+}
+
+uint64_t Util::GetTimestamp()
+{
+    FILETIME fileTime;
+    GetSystemTimePreciseAsFileTime(&fileTime);
+
+    uint64_t time = (static_cast<uint64_t>(fileTime.dwHighDateTime) << 32) | fileTime.dwLowDateTime;
+
+    return time * 100;
+}
+
+void Util::SetFlagEnvVar(const wchar_t* name, bool enabled)
+{
+    const wchar_t* crtValue = enabled ? L"1" : L"";
+    _wputenv_s(name, crtValue);
+    SetEnvironmentVariableW(name, enabled ? L"1" : nullptr);
+
+    if (auto ucrt = GetModuleHandleW(L"ucrtbase.dll"))
+    {
+        if (auto ucrtPutenv = reinterpret_cast<decltype(&_wputenv_s)>(GetProcAddress(ucrt, "_wputenv_s")))
+            ucrtPutenv(name, crtValue);
+    }
 }

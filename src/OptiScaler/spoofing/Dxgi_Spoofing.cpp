@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <misc/IdentifyGpu.h>
+#include <proxies/FfxApi_Proxy.h>
 
 typedef HRESULT (*PFN_GetDesc)(IDXGIAdapter* This, DXGI_ADAPTER_DESC* pDesc);
 typedef HRESULT (*PFN_GetDesc1)(IDXGIAdapter1* This, DXGI_ADAPTER_DESC1* pDesc);
@@ -160,7 +161,7 @@ HRESULT DxgiSpoofing::hkGetDesc1(IDXGIAdapter1* This, DXGI_ADAPTER_DESC1* pDesc)
         auto targetDeviceIdMatches = !Config::Instance()->TargetDeviceId.has_value() ||
                                      Config::Instance()->TargetDeviceId.value() == pDesc->DeviceId;
 
-        // amdxcffx64 needs to see AMD vendor id (upstream 8f2a9435)
+        // amdxcffx64 needs to see AMD vendor id
         auto isFfxDriver = caller.starts_with("amdxcffx64");
         auto keepRealAmd = isFfxDriver && pDesc->VendorId == VendorId::AMD;
 
@@ -179,7 +180,8 @@ HRESULT DxgiSpoofing::hkGetDesc1(IDXGIAdapter1* This, DXGI_ADAPTER_DESC1* pDesc)
 #endif
         }
 
-        if (isFfxDriver || caller.starts_with("amd_fidelityfx_upscaler_dx12"))
+        if (isFfxDriver || caller.starts_with("amd_fidelityfx_upscaler_dx12") ||
+            FfxApiProxy::IsCustomUpscalerModule(Util::GetCallerModule(_ReturnAddress())))
         {
             const auto primaryGpu = IdentifyGpu::getPrimaryGpu();
 

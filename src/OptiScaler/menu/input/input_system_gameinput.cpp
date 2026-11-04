@@ -3,6 +3,8 @@
 #include "pch.h"
 #include "input_system_internal.h"
 
+#include <hooks/Kernel_Hooks.h>
+
 #include <detours/detours.h>
 
 namespace OptiInput
@@ -14,53 +16,50 @@ constexpr wchar_t WindowsGamingInputModuleName[] = L"Windows.Gaming.Input.dll";
 constexpr char GameInputCreateExportName[] = "GameInputCreate";
 
 HMODULE GetAlreadyLoadedModule(const wchar_t* moduleName) { return GetModuleHandleW(moduleName); }
+} // namespace
 
-void RefreshGameInputModuleStateLocked()
+void UpdateGameInputIntegration()
 {
-    _state.GameInputModule = GetAlreadyLoadedModule(GameInputModuleName);
-    _state.WindowsGamingInputModule = GetAlreadyLoadedModule(WindowsGamingInputModuleName);
-
-    _state.GameInputModuleLoaded = _state.GameInputModule != nullptr;
-    _state.WindowsGamingInputModuleLoaded = _state.WindowsGamingInputModule != nullptr;
-
-    if (!_state.GameInputModuleLoaded)
-    {
-        _state.GameInputCreateExportFound = false;
+    if (DiagSkipHookGroup(DiagHookGroup::GameInput))
         return;
-    }
 
-    _state.GameInputCreateExportFound = GetProcAddress(_state.GameInputModule, GameInputCreateExportName) != nullptr;
-}
+    // A module may be mapped before its DllMain has completed
+    HMODULE gameInputModule = GetAlreadyLoadedModule(GameInputModuleName);
+    HMODULE windowsGamingInputModule = GetAlreadyLoadedModule(WindowsGamingInputModuleName);
+    FARPROC gameInputCreate = nullptr;
 
-bool InstallGameInputCreateHookLocked()
-{
-    if (_state.GameInputCreateHookInstalled)
-        return true;
+    if (gameInputModule != nullptr)
+        gameInputCreate = KernelBaseProxy::GetProcAddress_()(gameInputModule, GameInputCreateExportName);
 
-    if (_state.GameInputCreateHookAttempted)
-        return false;
-
-    if (_state.GameInputModule == nullptr)
-        return false;
-
-    FARPROC proc = GetProcAddress(_state.GameInputModule, GameInputCreateExportName);
-
-    if (proc == nullptr)
     {
-        _state.GameInputCreateExportFound = false;
-        return false;
+        std::unique_lock lock(_state.Mutex);
+
+        _state.GameInputModule = gameInputModule;
+        _state.WindowsGamingInputModule = windowsGamingInputModule;
+        _state.GameInputModuleLoaded = gameInputModule != nullptr;
+        _state.WindowsGamingInputModuleLoaded = windowsGamingInputModule != nullptr;
+        _state.GameInputCreateExportFound = gameInputCreate != nullptr;
+
+        if (_state.GameInputCreateHookInstalled || _state.GameInputCreateHookAttempted || gameInputCreate == nullptr)
+        {
+            return;
+        }
+
+        _state.GameInputCreateHookAttempted = true;
+        o_GameInputCreate = reinterpret_cast<GameInputCreate_t>(gameInputCreate);
     }
 
-    _state.GameInputCreateExportFound = true;
-    _state.GameInputCreateHookAttempted = true;
-    o_GameInputCreate = reinterpret_cast<GameInputCreate_t>(proc);
+    LONG result = NO_ERROR;
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-    DetourAttach(reinterpret_cast<PVOID*>(&o_GameInputCreate), hkGameInputCreate);
+    {
+        std::scoped_lock detourLock(GetDetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourAttach(reinterpret_cast<PVOID*>(&o_GameInputCreate), hkGameInputCreate);
+        result = DetourTransactionCommit();
+    }
 
-    const LONG result = DetourTransactionCommit();
-
+    std::unique_lock lock(_state.Mutex);
     _state.GameInputCreateHookInstalled = result == NO_ERROR;
 
     if (!_state.GameInputCreateHookInstalled)
@@ -68,29 +67,15 @@ bool InstallGameInputCreateHookLocked()
         LOG_WARN("GameInputCreate hook installation failed result:{}", result);
         o_GameInputCreate = nullptr;
     }
-
-    return _state.GameInputCreateHookInstalled;
-}
-} // namespace
-
-void UpdateGameInputIntegrationLocked()
-{
-    if (DiagSkipHookGroup(DiagHookGroup::GameInput))
-        return;
-
-    RefreshGameInputModuleStateLocked();
-
-    if (_state.GameInputModuleLoaded && _state.GameInputCreateExportFound)
-        InstallGameInputCreateHookLocked();
 }
 
-void RemoveGameInputHooksLocked()
+bool RemoveGameInputHooksLocked()
 {
     if (!_state.GameInputCreateHookInstalled || o_GameInputCreate == nullptr)
     {
         _state.GameInputCreateHookInstalled = false;
         o_GameInputCreate = nullptr;
-        return;
+        return true;
     }
 
     DetourTransactionBegin();
@@ -100,10 +85,14 @@ void RemoveGameInputHooksLocked()
     const LONG result = DetourTransactionCommit();
 
     if (result != NO_ERROR)
-        LOG_WARN("GameInputCreate hook removal completed with result:{}", result);
+    {
+        LOG_WARN("GameInputCreate hook removal failed result:{}; retaining trampoline for a safe retry", result);
+        return false;
+    }
 
     _state.GameInputCreateHookInstalled = false;
     o_GameInputCreate = nullptr;
+    return true;
 }
 
 HRESULT WINAPI hkGameInputCreate(void** gameInput)

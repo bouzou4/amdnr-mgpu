@@ -3,6 +3,8 @@
 #include "pch.h"
 #include "input_system_internal.h"
 
+#include <hooks/Kernel_Hooks.h>
+
 #include <detours/detours.h>
 
 #include <cstring>
@@ -25,6 +27,23 @@ constexpr GUID DirectInputSysKeyboardGuid = {
 constexpr GUID DirectInputSysMouseGuid = {
     0x6f1d2b60, 0xd5a0, 0x11cf, { 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 }
 };
+
+constexpr std::size_t MaxDirectInputMethodHooks = 8;
+
+template <typename T> struct DirectInputMethodHookSlot
+{
+    bool InUse = false;
+    T Target = nullptr;
+    T Trampoline = nullptr;
+};
+
+std::array<DirectInputMethodHookSlot<DirectInputCreateDevice_t>, MaxDirectInputMethodHooks>
+    DirectInputCreateDeviceHooks {};
+std::array<DirectInputMethodHookSlot<DirectInputDeviceRelease_t>, MaxDirectInputMethodHooks> DirectInputReleaseHooks {};
+std::array<DirectInputMethodHookSlot<DirectInputGetDeviceState_t>, MaxDirectInputMethodHooks>
+    DirectInputGetDeviceStateHooks {};
+std::array<DirectInputMethodHookSlot<DirectInputGetDeviceData_t>, MaxDirectInputMethodHooks>
+    DirectInputGetDeviceDataHooks {};
 
 bool IsDirectInputKeyboardGuid(REFGUID guid) { return IsEqualGUID(guid, DirectInputSysKeyboardGuid) != FALSE; }
 
@@ -76,8 +95,7 @@ bool ShouldBlockDirectInputMouseLocked()
 
 bool ShouldBlockDirectInputOtherLocked()
 {
-    return _state.Initialized && _state.Focused && ShouldApplyBlockingPolicyLocked() &&
-           (_state.BlockKeyboard || _state.BlockMouse);
+    return _state.Initialized && (ShouldBlockKeyboardInputLocked() || ShouldBlockMouseInputLocked());
 }
 
 bool ShouldBlockDirectInputDeviceLocked(DirectInputDeviceKind kind)
@@ -112,6 +130,127 @@ const char* DirectInputDeviceKindName(DirectInputDeviceKind kind)
     }
 }
 
+template <typename T, std::size_t N>
+DirectInputMethodHookSlot<T>*
+FindDirectInputMethodHookByTargetLocked(std::array<DirectInputMethodHookSlot<T>, N>& hooks, T target)
+{
+    if (target == nullptr)
+        return nullptr;
+
+    for (auto& slot : hooks)
+    {
+        if (slot.InUse && slot.Target == target)
+            return &slot;
+    }
+
+    return nullptr;
+}
+
+template <typename T, std::size_t N>
+DirectInputMethodHookSlot<T>* PrepareDirectInputMethodHookLocked(std::array<DirectInputMethodHookSlot<T>, N>& hooks,
+                                                                 T target, bool* needsAttach)
+{
+    if (needsAttach != nullptr)
+        *needsAttach = false;
+
+    if (target == nullptr)
+        return nullptr;
+
+    if (auto* existing = FindDirectInputMethodHookByTargetLocked(hooks, target); existing != nullptr)
+        return existing;
+
+    for (auto& slot : hooks)
+    {
+        if (slot.InUse)
+            continue;
+
+        slot.InUse = true;
+        slot.Target = target;
+        slot.Trampoline = target;
+
+        if (needsAttach != nullptr)
+            *needsAttach = true;
+
+        return &slot;
+    }
+
+    return nullptr;
+}
+
+template <typename T, std::size_t N>
+bool HasDirectInputMethodHooksLocked(const std::array<DirectInputMethodHookSlot<T>, N>& hooks)
+{
+    for (const auto& slot : hooks)
+    {
+        if (slot.InUse)
+            return true;
+    }
+
+    return false;
+}
+
+template <typename T, std::size_t N>
+T FirstDirectInputMethodTrampolineLocked(const std::array<DirectInputMethodHookSlot<T>, N>& hooks)
+{
+    for (const auto& slot : hooks)
+    {
+        if (slot.InUse && slot.Trampoline != nullptr)
+            return slot.Trampoline;
+    }
+
+    return nullptr;
+}
+
+template <typename T, std::size_t N>
+T ResolveDirectInputMethodTrampolineLocked(const std::array<DirectInputMethodHookSlot<T>, N>& hooks, T target)
+{
+    if (target == nullptr)
+        return nullptr;
+
+    for (const auto& slot : hooks)
+    {
+        if (slot.InUse && slot.Target == target)
+            return slot.Trampoline;
+    }
+
+    return nullptr;
+}
+
+void RefreshDirectInputDeviceHookStateLocked()
+{
+    _state.DirectInputDeviceReleaseHookInstalled = HasDirectInputMethodHooksLocked(DirectInputReleaseHooks);
+    _state.DirectInputGetDeviceStateHookInstalled = HasDirectInputMethodHooksLocked(DirectInputGetDeviceStateHooks);
+    _state.DirectInputGetDeviceDataHookInstalled = HasDirectInputMethodHooksLocked(DirectInputGetDeviceDataHooks);
+
+    // Keep the legacy globals valid for diagnostics/compatibility, but do not use them to identify a target.
+    o_DirectInputCreateDeviceA = FirstDirectInputMethodTrampolineLocked(DirectInputCreateDeviceHooks);
+    o_DirectInputCreateDeviceW = o_DirectInputCreateDeviceA;
+    o_DirectInputDeviceRelease = FirstDirectInputMethodTrampolineLocked(DirectInputReleaseHooks);
+    o_DirectInputDeviceGetDeviceState = FirstDirectInputMethodTrampolineLocked(DirectInputGetDeviceStateHooks);
+    o_DirectInputDeviceGetDeviceData = FirstDirectInputMethodTrampolineLocked(DirectInputGetDeviceDataHooks);
+}
+
+void ClearDirectInputMethodHooksLocked()
+{
+    DirectInputCreateDeviceHooks = {};
+    _state.DirectInputCreateDeviceAHookInstalled = false;
+    _state.DirectInputCreateDeviceWHookInstalled = false;
+    DirectInputReleaseHooks = {};
+    DirectInputGetDeviceStateHooks = {};
+    DirectInputGetDeviceDataHooks = {};
+    RefreshDirectInputDeviceHookStateLocked();
+}
+
+void MarkDirectInputDeviceKindSeenLocked(DirectInputDeviceKind kind)
+{
+    if (kind == DirectInputDeviceKind::Keyboard)
+        _state.DirectInputKeyboardDeviceSeen = true;
+    else if (kind == DirectInputDeviceKind::Mouse)
+        _state.DirectInputMouseDeviceSeen = true;
+    else
+        _state.DirectInputOtherDeviceSeen = true;
+}
+
 HMODULE FindLoadedDirectInput8Module() { return GetModuleHandleW(DirectInput8ModuleName); }
 
 HMODULE FindLoadedDirectInputLegacyModule() { return GetModuleHandleW(DirectInputLegacyModuleName); }
@@ -124,9 +263,6 @@ void ClearDirectInputHookPointersLocked()
     o_DirectInputCreateEx = nullptr;
     o_DirectInputCreateDeviceA = nullptr;
     o_DirectInputCreateDeviceW = nullptr;
-    o_DirectInputDeviceGetDeviceState = nullptr;
-    o_DirectInputDeviceGetDeviceData = nullptr;
-    o_DirectInputDeviceRelease = nullptr;
 
     _state.DirectInput8CreateHookInstalled = false;
     _state.DirectInputCreateAHookInstalled = false;
@@ -134,9 +270,8 @@ void ClearDirectInputHookPointersLocked()
     _state.DirectInputCreateExHookInstalled = false;
     _state.DirectInputCreateDeviceAHookInstalled = false;
     _state.DirectInputCreateDeviceWHookInstalled = false;
-    _state.DirectInputGetDeviceStateHookInstalled = false;
-    _state.DirectInputGetDeviceDataHookInstalled = false;
-    _state.DirectInputDeviceReleaseHookInstalled = false;
+
+    ClearDirectInputMethodHooksLocked();
 }
 
 std::size_t FindDirectInputDeviceSlotLocked(void* device)
@@ -193,7 +328,21 @@ void TrackDirectInputDeviceLocked(void* device, DirectInputDeviceKind kind)
 
         if (slot.InUse && slot.Device == device)
         {
-            slot.Kind = kind;
+            // A later CreateDevice call may use an instance GUID that we cannot classify and
+            // therefore reports Other. Never downgrade a known keyboard/mouse classification.
+            if (slot.Kind == DirectInputDeviceKind::Other && kind != DirectInputDeviceKind::Other)
+            {
+                slot.Kind = kind;
+                MarkDirectInputDeviceKindSeenLocked(kind);
+                LOG_INFO("DirectInput device reclassified device:{} kind:{}", device, DirectInputDeviceKindName(kind));
+            }
+            else if (slot.Kind != DirectInputDeviceKind::Other && kind != DirectInputDeviceKind::Other &&
+                     slot.Kind != kind)
+            {
+                LOG_WARN("DirectInput device kind mismatch device:{} existing:{} new:{}; preserving existing kind",
+                         device, DirectInputDeviceKindName(slot.Kind), DirectInputDeviceKindName(kind));
+            }
+
             return;
         }
 
@@ -215,12 +364,7 @@ void TrackDirectInputDeviceLocked(void* device, DirectInputDeviceKind kind)
 
     _state.DirectInputTrackedDeviceCount++;
 
-    if (kind == DirectInputDeviceKind::Keyboard)
-        _state.DirectInputKeyboardDeviceSeen = true;
-    else if (kind == DirectInputDeviceKind::Mouse)
-        _state.DirectInputMouseDeviceSeen = true;
-    else
-        _state.DirectInputOtherDeviceSeen = true;
+    MarkDirectInputDeviceKindSeenLocked(kind);
 
     LOG_INFO("DirectInput device captured device:{} kind:{}", device, DirectInputDeviceKindName(kind));
 }
@@ -240,55 +384,59 @@ bool HookDirectInputDeviceLocked(void* device, DirectInputDeviceKind kind)
     bool attachGetDeviceState = false;
     bool attachGetDeviceData = false;
 
-    if (o_DirectInputDeviceRelease == nullptr)
+    auto* releaseHook = PrepareDirectInputMethodHookLocked(DirectInputReleaseHooks, release, &attachRelease);
+    auto* getDeviceStateHook =
+        PrepareDirectInputMethodHookLocked(DirectInputGetDeviceStateHooks, getDeviceState, &attachGetDeviceState);
+    auto* getDeviceDataHook =
+        PrepareDirectInputMethodHookLocked(DirectInputGetDeviceDataHooks, getDeviceData, &attachGetDeviceData);
+
+    bool completeCoverage = true;
+
+    if (release != nullptr && releaseHook == nullptr)
     {
-        o_DirectInputDeviceRelease = release;
-        attachRelease = o_DirectInputDeviceRelease != nullptr;
-    }
-    else if (o_DirectInputDeviceRelease != release)
-    {
-        LOG_WARN("DirectInput device Release pointer differs, not detouring new pointer device:{}", device);
+        LOG_WARN("DirectInput Release hook table is full, device:{} target:{}", device,
+                 reinterpret_cast<void*>(release));
+        completeCoverage = false;
     }
 
-    if (o_DirectInputDeviceGetDeviceState == nullptr)
+    if (getDeviceState != nullptr && getDeviceStateHook == nullptr)
     {
-        o_DirectInputDeviceGetDeviceState = getDeviceState;
-        attachGetDeviceState = o_DirectInputDeviceGetDeviceState != nullptr;
-    }
-    else if (o_DirectInputDeviceGetDeviceState != getDeviceState)
-    {
-        LOG_WARN("DirectInput GetDeviceState pointer differs, not detouring new pointer device:{}", device);
+        LOG_WARN("DirectInput GetDeviceState hook table is full, device:{} target:{}", device,
+                 reinterpret_cast<void*>(getDeviceState));
+        completeCoverage = false;
     }
 
-    if (o_DirectInputDeviceGetDeviceData == nullptr)
+    if (getDeviceData != nullptr && getDeviceDataHook == nullptr)
     {
-        o_DirectInputDeviceGetDeviceData = getDeviceData;
-        attachGetDeviceData = o_DirectInputDeviceGetDeviceData != nullptr;
-    }
-    else if (o_DirectInputDeviceGetDeviceData != getDeviceData)
-    {
-        LOG_WARN("DirectInput GetDeviceData pointer differs, not detouring new pointer device:{}", device);
+        LOG_WARN("DirectInput GetDeviceData hook table is full, device:{} target:{}", device,
+                 reinterpret_cast<void*>(getDeviceData));
+        completeCoverage = false;
     }
 
     if (!attachRelease && !attachGetDeviceState && !attachGetDeviceData)
     {
         TrackDirectInputDeviceLocked(device, kind);
-        return true;
+        return completeCoverage;
     }
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
+    LONG result = NO_ERROR;
 
-    if (attachRelease)
-        DetourAttach(reinterpret_cast<PVOID*>(&o_DirectInputDeviceRelease), hkDirectInputDeviceRelease);
+    {
+        std::scoped_lock detourLock(GetDetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
 
-    if (attachGetDeviceState)
-        DetourAttach(reinterpret_cast<PVOID*>(&o_DirectInputDeviceGetDeviceState), hkDirectInputGetDeviceState);
+        if (attachRelease)
+            DetourAttach(reinterpret_cast<PVOID*>(&releaseHook->Trampoline), hkDirectInputDeviceRelease);
 
-    if (attachGetDeviceData)
-        DetourAttach(reinterpret_cast<PVOID*>(&o_DirectInputDeviceGetDeviceData), hkDirectInputGetDeviceData);
+        if (attachGetDeviceState)
+            DetourAttach(reinterpret_cast<PVOID*>(&getDeviceStateHook->Trampoline), hkDirectInputGetDeviceState);
 
-    const LONG result = DetourTransactionCommit();
+        if (attachGetDeviceData)
+            DetourAttach(reinterpret_cast<PVOID*>(&getDeviceDataHook->Trampoline), hkDirectInputGetDeviceData);
+
+        result = DetourTransactionCommit();
+    }
 
     if (result != NO_ERROR)
     {
@@ -296,28 +444,33 @@ bool HookDirectInputDeviceLocked(void* device, DirectInputDeviceKind kind)
                   DirectInputDeviceKindName(kind));
 
         if (attachRelease)
-            o_DirectInputDeviceRelease = nullptr;
+            *releaseHook = {};
 
         if (attachGetDeviceState)
-            o_DirectInputDeviceGetDeviceState = nullptr;
+            *getDeviceStateHook = {};
 
         if (attachGetDeviceData)
-            o_DirectInputDeviceGetDeviceData = nullptr;
+            *getDeviceDataHook = {};
 
+        RefreshDirectInputDeviceHookStateLocked();
         return false;
     }
 
+    RefreshDirectInputDeviceHookStateLocked();
+
     if (attachRelease)
-        _state.DirectInputDeviceReleaseHookInstalled = true;
+        LOG_INFO("DirectInput Release target detoured target:{} device:{}", reinterpret_cast<void*>(release), device);
 
     if (attachGetDeviceState)
-        _state.DirectInputGetDeviceStateHookInstalled = true;
+        LOG_INFO("DirectInput GetDeviceState target detoured target:{} device:{}",
+                 reinterpret_cast<void*>(getDeviceState), device);
 
     if (attachGetDeviceData)
-        _state.DirectInputGetDeviceDataHookInstalled = true;
+        LOG_INFO("DirectInput GetDeviceData target detoured target:{} device:{}",
+                 reinterpret_cast<void*>(getDeviceData), device);
 
     TrackDirectInputDeviceLocked(device, kind);
-    return true;
+    return completeCoverage;
 }
 
 bool HookDirectInputInterfaceLocked(void* directInput, bool wide)
@@ -331,53 +484,42 @@ bool HookDirectInputInterfaceLocked(void* directInput, bool wide)
     if (createDevice == nullptr)
         return false;
 
-    if (wide)
+    bool needsAttach = false;
+    auto* slot = PrepareDirectInputMethodHookLocked(DirectInputCreateDeviceHooks, createDevice, &needsAttach);
+
+    if (slot == nullptr)
     {
-        if (_state.DirectInputCreateDeviceWHookInstalled)
-        {
-            if (o_DirectInputCreateDeviceW != createDevice)
-                LOG_WARN("DirectInput W CreateDevice pointer changed, existing hook remains active old:{} new:{}",
-                         reinterpret_cast<void*>(o_DirectInputCreateDeviceW), reinterpret_cast<void*>(createDevice));
-
-            return true;
-        }
-
-        o_DirectInputCreateDeviceW = createDevice;
-    }
-    else
-    {
-        if (_state.DirectInputCreateDeviceAHookInstalled)
-        {
-            if (o_DirectInputCreateDeviceA != createDevice)
-                LOG_WARN("DirectInput A CreateDevice pointer changed, existing hook remains active old:{} new:{}",
-                         reinterpret_cast<void*>(o_DirectInputCreateDeviceA), reinterpret_cast<void*>(createDevice));
-
-            return true;
-        }
-
-        o_DirectInputCreateDeviceA = createDevice;
-    }
-
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-
-    if (wide)
-        DetourAttach(reinterpret_cast<PVOID*>(&o_DirectInputCreateDeviceW), hkDirectInputCreateDeviceW);
-    else
-        DetourAttach(reinterpret_cast<PVOID*>(&o_DirectInputCreateDeviceA), hkDirectInputCreateDeviceA);
-
-    const LONG result = DetourTransactionCommit();
-
-    if (result != NO_ERROR)
-    {
-        LOG_ERROR("DirectInput CreateDevice hook installation failed result:{} wide:{}", result, wide ? 1 : 0);
-
-        if (wide)
-            o_DirectInputCreateDeviceW = nullptr;
-        else
-            o_DirectInputCreateDeviceA = nullptr;
-
+        LOG_ERROR("DirectInput CreateDevice hook table full wide:{} target:{}", wide ? 1 : 0,
+                  reinterpret_cast<void*>(createDevice));
         return false;
+    }
+
+    if (needsAttach)
+    {
+        // ANSI and Unicode CreateDevice have the same ABI. Route every unique
+        // implementation through one detour so a shared A/W implementation is
+        // never attached twice. The interface's vtable identifies the correct
+        // per-target trampoline at call time.
+        LONG result = NO_ERROR;
+
+        {
+            std::scoped_lock detourLock(GetDetourTransactionMutex());
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+            DetourAttach(reinterpret_cast<PVOID*>(&slot->Trampoline), hkDirectInputCreateDeviceA);
+            result = DetourTransactionCommit();
+        }
+
+        if (result != NO_ERROR)
+        {
+            LOG_ERROR("DirectInput CreateDevice hook installation failed result:{} wide:{} target:{}", result,
+                      wide ? 1 : 0, reinterpret_cast<void*>(createDevice));
+            *slot = {};
+            RefreshDirectInputDeviceHookStateLocked();
+            return false;
+        }
+
+        LOG_INFO("DirectInput CreateDevice target detoured target:{}", reinterpret_cast<void*>(createDevice));
     }
 
     if (wide)
@@ -385,7 +527,7 @@ bool HookDirectInputInterfaceLocked(void* directInput, bool wide)
     else
         _state.DirectInputCreateDeviceAHookInstalled = true;
 
-    LOG_INFO("DirectInput CreateDevice hook installed wide:{}", wide ? 1 : 0);
+    RefreshDirectInputDeviceHookStateLocked();
     return true;
 }
 
@@ -435,25 +577,43 @@ void HandleLegacyDirectInputCreatedLocked(void** out, bool wide)
     HookDirectInputInterfaceLocked(*out, wide);
 }
 
-bool InstallDirectInputExportHookLocked(HMODULE module, const char* exportName, void** original, void* hook,
-                                        bool* installed)
+bool InstallDirectInputExportHook(HMODULE module, const char* exportName, void** original, void* hook, bool* installed)
 {
     if (module == nullptr || exportName == nullptr || original == nullptr || hook == nullptr || installed == nullptr)
         return false;
 
-    if (*installed)
-        return true;
+    {
+        std::unique_lock lock(_state.Mutex);
 
-    *original = reinterpret_cast<void*>(GetProcAddress(module, exportName));
+        if (*installed)
+            return true;
+    }
 
-    if (*original == nullptr)
+    void* resolved = reinterpret_cast<void*>(KernelBaseProxy::GetProcAddress_()(module, exportName));
+
+    if (resolved == nullptr)
         return false;
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-    DetourAttach(reinterpret_cast<PVOID*>(original), hook);
+    {
+        std::unique_lock lock(_state.Mutex);
 
-    const LONG result = DetourTransactionCommit();
+        if (*installed)
+            return true;
+
+        *original = resolved;
+    }
+
+    LONG result = NO_ERROR;
+
+    {
+        std::scoped_lock detourLock(GetDetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourAttach(reinterpret_cast<PVOID*>(original), hook);
+        result = DetourTransactionCommit();
+    }
+
+    std::unique_lock lock(_state.Mutex);
 
     if (result != NO_ERROR)
     {
@@ -478,25 +638,31 @@ HRESULT CallDirectInputCreateDeviceOriginal(DirectInputCreateDevice_t original, 
 }
 } // namespace
 
-void UpdateDirectInputIntegrationLocked()
+void UpdateDirectInputIntegration()
 {
     if (DiagSkipHookGroup(DiagHookGroup::DInput))
         return;
 
+    // Module discovery can enter the loader. Do it before publishing state or installing hooks.
     HMODULE module8 = FindLoadedDirectInput8Module();
     HMODULE legacyModule = FindLoadedDirectInputLegacyModule();
 
-    _state.DirectInputModule = module8;
-    _state.DirectInputLegacyModule = legacyModule;
-    _state.DirectInputModuleLoaded = module8 != nullptr || legacyModule != nullptr;
-    _state.DirectInputLegacyModuleLoaded = legacyModule != nullptr;
+    {
+        std::unique_lock lock(_state.Mutex);
+        _state.DirectInputModule = module8;
+        _state.DirectInputLegacyModule = legacyModule;
+        _state.DirectInputModuleLoaded = module8 != nullptr || legacyModule != nullptr;
+        _state.DirectInputLegacyModuleLoaded = legacyModule != nullptr;
+    }
 
     if (module8 != nullptr)
     {
-        if (!InstallDirectInputExportHookLocked(module8, DirectInput8CreateExportName,
-                                                reinterpret_cast<void**>(&o_DirectInput8Create), hkDirectInput8Create,
-                                                &_state.DirectInput8CreateHookInstalled))
+        if (!InstallDirectInputExportHook(module8, DirectInput8CreateExportName,
+                                          reinterpret_cast<void**>(&o_DirectInput8Create), hkDirectInput8Create,
+                                          &_state.DirectInput8CreateHookInstalled))
         {
+            std::unique_lock lock(_state.Mutex);
+
             if (o_DirectInput8Create == nullptr)
             {
                 OPTIINPUT_LOG_VERBOSE("DirectInput8Create export was not found module:{}", static_cast<void*>(module8));
@@ -506,21 +672,21 @@ void UpdateDirectInputIntegrationLocked()
 
     if (legacyModule != nullptr)
     {
-        InstallDirectInputExportHookLocked(legacyModule, DirectInputCreateAExportName,
-                                           reinterpret_cast<void**>(&o_DirectInputCreateA), hkDirectInputCreateA,
-                                           &_state.DirectInputCreateAHookInstalled);
+        InstallDirectInputExportHook(legacyModule, DirectInputCreateAExportName,
+                                     reinterpret_cast<void**>(&o_DirectInputCreateA), hkDirectInputCreateA,
+                                     &_state.DirectInputCreateAHookInstalled);
 
-        InstallDirectInputExportHookLocked(legacyModule, DirectInputCreateWExportName,
-                                           reinterpret_cast<void**>(&o_DirectInputCreateW), hkDirectInputCreateW,
-                                           &_state.DirectInputCreateWHookInstalled);
+        InstallDirectInputExportHook(legacyModule, DirectInputCreateWExportName,
+                                     reinterpret_cast<void**>(&o_DirectInputCreateW), hkDirectInputCreateW,
+                                     &_state.DirectInputCreateWHookInstalled);
 
-        InstallDirectInputExportHookLocked(legacyModule, DirectInputCreateExExportName,
-                                           reinterpret_cast<void**>(&o_DirectInputCreateEx), hkDirectInputCreateEx,
-                                           &_state.DirectInputCreateExHookInstalled);
+        InstallDirectInputExportHook(legacyModule, DirectInputCreateExExportName,
+                                     reinterpret_cast<void**>(&o_DirectInputCreateEx), hkDirectInputCreateEx,
+                                     &_state.DirectInputCreateExHookInstalled);
     }
 }
 
-void RemoveDirectInputHooksLocked()
+bool RemoveDirectInputHooksLocked()
 {
     if (!_state.DirectInput8CreateHookInstalled && !_state.DirectInputCreateAHookInstalled &&
         !_state.DirectInputCreateWHookInstalled && !_state.DirectInputCreateExHookInstalled &&
@@ -530,7 +696,7 @@ void RemoveDirectInputHooksLocked()
     {
         ClearDirectInputHookPointersLocked();
         ClearAllDirectInputDeviceSlotsLocked();
-        return;
+        return true;
     }
 
     DetourTransactionBegin();
@@ -548,28 +714,65 @@ void RemoveDirectInputHooksLocked()
     if (_state.DirectInputCreateExHookInstalled && o_DirectInputCreateEx != nullptr)
         DetourDetach(reinterpret_cast<PVOID*>(&o_DirectInputCreateEx), hkDirectInputCreateEx);
 
-    if (_state.DirectInputCreateDeviceAHookInstalled && o_DirectInputCreateDeviceA != nullptr)
-        DetourDetach(reinterpret_cast<PVOID*>(&o_DirectInputCreateDeviceA), hkDirectInputCreateDeviceA);
+    for (auto& slot : DirectInputCreateDeviceHooks)
+    {
+        if (slot.InUse && slot.Trampoline != nullptr)
+            DetourDetach(reinterpret_cast<PVOID*>(&slot.Trampoline), hkDirectInputCreateDeviceA);
+    }
 
-    if (_state.DirectInputCreateDeviceWHookInstalled && o_DirectInputCreateDeviceW != nullptr)
-        DetourDetach(reinterpret_cast<PVOID*>(&o_DirectInputCreateDeviceW), hkDirectInputCreateDeviceW);
+    for (auto& slot : DirectInputGetDeviceStateHooks)
+    {
+        if (slot.InUse && slot.Trampoline != nullptr)
+            DetourDetach(reinterpret_cast<PVOID*>(&slot.Trampoline), hkDirectInputGetDeviceState);
+    }
 
-    if (_state.DirectInputGetDeviceStateHookInstalled && o_DirectInputDeviceGetDeviceState != nullptr)
-        DetourDetach(reinterpret_cast<PVOID*>(&o_DirectInputDeviceGetDeviceState), hkDirectInputGetDeviceState);
+    for (auto& slot : DirectInputGetDeviceDataHooks)
+    {
+        if (slot.InUse && slot.Trampoline != nullptr)
+            DetourDetach(reinterpret_cast<PVOID*>(&slot.Trampoline), hkDirectInputGetDeviceData);
+    }
 
-    if (_state.DirectInputGetDeviceDataHookInstalled && o_DirectInputDeviceGetDeviceData != nullptr)
-        DetourDetach(reinterpret_cast<PVOID*>(&o_DirectInputDeviceGetDeviceData), hkDirectInputGetDeviceData);
-
-    if (_state.DirectInputDeviceReleaseHookInstalled && o_DirectInputDeviceRelease != nullptr)
-        DetourDetach(reinterpret_cast<PVOID*>(&o_DirectInputDeviceRelease), hkDirectInputDeviceRelease);
+    for (auto& slot : DirectInputReleaseHooks)
+    {
+        if (slot.InUse && slot.Trampoline != nullptr)
+            DetourDetach(reinterpret_cast<PVOID*>(&slot.Trampoline), hkDirectInputDeviceRelease);
+    }
 
     const LONG result = DetourTransactionCommit();
 
     if (result != NO_ERROR)
-        LOG_WARN("DirectInput hook removal completed with result:{}", result);
+    {
+        LOG_WARN("DirectInput hook removal failed result:{}; retaining trampoline tables for a safe retry", result);
+        return false;
+    }
 
     ClearDirectInputHookPointersLocked();
     ClearAllDirectInputDeviceSlotsLocked();
+    return true;
+}
+
+void DrainDirectInputBufferedDataLocked()
+{
+    for (DirectInputDeviceSlot& deviceSlot : _state.DirectInputDeviceSlots)
+    {
+        if (!deviceSlot.InUse || deviceSlot.Device == nullptr)
+            continue;
+
+        PVOID* vtable = *reinterpret_cast<PVOID**>(deviceSlot.Device);
+        auto target = reinterpret_cast<DirectInputGetDeviceData_t>(vtable[10]);
+        DirectInputGetDeviceData_t original =
+            ResolveDirectInputMethodTrampolineLocked(DirectInputGetDeviceDataHooks, target);
+
+        if (original == nullptr)
+            continue;
+
+        const DWORD objectDataSize =
+            deviceSlot.LastObjectDataSize != 0 ? deviceSlot.LastObjectDataSize : sizeof(DIDEVICEOBJECTDATA);
+        DWORD flushCount = INFINITE;
+
+        ScopedHookBypass bypass;
+        original(deviceSlot.Device, objectDataSize, nullptr, &flushCount, 0);
+    }
 }
 
 HRESULT WINAPI hkDirectInput8Create(HINSTANCE instance, DWORD version, REFIID riid, LPVOID* out, LPUNKNOWN outer)
@@ -686,7 +889,20 @@ HRESULT WINAPI hkDirectInputCreateEx(HINSTANCE instance, DWORD version, REFIID r
 
 HRESULT WINAPI hkDirectInputCreateDeviceA(void* directInput, REFGUID guid, void** device, LPUNKNOWN outer)
 {
-    HRESULT result = CallDirectInputCreateDeviceOriginal(o_DirectInputCreateDeviceA, directInput, guid, device, outer);
+    DirectInputCreateDevice_t original = nullptr;
+
+    {
+        std::unique_lock lock(_state.Mutex);
+
+        if (directInput != nullptr)
+        {
+            PVOID* vtable = *reinterpret_cast<PVOID**>(directInput);
+            auto target = reinterpret_cast<DirectInputCreateDevice_t>(vtable[3]);
+            original = ResolveDirectInputMethodTrampolineLocked(DirectInputCreateDeviceHooks, target);
+        }
+    }
+
+    HRESULT result = CallDirectInputCreateDeviceOriginal(original, directInput, guid, device, outer);
 
     {
         std::unique_lock lock(_state.Mutex);
@@ -708,7 +924,20 @@ HRESULT WINAPI hkDirectInputCreateDeviceA(void* directInput, REFGUID guid, void*
 
 HRESULT WINAPI hkDirectInputCreateDeviceW(void* directInput, REFGUID guid, void** device, LPUNKNOWN outer)
 {
-    HRESULT result = CallDirectInputCreateDeviceOriginal(o_DirectInputCreateDeviceW, directInput, guid, device, outer);
+    DirectInputCreateDevice_t original = nullptr;
+
+    {
+        std::unique_lock lock(_state.Mutex);
+
+        if (directInput != nullptr)
+        {
+            PVOID* vtable = *reinterpret_cast<PVOID**>(directInput);
+            auto target = reinterpret_cast<DirectInputCreateDevice_t>(vtable[3]);
+            original = ResolveDirectInputMethodTrampolineLocked(DirectInputCreateDeviceHooks, target);
+        }
+    }
+
+    HRESULT result = CallDirectInputCreateDeviceOriginal(original, directInput, guid, device, outer);
 
     {
         std::unique_lock lock(_state.Mutex);
@@ -730,6 +959,7 @@ HRESULT WINAPI hkDirectInputCreateDeviceW(void* directInput, REFGUID guid, void*
 
 HRESULT WINAPI hkDirectInputGetDeviceState(void* device, DWORD dataSize, LPVOID data)
 {
+    DirectInputGetDeviceState_t original = nullptr;
     bool keyboard = false;
 
     {
@@ -750,15 +980,22 @@ HRESULT WINAPI hkDirectInputGetDeviceState(void* device, DWORD dataSize, LPVOID 
         }
 
         _state.DirectInputGetDeviceStatePassedCount++;
+
+        if (device != nullptr)
+        {
+            PVOID* vtable = *reinterpret_cast<PVOID**>(device);
+            auto target = reinterpret_cast<DirectInputGetDeviceState_t>(vtable[9]);
+            original = ResolveDirectInputMethodTrampolineLocked(DirectInputGetDeviceStateHooks, target);
+        }
     }
 
-    if (o_DirectInputDeviceGetDeviceState == nullptr)
+    if (original == nullptr)
         return DIERR_GENERIC;
 
     HRESULT result = DIERR_GENERIC;
     {
         ScopedHookBypass bypass;
-        result = o_DirectInputDeviceGetDeviceState(device, dataSize, data);
+        result = original(device, dataSize, data);
     }
 
     // AMDNR 0.3.4.2: the held menu key reads as up in the keyboard state (256 bytes at DIK offsets).
@@ -777,81 +1014,121 @@ HRESULT WINAPI hkDirectInputGetDeviceState(void* device, DWORD dataSize, LPVOID 
 HRESULT WINAPI hkDirectInputGetDeviceData(void* device, DWORD objectDataSize, LPDIDEVICEOBJECTDATA data, LPDWORD inOut,
                                           DWORD flags)
 {
+    DirectInputGetDeviceData_t original = nullptr;
+    DirectInputDeviceKind kind = DirectInputDeviceKind::Other;
+    bool shouldBlock = false;
     bool keyboard = false;
 
     {
         std::unique_lock lock(_state.Mutex);
-        const DirectInputDeviceKind kind = GetDirectInputDeviceKindLocked(device);
+        kind = GetDirectInputDeviceKindLocked(device);
         keyboard = kind == DirectInputDeviceKind::Keyboard;
         _state.DirectInputGetDeviceDataCallCount++;
+        shouldBlock = ShouldBlockDirectInputDeviceLocked(kind);
 
-        if (ShouldBlockDirectInputDeviceLocked(kind))
-        {
-            if (inOut != nullptr)
-                *inOut = 0;
-
+        if (shouldBlock)
             _state.DirectInputGetDeviceDataBlockedCount++;
-            OPTIINPUT_LOG_VERBOSE("blocking DirectInput GetDeviceData device:{} kind:{} flags:{}", device,
-                                  DirectInputDeviceKindName(kind), flags);
-            return DI_OK;
-        }
+        else
+            _state.DirectInputGetDeviceDataPassedCount++;
 
-        _state.DirectInputGetDeviceDataPassedCount++;
-    }
-
-    if (o_DirectInputDeviceGetDeviceData == nullptr)
-        return DIERR_GENERIC;
-
-    HRESULT result = DIERR_GENERIC;
-    {
-        ScopedHookBypass bypass;
-        result = o_DirectInputDeviceGetDeviceData(device, objectDataSize, data, inOut, flags);
-    }
-
-    // AMDNR 0.3.4.2: the held menu key's buffered events (dwOfs, the first DWORD of every entry in the DX3 layout
-    // too, equal to its DIK offset) are dropped and the rest closed up; *inOut becomes the count kept.
-    if (SUCCEEDED(result) && keyboard && data != nullptr && inOut != nullptr && *inOut > 0 &&
-        objectDataSize >= sizeof(DWORD))
-    {
-        std::unique_lock lock(_state.Mutex);
-        const int offset = HeldKeyDirectInputOffsetLocked();
-
-        if (offset >= 0)
+        if (device != nullptr)
         {
-            BYTE* const bytes = reinterpret_cast<BYTE*>(data);
-            const DWORD count = *inOut;
-            DWORD kept = 0;
+            const std::size_t deviceSlotIndex = FindDirectInputDeviceSlotLocked(device);
+            if (deviceSlotIndex < MaxTrackedDirectInputDevices && objectDataSize != 0)
+                _state.DirectInputDeviceSlots[deviceSlotIndex].LastObjectDataSize = objectDataSize;
 
-            for (DWORD i = 0; i < count; ++i)
-            {
-                const BYTE* const entry = bytes + static_cast<std::size_t>(i) * objectDataSize;
-                DWORD entryOffset = 0;
-                std::memcpy(&entryOffset, entry, sizeof(entryOffset));
-
-                if (entryOffset == static_cast<DWORD>(offset))
-                    continue;
-
-                if (kept != i)
-                    std::memmove(bytes + static_cast<std::size_t>(kept) * objectDataSize, entry, objectDataSize);
-
-                kept++;
-            }
-
-            *inOut = kept;
+            PVOID* vtable = *reinterpret_cast<PVOID**>(device);
+            auto target = reinterpret_cast<DirectInputGetDeviceData_t>(vtable[10]);
+            original = ResolveDirectInputMethodTrampolineLocked(DirectInputGetDeviceDataHooks, target);
         }
     }
 
-    return result;
+    if (!shouldBlock)
+    {
+        if (original == nullptr)
+            return DIERR_GENERIC;
+
+        HRESULT result = DIERR_GENERIC;
+        {
+            ScopedHookBypass bypass;
+            result = original(device, objectDataSize, data, inOut, flags);
+        }
+
+        // AMDNR 0.3.4.2: the held menu key's buffered events (dwOfs, the first DWORD of every entry in the DX3 layout
+        // too, equal to its DIK offset) are dropped and the rest closed up; *inOut becomes the count kept.
+        if (SUCCEEDED(result) && keyboard && data != nullptr && inOut != nullptr && *inOut > 0 &&
+            objectDataSize >= sizeof(DWORD))
+        {
+            std::unique_lock lock(_state.Mutex);
+            const int offset = HeldKeyDirectInputOffsetLocked();
+
+            if (offset >= 0)
+            {
+                BYTE* const bytes = reinterpret_cast<BYTE*>(data);
+                const DWORD count = *inOut;
+                DWORD kept = 0;
+
+                for (DWORD i = 0; i < count; ++i)
+                {
+                    const BYTE* const entry = bytes + static_cast<std::size_t>(i) * objectDataSize;
+                    DWORD entryOffset = 0;
+                    std::memcpy(&entryOffset, entry, sizeof(entryOffset));
+
+                    if (entryOffset == static_cast<DWORD>(offset))
+                        continue;
+
+                    if (kept != i)
+                        std::memmove(bytes + static_cast<std::size_t>(kept) * objectDataSize, entry, objectDataSize);
+
+                    kept++;
+                }
+
+                *inOut = kept;
+            }
+        }
+
+        return result;
+    }
+
+    // GetDeviceData is backed by a buffered event queue. Returning zero without
+    // touching the real queue lets menu-time events replay after closing the
+    // overlay. Flush the device buffer, then present an empty successful read.
+    if (original != nullptr)
+    {
+        DWORD flushCount = INFINITE;
+        ScopedHookBypass bypass;
+        original(device, objectDataSize, nullptr, &flushCount, 0);
+    }
+
+    if (inOut != nullptr)
+        *inOut = 0;
+
+    OPTIINPUT_LOG_VERBOSE("blocking DirectInput GetDeviceData device:{} kind:{} flags:{}", device,
+                          DirectInputDeviceKindName(kind), flags);
+    return DI_OK;
 }
 
 ULONG WINAPI hkDirectInputDeviceRelease(void* device)
 {
+    DirectInputDeviceRelease_t original = nullptr;
+
+    {
+        std::unique_lock lock(_state.Mutex);
+
+        if (device != nullptr)
+        {
+            PVOID* vtable = *reinterpret_cast<PVOID**>(device);
+            auto target = reinterpret_cast<DirectInputDeviceRelease_t>(vtable[2]);
+            original = ResolveDirectInputMethodTrampolineLocked(DirectInputReleaseHooks, target);
+        }
+    }
+
     ULONG result = 0;
 
-    if (o_DirectInputDeviceRelease != nullptr)
+    if (original != nullptr)
     {
         ScopedHookBypass bypass;
-        result = o_DirectInputDeviceRelease(device);
+        result = original(device);
     }
 
     if (result == 0)

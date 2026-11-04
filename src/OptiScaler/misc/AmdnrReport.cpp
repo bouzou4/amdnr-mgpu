@@ -675,8 +675,8 @@ std::string BuildReportText(const Snapshot& s, const std::vector<std::string>& f
     r += std::format("  Wine/Proton: {}\n", s.wine ? "yes" : "no");
     // (0.3.4.1) The translation layers, as IdentifyGpu found them on the primary adapter (the first in s.gpus)
     r += std::format("  vkd3d-proton (D3D12): {}\n",
-                     !s.gpus.empty() && s.gpus.front().usesVkd3dProton ? "yes" : "no");
-    r += std::format("  DXVK: {}\n", !s.gpus.empty() && s.gpus.front().usesDxvk ? "yes" : "no");
+                     !s.gpus.empty() && s.gpus.front().d3d12IsVkd3dProton ? "yes" : "no");
+    r += std::format("  DXVK: {}\n", !s.gpus.empty() && s.gpus.front().dxgiIsDxvk ? "yes" : "no");
     OSVERSIONINFOW winVer {};
     if (Util::GetRealWindowsVersion(winVer))
         r += std::format("  Windows: {} ({}.{}.{})\n", Util::GetWindowsName(winVer), winVer.dwMajorVersion,

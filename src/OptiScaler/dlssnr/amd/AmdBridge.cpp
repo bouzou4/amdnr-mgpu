@@ -35,7 +35,7 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
-#include "resource.h" // VER_PRODUCT_NAME (ProductName)
+#include "BuildInfo.h" // product name (ProductName)
 #include "NrLooks.h"
 
 // Logger.cpp: this process's session header line (0.3.3.2); empty before BeginLogSession.
@@ -2211,10 +2211,10 @@ std::string SessionHeader()
     if (header.empty()) // no BeginLogSession in this process: the same facts, said here
         header = "AMDNR session start: tick " + std::to_string(GetTickCount64()) + ", pid " +
                  std::to_string(GetCurrentProcessId()) + ", exe=\"" + wstring_to_string(Util::ExePath().filename().wstring()) +
-                 "\", " + VER_PRODUCT_NAME;
+                 "\", " + BuildInfo::ProductName();
     return header;
 }
-const char* ProductName() { return VER_PRODUCT_NAME; }
+const char* ProductName() { return BuildInfo::ProductName(); }
 void NoteToggle(bool on, const char* source)
 {
     auto b = backend.load();

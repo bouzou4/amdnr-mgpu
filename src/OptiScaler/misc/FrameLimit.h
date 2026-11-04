@@ -4,14 +4,17 @@
 
 class FrameLimit
 {
-    static uint64_t get_timestamp();
     static int timer_sleep(int64_t hundred_ns);
     static int busywait_sleep(int64_t ns);
     static int combined_sleep(int64_t ns);
 
   public:
-    // outputPerBase: frames shown per game frame while FG runs (interpolated + 1); 2 = the old assumption
-    static void sleep(bool fgActive, uint32_t outputPerBase = 2);
+    static void sleep(bool fgActive);
+
+    // The presented frame rate to limit to, 0 = none: the FPS limit, or XeFG's Dynamic MFG target while it runs with
+    // "Use target as cap" when that is lower. Every limiter path (Reflex, XeLL, the low latency outputs, this one)
+    // uses it.
+    static float targetFps();
 
     // The tuned wait and clock, exposed so a second pacer does not have to reimplement
     // them. `sleep_ns` is the high-resolution timer with a busy-wait tail and deviation

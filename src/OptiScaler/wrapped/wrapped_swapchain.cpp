@@ -9,21 +9,24 @@
 #include <nvapi/fakenvapi.h>
 #include <hooks/Reflex_Hooks.h>
 #include <hooks/D3D12_Hooks.h>
+#include <with_dx12/dx11_with_dx12_sync.h>
 
 #include <menu/menu_overlay_dx.h>
 
 #include <misc/FrameLimit.h>
 #include <dlssnr/amd/InterleavePacing.h>
 #include <proxies/XeFGPacing.h>
+#include <misc/DeferredRelease.h>
 
 #include <d3d11.h>
 #include <d3d12.h>
 #include <misc/IdentifyGpu.h>
-#include <hooks/Xell_Hooks.h>
+#include <low_latency/input/input_common.h>
+#include <inputs/FG/XeFG_Inputs_Dx12.h>
 
-#ifdef LOW_LATENCY_INPUTS
+#include <magic_enum.hpp>
+
 #include <low_latency/input/input_antilag2.h>
-#endif
 
 #ifdef DXGI_DEBUG_ENABLED
 #include <magic_enum.hpp>
@@ -54,6 +57,126 @@ const GUID IID_IUnwrappedDXGISwapChain = {
 static ID3D12Fence* resizeFence = nullptr;
 static UINT64 resizeFenceValue = 0;
 static HANDLE resizeFenceEvent = nullptr;
+
+static void UpdateOutputColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace)
+{
+    auto& state = State::Instance();
+
+    OutputColorSpace info {};
+    info.dxgiColorSpace = colorSpace;
+
+    switch (colorSpace)
+    {
+        // ------------------------------------------------------------
+        // SDR / Rec.709
+        // ------------------------------------------------------------
+
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+        info.transfer = ColorTransfer::SRGB;
+        info.primaries = ColorPrimaries::Rec709;
+        info.range = ColorRange::Full;
+        info.model = ColorModel::RGB;
+        info.valid = true;
+
+        break;
+
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709:
+        info.transfer = ColorTransfer::SRGB;
+        info.primaries = ColorPrimaries::Rec709;
+        info.range = ColorRange::Studio;
+        info.model = ColorModel::RGB;
+        info.valid = true;
+
+        break;
+
+        // ------------------------------------------------------------
+        // scRGB / linear Rec.709
+        // ------------------------------------------------------------
+
+    case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+        info.transfer = ColorTransfer::Linear;
+        info.primaries = ColorPrimaries::Rec709;
+        info.range = ColorRange::Full;
+        info.model = ColorModel::RGB;
+        info.valid = true;
+
+        break;
+
+        // ------------------------------------------------------------
+        // HDR10 / PQ / Rec.2020
+        // ------------------------------------------------------------
+
+    case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+        info.transfer = ColorTransfer::PQ;
+        info.primaries = ColorPrimaries::Rec2020;
+        info.range = ColorRange::Full;
+        info.model = ColorModel::RGB;
+        info.valid = true;
+
+        break;
+
+    case DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020:
+        info.transfer = ColorTransfer::PQ;
+        info.primaries = ColorPrimaries::Rec2020;
+        info.range = ColorRange::Studio;
+        info.model = ColorModel::RGB;
+        info.valid = true;
+
+        break;
+
+    case DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020:
+    case DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_TOPLEFT_P2020:
+        info.transfer = ColorTransfer::PQ;
+        info.primaries = ColorPrimaries::Rec2020;
+        info.range = ColorRange::Studio;
+        info.model = ColorModel::YCbCr;
+        info.valid = true;
+
+        break;
+
+        // ------------------------------------------------------------
+        // HLG / Rec.2020
+        // ------------------------------------------------------------
+
+    case DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020:
+        info.transfer = ColorTransfer::HLG;
+        info.primaries = ColorPrimaries::Rec2020;
+        info.range = ColorRange::Full;
+        info.model = ColorModel::YCbCr;
+        info.valid = true;
+
+        break;
+
+    case DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020:
+        info.transfer = ColorTransfer::HLG;
+        info.primaries = ColorPrimaries::Rec2020;
+        info.range = ColorRange::Studio;
+        info.model = ColorModel::YCbCr;
+        info.valid = true;
+
+        break;
+
+        // ------------------------------------------------------------
+        // Unknown / unsupported
+        // ------------------------------------------------------------
+
+    default:
+        info.transfer = ColorTransfer::Unknown;
+        info.primaries = ColorPrimaries::Unknown;
+        info.range = ColorRange::Unknown;
+        info.model = ColorModel::Unknown;
+        info.valid = false;
+
+        break;
+    }
+
+    state.outputColorSpace = info;
+
+    LOG_INFO("Output color space updated: DXGI: {}, Transfer: {}, Primaries: {}, Range: {}, Model: {}, Valid: {}",
+             magic_enum::enum_name(info.dxgiColorSpace), magic_enum::enum_name(info.transfer),
+             magic_enum::enum_name(info.primaries), magic_enum::enum_name(info.range),
+             magic_enum::enum_name(info.model), info.valid);
+}
 
 static void WaitForGPUIdle(IUnknown* object)
 {
@@ -161,6 +284,14 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             return ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
     }
 
+    // This lock will delay/prevent release of buffers while present is ongoing
+    std::shared_lock<std::shared_mutex> dx11wDx12PresentLock(Dx11wDx12Sync::PresentResizeMutex(), std::defer_lock);
+    if (State::Instance().swapchainInteropApi == SwapchainInteropApi::Dx11wDx12 &&
+        State::Instance().activeFgOutput == FGOutput::XeFG)
+    {
+        dx11wDx12PresentLock.lock();
+    }
+
     LOG_DEBUG("{}", _frameCounter);
 
     HRESULT presentResult;
@@ -244,7 +375,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     else
         ReflexHooks::update(false, false);
 
-    XellHooks::update();
+    InputCommon::update();
 
     // Upscaler GPU time computation
     if (willPresent && (fg == nullptr || !fg->IsActive() || fg->IsPaused()))
@@ -253,26 +384,32 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         {
             std::optional<double> upscalerTimeOpt {};
 
-            if (cq != nullptr && currentFeature->Api() == API::DX12 && !currentFeature->IsWithDx12())
+            // If using DX11 with DX12 interop
+            if (State::Instance().swapchainInteropApi == SwapchainInteropApi::Dx11wDx12)
+            {
+                if (State::Instance().currentD3D11Device != nullptr &&
+                    (currentFeature->Api() == API::DX11 || currentFeature->IsWithDx12()))
+                {
+                    ID3D11DeviceContext* context = nullptr;
+                    State::Instance().currentD3D11Device->GetImmediateContext(&context);
+
+                    if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context); upscalerTimeOpt.has_value())
+                        currentFeature->ReadDetailedGpuTimes(context, State::Instance().detailedGpuTimes);
+
+                    context->Release();
+                }
+            }
+            // If DX12
+            else if (cq != nullptr && currentFeature->Api() == API::DX12 && !currentFeature->IsWithDx12())
             {
                 if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(cq); upscalerTimeOpt.has_value())
                     currentFeature->ReadDetailedGpuTimes(cq, State::Instance().detailedGpuTimes);
             }
-            else if (device != nullptr)
+            // If DX11
+            else if (device != nullptr && (currentFeature->Api() == API::DX11 || currentFeature->IsWithDx12()))
             {
                 ID3D11DeviceContext* context = nullptr;
                 device->GetImmediateContext(&context);
-
-                if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context); upscalerTimeOpt.has_value())
-                    currentFeature->ReadDetailedGpuTimes(context, State::Instance().detailedGpuTimes);
-
-                context->Release();
-            }
-            if (State::Instance().swapchainInteropApi == SwapchainInteropApi::Dx11wDx12 &&
-                State::Instance().currentD3D11Device != nullptr)
-            {
-                ID3D11DeviceContext* context = nullptr;
-                State::Instance().currentD3D11Device->GetImmediateContext(&context);
 
                 if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context); upscalerTimeOpt.has_value())
                     currentFeature->ReadDetailedGpuTimes(context, State::Instance().detailedGpuTimes);
@@ -327,73 +464,41 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         LOG_DEBUG("Final SyncInterval: {}", SyncInterval);
     }
 
-    // DXVK check, it's here because of upscaler time calculations
-    if (IdentifyGpu::getPrimaryGpu().usesDxvk)
-    {
-        if (pPresentParameters == nullptr)
-            presentResult = pSwapChain->Present(SyncInterval, Flags);
-        else
-            presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
-
-        if (presentResult == S_OK)
-        {
-            LOG_TRACE("3 {}", (UINT) presentResult);
-        }
-        else if (presentResult == DXGI_ERROR_DEVICE_REMOVED)
-        {
-            if (isD3D11)
-            {
-                if (State::Instance().currentD3D11Device != nullptr)
-                    Util::GetDeviceRemovedReason(State::Instance().currentD3D11Device);
-            }
-            else
-            {
-                if (State::Instance().currentD3D12Device != nullptr)
-                    Util::GetDeviceRemovedReason(State::Instance().currentD3D12Device);
-            }
-        }
-        else
-        {
-            LOG_ERROR("3 {:X}", (UINT) presentResult);
-        }
-
-        return presentResult;
-    }
+    ID3D12CommandQueue* fgPresentQueue = nullptr;
+    uint32_t fgFrameMultiplier = 1;
 
     if (willPresent)
     {
         // Tick feature to let it know if it's frozen
         if (auto currentFeature = State::Instance().currentFeature; currentFeature != nullptr)
-            currentFeature->TickFrozenCheck();
+        {
+            if (auto currentFg = State::Instance().currentFG; currentFg != nullptr)
+                currentFeature->TickFrozenCheck(std::max(currentFg->GetInterpolatedFrameCount(), 1u));
+            else
+                currentFeature->TickFrozenCheck();
+        }
 
         // Draw overlay
         MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
 
-#ifdef LOW_LATENCY_INPUTS
-        if (State::Instance().activeFgOutput == FGOutput::FSRFG)
+        if (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG)
         {
             auto fgIsActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
             InputAntiLag2::injectAl2Context(pSwapChain, fgIsActive);
-        }
-#else
-        if (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG)
-        {
-            LOG_DEBUG("Calling fakenvapi");
 
-            static UINT64 fgPresentFrame = 0;
-            auto fgIsActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
-
-            if (State::Instance().fgPresentIsCalled)
+            // For the Reflex output (and AntiLag 2 with XeFG), the generated and real frames' presents as DLSSG
+            // reports them
+            if (fgIsActive && pDevice != nullptr && pDevice->QueryInterface(IID_PPV_ARGS(&fgPresentQueue)) == S_OK)
             {
-                State::Instance().fgPresentIsCalled = false;
-                fgPresentFrame = _frameCounter;
+                fgFrameMultiplier = fg->GetInterpolatedFrameCount() + 1;
+                InputCommon::fg_output_present(fgPresentQueue, false, fgFrameMultiplier);
             }
-
-            auto isInterpolated = fgIsActive && (_frameCounter - fgPresentFrame) > 0;
-
-            fakenvapi::reportFGPresent(pSwapChain, fgIsActive, isInterpolated);
         }
-#endif
+        else
+        {
+            // The game's DLSSG presents through here
+            InputCommon::dlssg_present();
+        }
 
         _frameCounter++;
         State::Instance().frameCount = _frameCounter;
@@ -407,6 +512,14 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     else
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
 
+    DeferredRelease::Process();
+
+    if (fgPresentQueue != nullptr)
+    {
+        InputCommon::fg_output_present(fgPresentQueue, true, fgFrameMultiplier);
+        fgPresentQueue->Release();
+    }
+
     if (presentResult == S_OK)
     {
         LOG_DEBUG("Original present result: {:X}", (UINT) presentResult);
@@ -415,8 +528,18 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     {
         LOG_ERROR("Original present result: {:X}", (UINT) presentResult);
 
-        if (presentResult == DXGI_ERROR_DEVICE_REMOVED && State::Instance().currentD3D12Device != nullptr)
-            Util::GetDeviceRemovedReason(State::Instance().currentD3D12Device);
+        if (presentResult == DXGI_ERROR_DEVICE_REMOVED)
+        {
+            if (isD3D11)
+            {
+                if (State::Instance().currentD3D11Device != nullptr)
+                    Util::GetDeviceRemovedReason(State::Instance().currentD3D11Device);
+            }
+            else if (State::Instance().currentD3D12Device != nullptr)
+            {
+                Util::GetDeviceRemovedReason(State::Instance().currentD3D12Device);
+            }
+        }
     }
 
     return presentResult;
@@ -448,7 +571,7 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
     _real->AddRef();
     auto refCount = _real->Release();
 
-    _device2 = _device;
+    CheckForHdrOutput();
 
     LOG_INFO("{} created, real: {:X}, refCount: {}", _id, (UINT64) real, refCount);
 }
@@ -540,6 +663,13 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::QueryInterface(REFIID riid, vo
     {
         AddRef();
         *ppvObject = (IDXGIDeviceSubObject*) this;
+        return S_OK;
+    }
+    else if (XeFGInputs::IsXeFGSwapChainIID(riid))
+    {
+        // Only checked for, never called
+        AddRef();
+        *ppvObject = this;
         return S_OK;
     }
 
@@ -663,8 +793,9 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
         result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp);
 
         // When Reflex can't be used to limit, sleep in present
+        // DXVK's DXGI presents through Vulkan where the limiter already sleeps
         if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !IdentifyGpu::getPrimaryGpu().usesDxvk && !XellHooks::canLimit())
+            !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !InputCommon::can_limit_fps())
             FrameLimit::sleep(false);
 
         // Paced whether or not Reflex is capping, unlike the limiter above: a cap on the
@@ -791,7 +922,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
     DXGI_SWAP_CHAIN_DESC desc {};
     _real->GetDesc(&desc);
 
-    if (Config::Instance()->FGEnabled.value_or_default())
+    if (Config::Instance()->IsFGEnabled())
     {
         State::Instance().fgResetCapturedResources = true;
         State::Instance().fgOnlyUseCapturedResources = false;
@@ -891,6 +1022,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
         result = _real->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
     }
 
+    // Game recreates its views before the next present, resource tracking filters them by swapchain size
+    if (result == S_OK && _real->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
+        LOG_WARN("Can't get swapchain desc!");
+
     if (result == DXGI_ERROR_DEVICE_REMOVED && State::Instance().currentD3D12Device != nullptr)
         Util::GetDeviceRemovedReason(State::Instance().currentD3D12Device);
 
@@ -985,6 +1120,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
         State::Instance().currentFG->Mutex.unlockThis(3);
     }
 
+    CheckForHdrOutput();
+
     return result;
 }
 
@@ -1048,8 +1185,9 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
         result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp);
 
         // When Reflex can't be used to limit, sleep in present
+        // DXVK's DXGI presents through Vulkan where the limiter already sleeps
         if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !IdentifyGpu::getPrimaryGpu().usesDxvk && !XellHooks::canLimit())
+            !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !InputCommon::can_limit_fps())
             FrameLimit::sleep(false);
 
         // See Present(): paced regardless of the limiter above, and regardless of FG -
@@ -1146,10 +1284,18 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::CheckColorSpaceSupport(DXGI_CO
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)
 {
-    State::Instance().isHdrActive = ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-                                    ColorSpace == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 ||
-                                    ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020 ||
-                                    ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+    auto result = _real3->SetColorSpace1(ColorSpace);
+
+    if (SUCCEEDED(result))
+    {
+        UpdateOutputColorSpace(ColorSpace);
+
+        CheckForHdrOutput();
+
+        LOG_INFO("Output HDR Active: {}", State::Instance().hdrOutputActive);
+
+        MenuOverlayDx::ApplyThemeStyle();
+    }
 
     // What one unit of the buffer means, which is the question the white point is really asking.
     //
@@ -1188,7 +1334,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetColorSpace1(DXGI_COLOR_SPAC
 
     LOG_INFO("DLSS-NR: swapchain colour space {} -- {} ({})", (int) ColorSpace, name, meaning);
 
-    return _real3->SetColorSpace1(ColorSpace);
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height,
@@ -1226,7 +1372,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
     DXGI_SWAP_CHAIN_DESC desc {};
     _real->GetDesc(&desc);
 
-    if (Config::Instance()->FGEnabled.value_or_default())
+    if (Config::Instance()->IsFGEnabled())
     {
         State::Instance().fgResetCapturedResources = true;
         State::Instance().fgOnlyUseCapturedResources = false;
@@ -1349,6 +1495,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
                                         ppPresentQueue);
     }
 
+    // Game recreates its views before the next present, resource tracking filters them by swapchain size
+    if (result == S_OK && _real->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
+        LOG_WARN("Can't get swapchain desc!");
+
     if (result == DXGI_ERROR_DEVICE_REMOVED && State::Instance().currentD3D12Device != nullptr)
         Util::GetDeviceRemovedReason(State::Instance().currentD3D12Device);
 
@@ -1440,6 +1590,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
         LOG_TRACE("Releasing ffxMutex: {}", State::Instance().currentFG->Mutex.getOwner());
         State::Instance().currentFG->Mutex.unlockThis(3);
     }
+
+    CheckForHdrOutput();
 
     return result;
 }

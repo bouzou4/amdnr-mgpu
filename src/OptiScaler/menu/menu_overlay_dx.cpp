@@ -15,8 +15,13 @@
 #include <imgui/imgui_impl_win32.h>
 #include <misc/DiagSwitches.h>
 
+#include "menu_common.h"
+#include <shaders/menu_blur/MenuBlur_Dx11.h>
+#include <shaders/menu_blur/MenuBlur_Dx12.h>
+
 // menu
-static int const NUM_BACK_BUFFERS = 8;
+// Sized for the largest swapchain DXGI allows, the menu can draw on chains created by other layers
+static int const NUM_BACK_BUFFERS = 16; // DXGI_MAX_SWAP_CHAIN_BUFFERS
 static int const SRV_HEAP_SIZE = 64;
 static bool _dx11Device = false;
 static bool _dx12Device = false;
@@ -25,6 +30,7 @@ static bool _dx12Device = false;
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static ID3D11RenderTargetView* g_pd3dRenderTarget = nullptr;
+static std::unique_ptr<MenuBlur_Dx11> g_menuBlurDx11;
 
 // for dx12
 static ID3D12Device* g_pd3dDeviceParam = nullptr;
@@ -36,41 +42,16 @@ static ID3D12GraphicsCommandList* g_pd3dCommandList = nullptr;
 static ID3D12CommandAllocator* g_commandAllocators[NUM_BACK_BUFFERS] = {};
 static ID3D12Resource* g_mainRenderTargetResource[NUM_BACK_BUFFERS] = {};
 static D3D12_CPU_DESCRIPTOR_HANDLE g_mainRenderTargetDescriptor[NUM_BACK_BUFFERS] = {};
+static std::unique_ptr<MenuBlur_Dx12> g_menuBlur;
+
+// Tracks GPU completion of menu command lists so an allocator is never reset while still executing
+static ID3D12Fence* g_menuFence = nullptr;
+static HANDLE g_menuFenceEvent = nullptr;
+static UINT64 g_menuFenceValue = 0;
+static UINT64 g_allocatorFenceValues[NUM_BACK_BUFFERS] = {};
 
 // current command queue for dx12 swapchain
 static IUnknown* currentSCCommandQueue = nullptr;
-
-// AMDNR 0.3.3 (MFG stutter, D). The eight allocators above used to be picked by
-// GetCurrentBackBufferIndex(), so with a three-buffer swapchain only three were ever used,
-// and each was Reset with no fence - about every 10 ms at 300 presents/s, while the GPU
-// was 10 ms or more behind on the present queue. All 43 of the exact 100 ms stalls in the
-// Silent Hill 2 9X/10X logs fell inside this overlay. Now the eight are taken in turn and
-// each carries the fence value its last submission signalled: an allocator is only reused
-// once the GPU has passed that value, nothing ever waits on the fence, and when the next
-// allocator is still in flight this present goes without the overlay instead.
-//
-// Only the next one in turn is ever considered. One queue retires in order, so if it is
-// not done none of the newer ones is either; and ImGui's own eight vertex/index buffer
-// sets (NumFramesInFlight = NUM_BACK_BUFFERS) advance once per draw too, so they stay
-// covered by the same fences. If the fence cannot be created, or a Signal fails, the
-// overlay goes back to the old per-back-buffer allocators.
-//
-// Known gap, left for 0.3.4 (review of 0.3.3; not a regression, the old code had no fence
-// at all). ImGui's TEXTURES are not covered the same way. A skipped present still runs
-// ImGui::NewFrame (RenderMenu) and ImGui::Render before the fence check, and ImGui 1.92
-// counts every NewFrame toward a WantDestroy texture's UnusedFrames (imgui_draw.cpp), while
-// the DX12 backend destroys it at UnusedFrames >= NumFramesInFlight inside RenderDrawData
-// (imgui_impl_dx12.cpp). After skips, that draw's fence only proves the draw eight DRAWS
-// back is done, not the last draw that sampled the texture. It needs a replaced font atlas
-// (new glyphs or a new scale, e.g. the menu opening) while the GPU is more than eight
-// overlay draws behind (9X/10X). Fix for 0.3.4: do the next-allocator check before
-// ImGui_ImplDX12_NewFrame / RenderMenu (RenderMenu also runs the hotkeys and frame timing,
-// so that needs its own pass), or hold a WantDestroy texture until the fence value of the
-// last draw that used it has completed.
-static ID3D12Fence* g_overlayFence = nullptr;
-static UINT64 g_overlayFenceValue = 0;
-static UINT64 g_allocatorFenceValues[NUM_BACK_BUFFERS] = {};
-static UINT g_nextAllocator = 0;
 
 // The rate-limited WARN timing (D): which step of an overlay present took over 20 ms,
 // and how many presents went without the overlay. One line a second at most.
@@ -140,9 +121,8 @@ static void NoteOverlaySkipped()
     if (!OverlayMayWarn(OverlayQpcNow()))
         return;
 
-    LOG_WARN("Overlay skipped on this present: all {} command allocators are still in flight on the GPU "
-             "({} skipped since the last warning)",
-             NUM_BACK_BUFFERS, g_overlaySkipped);
+    LOG_WARN("Overlay skipped on this present: the menu fence wait failed ({} skipped since the last warning)",
+             g_overlaySkipped);
 
     g_overlaySkipped = 0;
 }
@@ -269,13 +249,16 @@ static void CreateRenderTargetDx12(ID3D12Device* device, IDXGISwapChain* pSwapCh
         return;
     }
 
+    if (sd.BufferCount > NUM_BACK_BUFFERS)
+    {
+        LOG_ERROR("Swapchain has {} buffers, menu supports {}", sd.BufferCount, NUM_BACK_BUFFERS);
+        return;
+    }
+
     for (UINT i = 0; i < sd.BufferCount; ++i)
     {
         ID3D12Resource* pBackBuffer = nullptr;
         auto result = pSwapChain->GetBuffer(i, IID_PPV_ARGS(&pBackBuffer));
-
-        if (pBackBuffer != nullptr)
-            pBackBuffer->Release();
 
         if (result != S_OK)
         {
@@ -302,16 +285,19 @@ static void CleanupRenderTargetDx12(bool clearQueue)
     if (!_isInited || !_dx12Device || State::Instance().isShuttingDown)
         return;
 
-    LOG_TRACE("clearQueue: {}", clearQueue);
-
     for (UINT i = 0; i < NUM_BACK_BUFFERS; ++i)
     {
-        if (g_mainRenderTargetResource[i])
-            g_mainRenderTargetResource[i] = nullptr;
+        SAFE_RELEASE(g_mainRenderTargetResource[i]);
     }
+
+    LOG_TRACE("clearQueue: {}", clearQueue);
 
     if (clearQueue)
     {
+        // Uses a descriptor from the ImGui heap, needs to go before it
+        MenuCommon::SetBackgroundBlur(ImTextureID_Invalid);
+        g_menuBlur.reset();
+
         if (MenuOverlayBase::IsInited() && g_pd3dDeviceParam != nullptr && g_pd3dSrvDescHeap != nullptr &&
             ImGui::GetIO().BackendRendererUserData)
         {
@@ -325,15 +311,20 @@ static void CleanupRenderTargetDx12(bool clearQueue)
         for (UINT i = 0; i < NUM_BACK_BUFFERS; ++i)
         {
             SAFE_RELEASE(g_commandAllocators[i]);
-            g_allocatorFenceValues[i] = 0;
         }
 
-        // AMDNR 0.3.3: the allocators' fence goes with them.
-        SAFE_RELEASE(g_overlayFence);
-        g_overlayFenceValue = 0;
-        g_nextAllocator = 0;
-
         SAFE_RELEASE(g_pd3dCommandList);
+
+        SAFE_RELEASE(g_menuFence);
+
+        if (g_menuFenceEvent != nullptr)
+        {
+            CloseHandle(g_menuFenceEvent);
+            g_menuFenceEvent = nullptr;
+        }
+
+        g_menuFenceValue = 0;
+        memset(g_allocatorFenceValues, 0, sizeof(g_allocatorFenceValues));
 
         if (g_pd3dCommandQueue != nullptr)
             g_pd3dCommandQueue = nullptr;
@@ -375,6 +366,9 @@ static void CleanupRenderTargetDx11(bool shutDown)
         LOG_FUNC();
 
     SAFE_RELEASE(g_pd3dRenderTarget);
+
+    MenuCommon::SetBackgroundBlur(ImTextureID_Invalid);
+    g_menuBlurDx11.reset();
 
     if (g_pd3dDevice != nullptr)
         g_pd3dDevice = nullptr;
@@ -440,13 +434,37 @@ static void RenderImGui_DX11(IDXGISwapChain* pSwapChain)
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
 
+            ID3D11Texture2D* backBuffer = nullptr;
+            pSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+
+            // Blur textures are only created once the menu is opened, menu decides if they are used
+            bool blurReady = false;
+            if (backBuffer != nullptr && (g_menuBlurDx11 || MenuOverlayBase::IsVisible()))
+            {
+                if (!g_menuBlurDx11)
+                    g_menuBlurDx11 = std::make_unique<MenuBlur_Dx11>("MenuBlur", g_pd3dDevice);
+
+                blurReady = g_menuBlurDx11->Prepare(backBuffer);
+            }
+
+            if (blurReady)
+                MenuCommon::SetBackgroundBlur(g_menuBlurDx11->TextureId(), g_menuBlurDx11->UVScale());
+            else
+                MenuCommon::SetBackgroundBlur(ImTextureID_Invalid);
+
             if (MenuOverlayBase::RenderMenu())
             {
                 ImGui::Render();
 
+                if (blurReady && MenuCommon::BackgroundBlurUsed())
+                    g_menuBlurDx11->Dispatch(g_pd3dDeviceContext, backBuffer);
+
                 g_pd3dDeviceContext->OMSetRenderTargets(1, &g_pd3dRenderTarget, NULL);
                 ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
             }
+
+            if (backBuffer != nullptr)
+                backBuffer->Release();
         }
     }
 }
@@ -573,19 +591,6 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                 return;
             }
 
-            g_allocatorFenceValues[i] = 0;
-        }
-
-        // AMDNR 0.3.3 (MFG stutter, D): one fence value per allocator, see g_overlayFence.
-        // Without the fence the overlay keeps the old per-back-buffer allocators.
-        g_overlayFenceValue = 0;
-        g_nextAllocator = 0;
-        SAFE_RELEASE(g_overlayFence);
-
-        if (device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_overlayFence)) != S_OK)
-        {
-            g_overlayFence = nullptr;
-            LOG_WARN("Overlay fence could not be created, command allocators stay per back buffer");
         }
 
         result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_commandAllocators[0], NULL,
@@ -608,6 +613,21 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
             pSwapChain->Release();
             return;
         }
+
+        result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_menuFence));
+        g_menuFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (result != S_OK || g_menuFenceEvent == nullptr)
+        {
+            LOG_ERROR("CreateFence: {0:X}, event: {1:X}", (unsigned long) result, (size_t) g_menuFenceEvent);
+            MenuOverlayBase::HideMenu();
+            CleanupRenderTargetDx12(true);
+            pSwapChain->Release();
+            return;
+        }
+
+        g_menuFence->SetName(L"MenuFence");
+        g_menuFenceValue = 0;
+        memset(g_allocatorFenceValues, 0, sizeof(g_allocatorFenceValues));
 
         DXGI_SWAP_CHAIN_DESC scDesc;
         pSwapChain->GetDesc(&scDesc);
@@ -647,11 +667,34 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
         {
             _showRenderImGuiDebugOnce = true;
 
+            UINT backBufferIdx = pSwapChain->GetCurrentBackBufferIndex();
+
+            if (backBufferIdx >= NUM_BACK_BUFFERS || !g_mainRenderTargetResource[backBufferIdx])
+            {
+                pSwapChain->Release();
+                return;
+            }
+
             ImGui_ImplDX12_NewFrame();
 
             // AMDNR 0.3.3 (D): timed, for the rate-limited WARN; and the total is handed to
             // the XeFG pacing engine, which takes it back out of its present timing.
             const int64_t menuStart = OverlayQpcNow();
+
+            // Blur textures are only created once the menu is opened, menu decides if they are used
+            bool blurReady = false;
+            if (g_menuBlur || MenuOverlayBase::IsVisible())
+            {
+                if (!g_menuBlur)
+                    g_menuBlur = std::make_unique<MenuBlur_Dx12>("MenuBlur", device, &g_pd3dSrvDescHeapAlloc);
+
+                blurReady = g_menuBlur->Prepare(g_mainRenderTargetResource[backBufferIdx]);
+            }
+
+            if (blurReady)
+                MenuCommon::SetBackgroundBlur(g_menuBlur->TextureId(), g_menuBlur->UVScale());
+            else
+                MenuCommon::SetBackgroundBlur(ImTextureID_Invalid);
 
             if (MenuOverlayBase::RenderMenu())
             {
@@ -661,32 +704,26 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
 
                 const int64_t allocatorStart = OverlayQpcNow();
 
-                UINT backBufferIdx = pSwapChain->GetCurrentBackBufferIndex();
+                const bool blurMenu = blurReady && MenuCommon::BackgroundBlurUsed();
+                ID3D12CommandAllocator* commandAllocator = g_commandAllocators[backBufferIdx];
 
-                // AMDNR 0.3.3 (D): the next allocator in turn, if the GPU is done with it;
-                // otherwise no overlay on this present. Never waits. Without the fence,
-                // the old per-back-buffer choice.
-                int allocatorSlot = -1;
-                ID3D12CommandAllocator* commandAllocator = nullptr;
-
-                if (g_overlayFence != nullptr)
+                // Previous command list recorded with this allocator might still be executing
+                const UINT64 waitValue = g_allocatorFenceValues[backBufferIdx];
+                if (g_menuFence != nullptr && g_menuFence->GetCompletedValue() < waitValue)
                 {
-                    const UINT slot = g_nextAllocator % NUM_BACK_BUFFERS;
+                    DWORD waitResult = WAIT_FAILED;
 
-                    if (g_allocatorFenceValues[slot] > g_overlayFence->GetCompletedValue())
+                    if (g_menuFence->SetEventOnCompletion(waitValue, g_menuFenceEvent) == S_OK)
+                        waitResult = WaitForSingleObject(g_menuFenceEvent, 2000);
+
+                    if (waitResult != WAIT_OBJECT_0)
                     {
+                        LOG_ERROR("Menu fence wait failed: {:X}", waitResult);
                         NoteOverlaySkipped();
                         XeFGPacing::NoteOverlayTime(OverlayQpcNow() - menuStart);
                         pSwapChain->Release();
                         return;
                     }
-
-                    allocatorSlot = static_cast<int>(slot);
-                    commandAllocator = g_commandAllocators[slot];
-                }
-                else
-                {
-                    commandAllocator = g_commandAllocators[backBufferIdx];
                 }
 
                 auto result = commandAllocator->Reset();
@@ -716,6 +753,17 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                     return;
                 }
 
+                if (blurMenu)
+                {
+                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    g_pd3dCommandList->ResourceBarrier(1, &barrier);
+
+                    g_menuBlur->Dispatch(g_pd3dCommandList, g_mainRenderTargetResource[backBufferIdx], backBufferIdx);
+
+                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                }
+
                 g_pd3dCommandList->ResourceBarrier(1, &barrier);
                 g_pd3dCommandList->OMSetRenderTargets(1, &g_mainRenderTargetDescriptor[backBufferIdx], FALSE, NULL);
                 g_pd3dCommandList->SetDescriptorHeaps(1, &g_pd3dSrvDescHeap);
@@ -740,24 +788,14 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                 ID3D12CommandList* ppCommandLists[] = { g_pd3dCommandList };
                 ((ID3D12CommandQueue*) currentSCCommandQueue)->ExecuteCommandLists(1, ppCommandLists);
 
-                // AMDNR 0.3.3 (D): mark the allocator's work, and move on to the next one.
-                // A Signal that fails would leave the allocator waiting on a value that never
-                // comes, so the fence is dropped and the old per-back-buffer choice returns.
-                if (allocatorSlot >= 0 && g_overlayFence != nullptr)
+                if (g_menuFence != nullptr)
                 {
-                    const UINT64 value = g_overlayFenceValue + 1;
+                    result = ((ID3D12CommandQueue*) currentSCCommandQueue)->Signal(g_menuFence, ++g_menuFenceValue);
 
-                    if (((ID3D12CommandQueue*) currentSCCommandQueue)->Signal(g_overlayFence, value) == S_OK)
-                    {
-                        g_overlayFenceValue = value;
-                        g_allocatorFenceValues[allocatorSlot] = value;
-                        g_nextAllocator = (static_cast<UINT>(allocatorSlot) + 1) % NUM_BACK_BUFFERS;
-                    }
+                    if (result == S_OK)
+                        g_allocatorFenceValues[backBufferIdx] = g_menuFenceValue;
                     else
-                    {
-                        LOG_WARN("Overlay fence Signal failed, command allocators go back to per back buffer");
-                        SAFE_RELEASE(g_overlayFence);
-                    }
+                        LOG_ERROR("Menu fence Signal: {:X}", (unsigned long) result);
                 }
 
                 const int64_t submitEnd = OverlayQpcNow();
@@ -911,3 +949,5 @@ void MenuOverlayDx::Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     if (device12 != nullptr)
         device12->Release();
 }
+
+void MenuOverlayDx::ApplyThemeStyle() { MenuOverlayBase::ApplyThemeStyle(); }

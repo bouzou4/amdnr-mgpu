@@ -5,9 +5,11 @@
 #include "misc/Quirks.h"
 #include "misc/SkipSpoof.h"
 #include "framegen/IFGFeature_Dx12.h"
-#include <inputs/FG/Streamline_Inputs_Dx12.h>
+#include "framegen/IFGFeature_Vk.h"
+#include <inputs/FG/Streamline_Inputs.h>
 #include <inputs/FG/Streamline_Inputs_Sl1_Dx12.h>
 
+#include <chrono>
 #include <set>
 #include <deque>
 #include <mutex>
@@ -43,12 +45,37 @@ enum class FGInput : uint32_t
     ForceXeLL, // Do not expose this option
 };
 
+template <> struct EnumConfig<FGInput>
+{
+    static constexpr auto default_value = FGInput::NoFG;
+
+    static constexpr std::pair<FGInput, std::string_view> mapping[] = {
+        { FGInput::NoFG, "NoFG" },       { FGInput::Upscaler, "Upscaler" },   { FGInput::DLSSG, "DLSSG" },
+        { FGInput::NvngxFG, "NvngxFG" }, { FGInput::FSRFG, "FSRFG" },         { FGInput::FSRFG30, "FSRFG30" },
+        { FGInput::XeFG, "XeFG" },       { FGInput::ForceXeLL, "ForceXeLL" },
+    };
+};
+
 enum class FGOutput : uint32_t
 {
     NoFG,
     FSRFG,
     DLSSG,
     XeFG,
+    Reprojection
+};
+
+template <> struct EnumConfig<FGOutput>
+{
+    static constexpr auto default_value = FGOutput::NoFG;
+
+    static constexpr std::pair<FGOutput, std::string_view> mapping[] = {
+        { FGOutput::NoFG, "NoFG" },
+        { FGOutput::FSRFG, "FSRFG" },
+        { FGOutput::DLSSG, "DLSSG" },
+        { FGOutput::XeFG, "XeFG" },
+        { FGOutput::Reprojection, "Reprojection" },
+    };
 };
 
 enum class FGNvngxReplacement : uint32_t
@@ -58,6 +85,7 @@ enum class FGNvngxReplacement : uint32_t
     Arturs,
     FFX,
     Combo,
+    Custom, // State::fgNvngxCustom folder in custom
 };
 
 enum class WorkingMode : uint32_t
@@ -89,6 +117,48 @@ enum class SwapchainInteropApi : uint32_t
     Dx11wDx12,
 };
 
+enum class ColorTransfer : uint32_t
+{
+    Unknown,
+    SRGB,
+    Linear,
+    PQ,
+    HLG
+};
+
+enum class ColorPrimaries : uint32_t
+{
+    Unknown,
+    Rec709,
+    Rec2020
+};
+
+enum class ColorRange : uint32_t
+{
+    Unknown,
+    Full,
+    Studio
+};
+
+enum class ColorModel : uint32_t
+{
+    Unknown,
+    RGB,
+    YCbCr
+};
+
+struct OutputColorSpace
+{
+    DXGI_COLOR_SPACE_TYPE dxgiColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+
+    ColorTransfer transfer = ColorTransfer::SRGB;
+    ColorPrimaries primaries = ColorPrimaries::Rec709;
+    ColorRange range = ColorRange::Full;
+    ColorModel model = ColorModel::RGB;
+
+    bool valid = false;
+};
+
 typedef struct CapturedHudlessInfo
 {
     UINT64 usageCount = 1;
@@ -107,8 +177,11 @@ class State
 
     std::string gameExe;
     std::string gameName;
+    // Counts from when the dll is attached to the process
+    std::chrono::steady_clock::time_point startTime { std::chrono::steady_clock::now() };
     std::string gameVersion;
     GameEngineType gameEngine = GameEngineType::Other;
+    bool isWindows10 = false;
 
     bool nvngxDx11Inited = false;
     bool nvngxDx12Inited = false;
@@ -120,6 +193,9 @@ class State
     // Reseting on creation of new feature
     std::optional<bool> autoExposure;
 
+    // Passed through from the game's FFX create flags
+    bool dynamicResolution = false;
+
     // FG
     uint64_t fgLastFrame = 0;
 
@@ -129,7 +205,6 @@ class State
     bool dlssgDebugView = false;
     bool dlssgInterpolatedOnly = false;
     uint64_t dlssgLastFrame = 0;
-    uint32_t delayMenuRenderBy = 0;
 
     // FSR Common
     float lastFsrCameraNear = 0.0f;
@@ -142,9 +217,11 @@ class State
     std::string fgNote; // why the FG output differs from the ini (native XeSS FG present), shown in the Frame Gen tab
     // This should be set to a non-None value only if all other requirements are met and nvngx can be used
     FGNvngxReplacement activeFgNvngx = FGNvngxReplacement::None;
+    std::string fgNvngxCustom;
+    std::string activeFgNvngxCustom;
 
     // Streamline FG inputs
-    Sl_Inputs_Dx12 slFGInputs = {};
+    Sl_Inputs slFGInputs = {};
     // The last sl::Constants the title published, kept whole. Ray Regeneration needs
     // the view and projection matrices, and the FG input path above only keeps the
     // fields frame generation happens to use.
@@ -161,12 +238,11 @@ class State
     Sl1_Inputs_Dx12 s_sl1FGInputs {};
 
     // OptiFG
-    bool fgPresentIsCalled = false;
     bool fgOnlyGenerated = false;
     bool fgHudlessCompare = false;
     bool fgChanged = false;
     bool scChanged = false;
-    bool skipHeapCapture = false;
+    inline static thread_local bool skipHeapCapture = false;
 
     bool fgCaptureResources = false;
     size_t fgCapturedResourceCount = 0;
@@ -200,6 +276,14 @@ class State
     HMODULE optiSlReflex = nullptr;
     HMODULE optiSlPCL = nullptr;
     HMODULE optiDLSSG = nullptr;
+
+    // One of the modules of OptiScaler's own Streamline (DLSSG output)
+    bool IsOptiStreamlineModule(HMODULE module) const
+    {
+        return module != nullptr && optiSlInterposer != nullptr &&
+               (module == optiSlInterposer || module == optiSlCommon || module == optiSlDLSSG ||
+                module == optiSlReflex || module == optiSlPCL || module == optiDLSSG);
+    }
 
     // NGX OTA
     std::string NGX_OTA_Dlss;
@@ -237,10 +321,13 @@ class State
     bool reflexLimitsFps = false;
     bool reflexShowWarning = false;
     bool rtssReflexInjection = false;
-    bool fakenvapiReloadLowLatency = false;
     UINT64 reflexFrameId = 0;
     UINT64 frameCount = 0;
     bool vkAntiLagSupported = false;
+
+    // AMD driver flip metering
+    bool amdFlipMeterCreated = false;
+    uint32_t amdFlipMeterMode = 0;
 
     // for realtime changes
     ankerl::unordered_dense::map<unsigned int, bool> changeBackend;
@@ -262,9 +349,17 @@ class State
 
     bool WAR_xefgRequestFGToggle = false;
 
+    // XeFG Dynamic MFG with "Use target as cap": its target while it runs (0 = no cap), the FPS limit when lower
+    float xefgDynamicCapFps = 0.0f;
+
     bool dlssgGameDMFGSupported = false;
     sl::DLSSGMode dlssgLastSetMode = sl::DLSSGMode::eOff;
     int dlssgDetectedInterpolationCount = 0;
+
+    // What the game requested from DLSSG when it's used as FG Input
+    // This might need to get moved to Sl_Inputs
+    bool dlssgInputGameEnabled = false;
+    int dlssgInputGameInterpolationCount = 1;
 
     // DLSS
     bool dlssPresetsOverriddenExternally = false;
@@ -296,9 +391,24 @@ class State
     // quirks
     std::vector<std::string> detectedQuirks {};
 
+    // ASI plugins loaded from the plugins folder, late-load ones are added from another thread
+    struct LoadedAsiPlugin
+    {
+        std::string name;
+        std::string version;
+    };
+    std::vector<LoadedAsiPlugin> loadedAsiPlugins {};
+    std::mutex loadedAsiPluginsMutex;
+
     // FFX
-    std::vector<const char*> ffxUpscalerVersionNames {};
-    std::vector<uint64_t> ffxUpscalerVersionIds {};
+    // Separate lists as DX12 (incl. w/Dx12) and Vulkan FFX can report different upscalers
+    struct FfxVersionList
+    {
+        std::vector<const char*> names {};
+        std::vector<uint64_t> ids {};
+    };
+    FfxVersionList ffxUpscalerVersionsDx12 {};
+    FfxVersionList ffxUpscalerVersionsVk {};
     std::vector<const char*> ffxFGVersionNames {};
     std::vector<uint64_t> ffxFGVersionIds {};
     std::optional<uint32_t> currentFsr4Preset {};
@@ -311,7 +421,9 @@ class State
 
     // Vulkan stuff
     bool vulkanCreatingSC = false;
-    bool creatingD3DDevice = false;
+    // Per thread, it's only meant for the call chain of the thread creating the device
+    // and overlapping ScopedCreatingD3DDevice from different threads could leave it stuck
+    inline static thread_local bool creatingD3DDevice = false;
     bool vulkanSkipHooks = false;
     VkInstance VulkanInstance = nullptr;
 
@@ -321,6 +433,8 @@ class State
     std::vector<DetailedGpuTime> detailedGpuTimes;
     double lastFGFrameTime = 0.0;
     double presentFrameTime = 0.0;
+    // Time the game's last present to the FG swapchain took, with the FPS limiter's sleep (V-Sync, a full queue)
+    double lastFGPresentMs = 0.0;
     std::mutex frameTimeMutex;
 
     // Opti checking if everything is setup correctly on game launch
@@ -348,13 +462,15 @@ class State
 
     // HDR
     std::vector<IUnknown*> scBuffers;
-    bool isHdrActive = false;
+    OutputColorSpace outputColorSpace {};
+    bool hdrOutputActive = false;
 
     std::optional<ApiUpscalerInput> setInputApiName;
     ApiUpscalerInput currentInputApiName;
 
     bool isShuttingDown = false;
     std::set<PVOID> modulesToFree;
+    std::mutex modulesToFreeMutex;
 
     // menu warnings
     bool fgSettingsChanged = false;
@@ -367,6 +483,7 @@ class State
 
     IFeature* currentFeature = nullptr;
     IFGFeature_Dx12* currentFG = nullptr;
+    IFGFeature_Vk* currentVkFG = nullptr;
     IDXGISwapChain* currentSwapchain = nullptr;
     IDXGISwapChain* currentWrappedSwapchain = nullptr;
     IDXGISwapChain* currentRealSwapchain = nullptr;
@@ -379,6 +496,20 @@ class State
 
     std::vector<ID3D12Device*> d3d12Devices;
     std::vector<ID3D11Device*> d3d11Devices;
+
+    // The FG output of whichever API the game uses
+    IFGFeature* CurrentFG() const
+    {
+        if (currentFG != nullptr)
+            return currentFG;
+
+        return currentVkFG;
+    }
+
+    bool FGSwapchainExists() const
+    {
+        return currentFGSwapchain != nullptr || (currentVkFG != nullptr && currentVkFG->HasSwapchain());
+    }
 
     static UINT GetOwner()
     {

@@ -338,7 +338,7 @@ struct Context
         // more precision, so it is decoded the same way. With HDR active it is PQ-encoded,
         // which the encoding pass cannot undo yet, so that case is refused with the reason.
         const bool sdr8 = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                          (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM && !State::Instance().isHdrActive);
+                          (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM && !State::Instance().hdrOutputActive);
         const bool hdr16 = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (!sdr8 && !hdr16)
         {

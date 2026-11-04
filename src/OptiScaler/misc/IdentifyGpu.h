@@ -56,8 +56,10 @@ struct GpuInformation
     uint32_t subsystemId = 0x0;
     uint32_t revisionId = 0x0;
     size_t dedicatedVramInBytes = 0;
-    bool usesDxvk = false;
-    bool usesVkd3dProton = false;
+    // Only says which implementation backs the API, not that the game renders through it
+    // Use IdentifyGpu::gameUsesDxvk/gameUsesVkd3dProton for that
+    bool dxgiIsDxvk = false;         // Adapter was enumerated through DXVK's DXGI
+    bool d3d12IsVkd3dProton = false; // D3D12 device creation goes through vkd3d-proton
     bool softwareAdapter = false;
     std::filesystem::path driverStore {};
 
@@ -66,6 +68,9 @@ struct GpuInformation
     FSR4Support fsr4Support {};
     FSR4Support realFsr4Support {};
     device_info::HwGeneration amdHwGeneration = device_info::HwGeneration::kUndefinedGeneration;
+    uint32_t amdAsicFamily = 0; // amdgpu family from the kernel driver, 0 if unknown
+    uint32_t amdAsicRevision = 0;
+    FSR4Support fsr4DriverModel {}; // FSR 4 model the driver would pick
 
     // Nvidia
     bool dlssCapable = false;
@@ -101,6 +106,14 @@ class IdentifyGpu
     // gfx115x (890M, 880M, Z2 Extreme, Radeon 8060S / 8050S, 860M, 840M), by the same card table lookup as isRdna4. An id
     // the table does not list is not RDNA 3 here (no probe answers it).
     static bool isRdna3(const GpuInformation& gpu);
+
+    // Game is rendering through the translation layer, based on the API it's currently using
+    static bool gameUsesDxvk();
+    static bool gameUsesVkd3dProton();
+
     static void updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3D12CreateDevice = nullptr);
-    static void updateInt8Support(std::optional<bool>& sdkSupportsInt8, std::optional<bool>& amdxcffx64SupportsInt8);
+    static void updateInt8Support(bool sdkSupportsInt8, bool driverSupportsInt8);
+
+    static bool queryAmdAsicInfo(LUID luid, uint32_t vendorId, uint32_t deviceId, uint32_t& family, uint32_t& revision);
+    static FSR4Support getFsr4ModelForAsic(uint32_t family, uint32_t revision, uint32_t deviceId, bool asicInfoValid);
 };
