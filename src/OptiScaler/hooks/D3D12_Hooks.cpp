@@ -1346,7 +1346,7 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
     if (MgpuHost::InternalDeviceCreate())
         return o_D3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
     if (MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
-        pAdapter = MgpuHost::AdapterForDevice(pAdapter);
+        pAdapter = MgpuHost::AdapterForDevice(pAdapter, _ReturnAddress());
 
 #ifdef ENABLE_DEBUG_LAYER_DX12
     LOG_WARN("Debug layers active!");

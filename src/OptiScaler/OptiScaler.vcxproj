@@ -316,6 +316,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="mgpu\MgpuSwapChain.cpp" />
     <ClCompile Include="mgpu\MgpuGpuLoad.cpp" />
     <ClCompile Include="mgpu\MgpuHost.cpp" />
+    <ClCompile Include="mgpu\MgpuDump.cpp" />
     <ClCompile Include="dlssnr\amd\AmdBridge.cpp" />
     <ClCompile Include="dlssnr\lmxxf\LmxxfBackend.cpp" />
     <ClInclude Include="dlssnr\amd\AmdPreSr.h" />
