@@ -443,6 +443,7 @@ bool NrEngine::CreateSession()
         return Fail("PrepareSession failed: " + std::to_string(rc) + " " + _rt.LastError()), false;
     _frameInfoSize = 0;
     _sessionFull = false;
+    _mpHistoryRefused = false;
     return true;
 }
 
@@ -490,7 +491,7 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
 
     // Motion-fed history: the temporal layout, sizes with and without the exposure tail
     _stats.temporal = false;
-    if (_settings.History() && _rt.temporal != 0 && _motion.res != nullptr)
+    if (_settings.History() && _rt.temporal != 0 && _motion.res != nullptr && !(_settings.Passes() > 1 && _mpHistoryRefused))
     {
         LmxxfNrFrameInfoTemporalExt t {};
         memcpy(&t, &fi, LMXXF_NR_FRAME_INFO_V1_SIZE);
@@ -505,7 +506,7 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
         if (t.history_reset)
             _resetFrame = _frameId;
         _extentReset = false;
-        t.passes = 1;
+        t.passes = (uint32_t) _settings.Passes();
         t.exposure = fi.exposure;
         t.exposure_state = fi.exposure_state;
         t.pre_exposure = fi.pre_exposure;
@@ -533,7 +534,15 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
             if (_rt.temporal == 1)
                 break;
         }
-        if (_rt.temporal != 1)
+        if (_settings.Passes() > 1)
+        {
+            // an older runtime takes history with one pass only: this session runs without it
+            if (!_mpHistoryRefused)
+                Log(OptiLog_Info, "runtime takes no motion-fed history with %d passes (%s): single-frame NR",
+                    _settings.Passes(), _rt.LastError().c_str());
+            _mpHistoryRefused = true;
+        }
+        else if (_rt.temporal != 1)
         {
             Log(OptiLog_Info, "runtime takes no motion-fed history (%s): single-frame NR", _rt.LastError().c_str());
             _rt.temporal = 0;

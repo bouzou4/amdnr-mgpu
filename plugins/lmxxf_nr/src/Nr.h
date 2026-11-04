@@ -41,7 +41,7 @@ struct NrSettings
     int32_t model = 0; // 0 Full (71 blocks), 1 Small (31 blocks)
     int32_t passes = 1; // Full only: DLSS5_MULTI_PASS 1..3, the network run N times per frame
     int32_t Passes() const { return model == 0 ? passes : 1; }
-    bool History() const { return temporal && Passes() == 1; } // the runtime's history needs one pass
+    bool History() const { return temporal && Passes() <= 2; } // 3 passes: the runtime's history needs no prediction
     int32_t style = 0; // NVIDIA NGX style, 0 = NVIDIA's default look
     float strength = 1.0f;
     float uiLow = 0.004f;  // terminal: back buffer vs HUD-less difference where UI starts (encoded units)
@@ -256,6 +256,7 @@ class NrEngine
     bool _extentReset = false;
     bool _forceFull = false; // warm-up job that moves the runtime's model pin, see WarmUp
     bool _sessionFull = false; // this session's last frame had FULL_NETWORK
+    bool _mpHistoryRefused = false; // the runtime refused history with this pass count
     uint32_t _loggedMvFlags = ~0u;
     uint64_t _motionUpscale = 0; // upscale frame of _motion
     void LogMotion(const OptiUpscaleFrame* f);

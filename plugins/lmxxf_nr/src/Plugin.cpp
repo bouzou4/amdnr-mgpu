@@ -227,7 +227,7 @@ void DrawTab(void*)
         presetOff[i] = why != nullptr;
         tip += std::string(r.name) + ": " + (r.model == 1 ? "Small" : "Full") + ", " + kSizes[(int) r.size] + ", " +
                std::to_string(r.passes) + (r.passes == 1 ? " pass" : " passes") +
-               (r.temporal && r.passes == 1 ? ", history on" : ", history off (more than one pass)") +
+               (r.temporal && r.passes <= 2 ? ", history on" : ", history off") +
                ".\n    One GPU: " + r.cost + (why ? std::string(".\n    Unavailable: ") + why : std::string()) + ".\n";
     }
     presetNames[kPresetCount] = "Custom";
@@ -297,8 +297,8 @@ void DrawTab(void*)
     g_api->ItemTooltip(!rt.Models() ? "This runtime has one model (no DLSS5_MULTI_PASS)"
                                     : "DLSS5_MULTI_PASS: the Full network runs N times per frame for a stronger style.\n"
                                       "Full model only: the runtime runs Small once (DLSS5_MULTI_PASS 0.5).\n"
-                                      "3 predicts its third pass unless DLSS5_MULTI_PASS_PREDICT=0 is set. 2 and 3 run\n"
-                                      "without network history (the runtime's history takes one pass).");
+                                      "3 predicts its third pass unless DLSS5_MULTI_PASS_PREDICT=0 is set. 2 keeps the network\n"
+                                      "history when the runtime takes it with 2 passes; 3 runs without it.");
     if (rt.Models() && g_ui.model != 0 && g_ui.passes > 1)
         g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "Passes apply to the Full model: pick Full to use them.");
 
