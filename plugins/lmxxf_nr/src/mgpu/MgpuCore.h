@@ -64,6 +64,7 @@ struct Env
     // NR on the display card, recorded and submitted on `queue`. True = wrote `in.dst`.
     std::function<bool(ID3D12Device*, ID3D12CommandQueue*, const NrInput& in)> nrFrame;
     std::function<bool()> nrWanted;
+    std::function<void()> nrSettle; // before the present of a frame nrFrame ran on
     std::function<std::string()> nrStatus;
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it

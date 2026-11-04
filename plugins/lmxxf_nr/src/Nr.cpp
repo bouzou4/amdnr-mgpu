@@ -1237,6 +1237,18 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
     queue->Signal(_presentFence.Get(), _presentValue[slot]);
 }
 
+// A present queued behind the wait on the network page-faults the display device: present once it is done
+void NrEngine::SettleOwn()
+{
+    const uint64_t value = _answerWait;
+    _answerWait = 0;
+    if (value == 0 || !_hipFence || _hipFence->GetCompletedValue() >= value)
+        return;
+    static thread_local HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (e && SUCCEEDED(_hipFence->SetEventOnCompletion(value, e)))
+        WaitForSingleObject(e, 1000);
+}
+
 bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
 {
     if (_termCopy && _termCopy->GetDesc().Width == bd.Width && _termCopy->GetDesc().Height == bd.Height &&
@@ -1371,6 +1383,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         }
         lock.unlock();
         SubmitOwn(queue, slot, list, wait);
+        _answerWait = wait;
         return wrote;
     }
 
@@ -1389,6 +1402,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     Produce(list, nullptr, wait);
     lock.unlock();
     SubmitOwn(queue, slot, list, wait);
+    _answerWait = wait;
     return wrote;
 }
 

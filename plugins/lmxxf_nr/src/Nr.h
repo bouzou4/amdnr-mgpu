@@ -96,6 +96,7 @@ class NrEngine
         uint32_t encoding = 1; // 0 linear, 1 sRGB, 2 PQ
     };
     bool RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in);
+    void SettleOwn(); // before presenting a RunOwn frame: its network answer is done
     // Leaves the session alone: the game card's engine while the display card runs NR
     void SetSuspended(bool s) { _suspended = s; }
     bool Suspended() const { return _suspended; }
@@ -166,6 +167,7 @@ class NrEngine
     bool _suspended = false;
     ID3D12GraphicsCommandList* NextOwnList(uint32_t* slot);
     void SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12GraphicsCommandList* list, uint64_t wait);
+    uint64_t _answerWait = 0;
     bool EnsureCopies(const D3D12_RESOURCE_DESC& d);
     // Frame dump on <dumpDir>\lmxxf_nr_dump.trigger: the network output, what it was fed, and the result
     void MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result = nullptr,

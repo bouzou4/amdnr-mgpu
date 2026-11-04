@@ -77,7 +77,7 @@ Uncapped menu, FSR 4 output 3840x2160, terminal placement (HUD-less) on one card
 | Multi-GPU, Full 1080, history on | 56.2 | 19.4 | 8.4 | 8.2 |
 | Multi-GPU, Small native 2560x1440, history on | 56.8 | 19.1 | 8.2 | 8.0 |
 
-Multi-GPU is render card bound (93 % busy) with NR in every case; the display card is 37-46 % busy with NR, 18 % without. The multi-GPU rows need `MgpuDred=true`: without it the display device hangs (`DXGI_ERROR_DEVICE_HUNG`) within a second of the first network frame with this runtime (not with AMDNR's pair, and not in `nr_sequence` on the same card); open.
+Multi-GPU is render card bound (93 % busy) with NR in every case; the display card is 37-46 % busy with NR, 18 % without. With NR every frame the presenter holds the real present until the frame's network answer is done: a present queued on the display queue behind the still unresolved wait on the HIP answer page-faulted the display device (`DXGI_ERROR_DEVICE_HUNG`, DRED device state page fault, at the present) within a second of the first network frame. DRED breadcrumbs hid it by serialising the queue, and AMDNR's pair never hit it. The rows above were measured with `MgpuDred=true` before that fix; without DRED the fixed build runs about 0.4 ms per frame slower (render 18.3-18.4 ms against 17.7-18.0).
 
 History on game frames (`tools/seq_metrics.py`, 7 sequences of 12 frames per run, Small 1080; the menu camera is mostly still with occasional pans):
 

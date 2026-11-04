@@ -201,6 +201,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
             fn();
     };
     e.nrFrame = NrFrame;
+    e.nrSettle = [] { DisplayEngine().SettleOwn(); };
     e.nrWanted = [] { return Engine().Settings().enabled; };
     e.nrStatus = []
     {

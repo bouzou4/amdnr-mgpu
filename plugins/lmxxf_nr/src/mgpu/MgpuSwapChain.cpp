@@ -860,6 +860,8 @@ void ProxySwapChain::PresenterLoop()
             if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
+            if (env.nrSettle)
+                env.nrSettle();
             BOOL fs = FALSE;
             _real->GetFullscreenState(&fs, nullptr);
             UINT pf = flags & ~(UINT) DXGI_PRESENT_ALLOW_TEARING;
