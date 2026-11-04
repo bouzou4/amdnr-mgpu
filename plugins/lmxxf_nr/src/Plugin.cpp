@@ -32,6 +32,7 @@ const char* const kPlacements[] = { "Before upscaling", "After upscaling", "Term
 const char* const kSizes[] = { "1080 tier", "1440 (2560x1440)", "Native" };
 const char* const kModels[] = { "Full (71 blocks)", "Small (31 blocks)" };
 const char* const kStyles[] = { "0 (NVIDIA look)", "1", "2" };
+const char* const kPasses[] = { "1", "2 (about 2x the network)", "3 (2 run + 1 predicted, about 2x)" };
 
 void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
 {
@@ -45,6 +46,7 @@ NrSettings ReadSettings()
     s.placement = (Placement) std::clamp(g_api->GetInt(g_plugin, "Placement", 1), 0, 2);
     s.size = (NetworkSize) std::clamp(g_api->GetInt(g_plugin, "NetworkSize", 0), 0, 2);
     s.model = std::clamp(g_api->GetInt(g_plugin, "Model", 0), 0, 1);
+    s.passes = std::clamp(g_api->GetInt(g_plugin, "MultiPass", 1), 1, 3);
     s.style = std::clamp(g_api->GetInt(g_plugin, "Style", 0), 0, 2);
     s.strength = std::clamp(g_api->GetFloat(g_plugin, "Strength", 1.0f), 0.0f, 2.0f);
     s.motion = g_api->GetBool(g_plugin, "MotionVectors", true);
@@ -61,6 +63,7 @@ void WriteSettings(const NrSettings& s)
     g_api->SetInt(g_plugin, "Placement", (int32_t) s.placement);
     g_api->SetInt(g_plugin, "NetworkSize", (int32_t) s.size);
     g_api->SetInt(g_plugin, "Model", s.model);
+    g_api->SetInt(g_plugin, "MultiPass", s.passes);
     g_api->SetInt(g_plugin, "Style", s.style);
     g_api->SetFloat(g_plugin, "Strength", s.strength);
     g_api->SetBool(g_plugin, "MotionVectors", s.motion);
@@ -182,6 +185,17 @@ void DrawTab(void*)
     g_api->ItemTooltip(rt.Models() ? "Full: the 71-block model, Small: 31 blocks (DLSS5_MULTI_PASS 1 / 0.5)"
                                    : "This runtime has one model (no DLSS5_MULTI_PASS)");
 
+    g_api->Disabled(!rt.Models() || g_ui.model != 0);
+    int32_t pass = g_ui.passes - 1;
+    if (g_api->Combo("Passes", &pass, kPasses, 3, nullptr))
+        g_ui.passes = pass + 1, changed = true;
+    g_api->Disabled(false);
+    g_api->ItemTooltip(!rt.Models() ? "This runtime has one model (no DLSS5_MULTI_PASS)"
+                       : g_ui.model != 0 ? "Full model only (Small is one pass)"
+                                         : "DLSS5_MULTI_PASS: the Full network runs N times per frame for a stronger style.\n"
+                                           "3 predicts its third pass unless DLSS5_MULTI_PASS_PREDICT=0 is set. 2 and 3 run\n"
+                                           "without network history (the runtime's history takes one pass).");
+
     g_api->Disabled(!rt.Styles());
     if (g_api->Combo("Style", &g_ui.style, kStyles, 3, nullptr))
         changed = true;
@@ -206,7 +220,7 @@ void DrawTab(void*)
         WriteSettings(g_ui);
         g_api->SaveSettings(g_plugin);
     }
-    g_api->TextDisabled("Size, model and style rebuild the network (a few seconds without NR).");
+    g_api->TextDisabled("Size, model, passes and style rebuild the network (a few seconds without NR).");
 
     g_api->Section("Runtime");
     if (rt.module == nullptr)
@@ -259,7 +273,8 @@ bool OverlayText(char* buf, size_t size, void*)
     }
     NrEngine& nr = MgpuActive() ? DisplayEngine() : Engine();
     const NrStats st = nr.Stats();
-    const char* model = nr.GetRuntime().Models() ? (s.model == 1 ? " Small" : " Full") : "";
+    const char* fulls[] = { " Full", " Full x2", " Full x3" };
+    const char* model = nr.GetRuntime().Models() ? (s.model == 1 ? " Small" : fulls[std::clamp(s.passes, 1, 3) - 1]) : "";
     if (st.state != "running")
         snprintf(buf, size, "%s", st.state.c_str());
     else if (st.networkMs > 0)

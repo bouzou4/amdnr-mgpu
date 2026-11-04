@@ -12,7 +12,7 @@ Nothing of the runtime ships with the plugin. It looks for a user-installed `Lmx
 - **lmxxf's own package layout**: `DLSS5-AMD\native-game-tiled-assets\HIP\SHA256SUMS` + the HIP modules, weights in `native-game-tiled-assets\`. The runtime gets the HIP folder as `assets_directory`.
 - **A runtime + `LmxxfNrRuntime.pak` beside it** (compatibility): for a repackaged runtime that keeps lmxxf's ABI v1 prefix. It gets only lmxxf's v1 functions and the 64-byte frame info every lmxxf-derived runtime reads the same way; a larger function table is accepted by size probing and only its v1 prefix is used.
 
-`DLSS5_*` settings the runtime knows (found by name in the dll) are set in the process environment before the session is created; the menu greys out what the runtime does not read. A runtime with lmxxf's history ABI (sole export, `GetTimings`, `history_supported = 1`, the `temporal` branch of lmxxf) gets the 168-byte temporal frame info, `FULL_NETWORK` for the Full model, and its history network built during the warm-up.
+`DLSS5_*` settings the runtime knows (found by name in the dll) are set in the process environment before the session is created; the menu greys out what the runtime does not read. `MultiPass` 2 / 3 ("Passes" in the menu, Full model only) runs the network two or three times per frame for a stronger style: the session is rebuilt off the render thread, without `FULL_NETWORK` (which pins the runtime to one pass) and without history (the runtime's history takes one pass). The runtime keeps the pass count of the last `FULL_NETWORK` frame process-wide, so after a Full session the warm-up runs one `FULL_NETWORK` job before the real one to release it (also for Small). Network time on the temporal runtime, 1080 tier (`nr_sequence --perf`): 1 pass 10.4 ms, 2 passes 22.3 ms, 3 passes 17.7 ms (its default `DLSS5_MULTI_PASS_PREDICT=1` predicts the third pass). A runtime with lmxxf's history ABI (sole export, `GetTimings`, `history_supported = 1`, the `temporal` branch of lmxxf) gets the 168-byte temporal frame info, `FULL_NETWORK` for the Full model, and its history network built during the warm-up.
 
 Install: `<game>\OptiScaler\plugins\lmxxf_nr.asi` (OptiScaler's `MainDllPath` plugins folder) and in `OptiScaler.ini`:
 
@@ -24,6 +24,7 @@ LoadAsiPlugins=true
 Placement=1        ; 0 before upscaling, 1 after upscaling, 2 terminal (HUD-less, at present)
 NetworkSize=0      ; 0 1080 tier, 1 2560x1440, 2 native (1 and 2 need DLSS5_NETWORK_FREE_RES)
 Model=0            ; 0 Full (71 blocks), 1 Small (31 blocks), DLSS5_MULTI_PASS 1 / 0.5
+MultiPass=1        ; Full only: 1-3 network passes per frame (DLSS5_MULTI_PASS), 2 and 3 without history
 Style=0            ; DLSS5_STYLE, 0 = NVIDIA's look
 Strength=1.0
 Temporal=true      ; motion-fed network history, when the runtime takes it

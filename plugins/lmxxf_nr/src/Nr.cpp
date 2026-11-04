@@ -173,7 +173,7 @@ void NrEngine::Configure(const NrSettings& s)
     _settings = s;
     // A history session drops adaptive ViT reuse: toggling history rebuilds it off the render thread
     _dirty = s.size != _active.size || s.model != _active.model || s.style != _active.style ||
-             (_rt.Native() && s.temporal != _active.temporal);
+             s.Passes() != _active.Passes() || (_rt.Native() && s.History() != _active.History());
 }
 
 NrSettings NrEngine::Settings()
@@ -231,7 +231,10 @@ void NrEngine::ApplyEnv()
         SetRuntimeEnv("DLSS5_STYLE", styles[std::clamp(_settings.style, 0, 2)]);
     }
     if (_rt.envMultiPass)
-        SetRuntimeEnv("DLSS5_MULTI_PASS", _settings.model == 1 ? "0.5" : "1");
+    {
+        const char* passes[] = { "1", "2", "3" };
+        SetRuntimeEnv("DLSS5_MULTI_PASS", _settings.model == 1 ? "0.5" : passes[std::clamp(_settings.Passes(), 1, 3) - 1]);
+    }
 }
 
 bool NrEngine::InitDevice(ID3D12Device* device, ID3D12CommandQueue* gameQueue)
@@ -409,6 +412,9 @@ bool NrEngine::CreateSession()
     return true;
 }
 
+// The runtime keeps the pass count of the last FULL_NETWORK frame process-wide (dlss5_mode::Request)
+static bool g_fullSent = false;
+
 bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* frame)
 {
     LmxxfNrFrameInfo fi {};
@@ -420,7 +426,11 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
     fi.color_height = _feedH;
     fi.color = _feed.Get();
     fi.color_state = kRead;
-    fi.flags = _rt.Native() && _settings.model == 0 ? LMXXF_NR_FRAME_FLAG_FULL_NETWORK_EXT : 0;
+    // FULL_NETWORK pins the runtime to one Full pass; 2-3 passes are DLSS5_MULTI_PASS without the flag
+    const bool full = _rt.Native() && ((_settings.model == 0 && _settings.Passes() == 1) || _forceFull);
+    fi.flags = full ? LMXXF_NR_FRAME_FLAG_FULL_NETWORK_EXT : 0;
+    if (full)
+        g_fullSent = true;
     fi.transfer_strength = 1.0f;
     fi.color_strength = 1.0f;
     fi.model_scale = 1.0f;
@@ -443,7 +453,7 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
 
     // Motion-fed history: the temporal layout, sizes with and without the exposure tail
     _stats.temporal = false;
-    if (_settings.temporal && _rt.temporal != 0 && _motion.res != nullptr)
+    if (_settings.History() && _rt.temporal != 0 && _motion.res != nullptr)
     {
         LmxxfNrFrameInfoTemporalExt t {};
         memcpy(&t, &fi, LMXXF_NR_FRAME_INFO_V1_SIZE);
@@ -570,10 +580,19 @@ void NrEngine::DrainJob()
 bool NrEngine::WarmUp()
 {
     const DWORD t0 = GetTickCount();
+    // A pin from an earlier Full session is released only by a FULL frame followed by one without it
+    if (_rt.Native() && g_fullSent && !(_settings.model == 0 && _settings.Passes() == 1) && !_forceFull)
+    {
+        _forceFull = true;
+        const bool ok = WarmUp();
+        _forceFull = false;
+        if (!ok)
+            return false;
+    }
     _ownAlloc->Reset();
     _ownList->Reset(_ownAlloc.Get(), nullptr);
     _motion = {};
-    if (_settings.temporal && _rt.Native())
+    if (_settings.History() && _rt.Native() && !_forceFull)
     {
         // Builds the history network now rather than at the first frame with vectors (values unused on a reset)
         _motion.res = _feed.Get();
@@ -598,8 +617,9 @@ bool NrEngine::WarmUp()
     DrainJob();
     WaitIdle();
     _motion = {};
-    Log(OptiLog_Info, "network ready for %ux%u in %lu ms (%s, history %d)", _feedW, _feedH, GetTickCount() - t0,
-        _rt.Native() ? (_settings.model == 0 ? "Full" : "Small") : "runtime's model", (int) _stats.temporal);
+    Log(OptiLog_Info, "network ready for %ux%u in %lu ms (%s, %d pass(es), history %d)%s", _feedW, _feedH,
+        GetTickCount() - t0, _rt.Native() ? (_settings.model == 0 || _forceFull ? "Full" : "Small") : "runtime's model",
+        _forceFull ? 1 : _settings.Passes(), (int) _stats.temporal, _forceFull ? " [model pin reset]" : "");
     return true;
 }
 
