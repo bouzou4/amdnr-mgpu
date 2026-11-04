@@ -122,7 +122,7 @@ Two transfer layouts follow, both a single hop from the game's image to system m
 - **(a) The ring heap created on the render card's D3D12 device**, opened on the display card, imported into the game's `VkDevice`. The plugin keeps a small D3D12 device on R only for this heap and the fences.
 - **(b) Host pages** imported into the game's `VkDevice` and opened on the display card with `OpenExistingHeapFromAddress`. This is spec-clean on the Vulkan side and needs no D3D12 device on R for memory. It is vkd3d-proton's own mapping of cross-adapter heaps.
 
-(a) relies on behaviour the driver doesn't advertise; (b) relies on a "diagnostic" D3D12 heap type. Both pass the probe. Section 5 compares their speed; the PoC should implement (b) first, with (a) behind a switch.
+(a) relies on behaviour the driver doesn't advertise; (b) relies on a "diagnostic" D3D12 heap type. Both pass the probe. Section 5 measures (b) at 2.08 ms per 4K frame. The PoC implements (b) first, with (a) behind a switch.
 
 ### 4.3 Semaphores and fences (Q2)
 
@@ -179,7 +179,23 @@ There is no GPU peer-to-peer on Windows between these cards (`mgpu/tools/optinr_
 - Host pages imported on both sides are the same thing under another name.
 - The only difference between paths is the hops inside the render card's VRAM before the system-memory write.
 
-BENCH_RESULTS
+Bench (`xapi_probe bench`, idle GPUs under the lock queue): 3840x2160 R10G10B10A2 (33.2 MB), GPU timestamps, median of 30. Every row ends with the display card's texture compared byte for byte against the source: 0 mismatched bytes in all rows.
+
+| Path | Render card | Display card ingest |
+|---|---|---|
+| D3D12 texture → ring (today) | 2.360 ms (14.1 GB/s, 0.071 ms/MB) | 1.160 ms (28.6 GB/s) |
+| D3D11 → NT-shared texture (D3D11 `CopyResource`) → D3D12 → ring | 0.060 ms D3D11 copy + 2.358 ms send; CPU wall clock from D3D11 submit to send done 2.74 ms | 1.160 ms |
+| D3D12 texture → host pages (`OpenExistingHeapFromAddress` on both cards) | 2.361 ms | 1.160 ms |
+| Vulkan image → VRAM buffer (reference) | 0.069 ms | - |
+| Vulkan image → host pages (`VK_EXT_external_memory_host` on R, `OpenExistingHeapFromAddress` on D) | **2.078 ms (16.0 GB/s, 0.063 ms/MB)** | 1.160 ms |
+| Vulkan image → imported D3D12 cross-adapter heap | not measured: the bench made its heap on D, which doesn't import (4.2). The functional probe with the heap made on R passes; its timing is left for V4 | - |
+
+What the numbers say:
+
+- **D3D11 costs 0.06 ms more than D3D12 per 4K frame.** The VRAM hop is about 2.5 % of the send and runs on the game's D3D11 context. The send itself is today's, at the Gen4 x8 link speed.
+- **Vulkan's single hop is 12 % faster than the D3D12 copy-queue send** (2.08 against 2.36 ms). The cause is either the graphics queue's copy path or the host-page target; the D3D12 send into the same kind of host pages is 2.36 ms, which points at the queue. Worth an A/B on the D3D12 path later (send on the direct queue), as an optimisation after the features.
+- **The host-page ring is exactly as fast as the `SHARED_CROSS_ADAPTER` heap** (2.361 against 2.360 ms, ingest identical). They are the same system memory.
+- **Per-MB cost.** The send is 0.063-0.071 ms per MB on the render card, in line with `SPIKE_RULES.md`'s 0.065 ms/MB of render time. None of these paths changes the PCIe budget. Whatever reduces bytes (UI tiles, half-res HUD-less) applies equally to all three APIs.
 
 ## 6. Latency and VRR (Q4)
 
@@ -251,4 +267,4 @@ Avoid: CS2, Deadlock (VAC), The Finals, Delta Force, Marvel Rivals, Splitgate, B
 
 ## 10. Probe tool
 
-`plugins/lmxxf_nr/tools/xapi_probe` (`build.ps1`, VS 2022). `xapi_probe.exe func` runs the sharing, import and signal tests on small allocations; `xapi_probe.exe bench` runs the 4K copies of section 5 (needs idle GPUs: take the lock queue). Each probe prints one `RESULT` line, and the cards are chosen by outputs, so run it without the per-app GPU setting (3.4).
+`plugins/lmxxf_nr/tools/xapi_probe` (`build.ps1`, VS 2022). `xapi_probe.exe func` runs the sharing, import and signal tests on small allocations; `xapi_probe.exe bench` runs the 4K copies of section 5 (needs idle GPUs: take the lock queue). Raw outputs of this study: `data/xapi_probe/{func,func_d3d11_fences,func_gpu_pref,bench}.txt` (git-ignored). Each probe prints one `RESULT` line, and the cards are chosen by outputs, so run it without the per-app GPU setting (3.4).
