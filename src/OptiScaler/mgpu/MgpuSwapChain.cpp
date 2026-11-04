@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "MgpuSwapChain.h"
+#include "MgpuComposite.h"
 
 #include <format>
 
@@ -10,6 +11,77 @@ std::mutex& StatsMutex() { return s_statsMutex; }
 
 static inline UINT64 AlignUp(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 static inline double Ema(double prev, double v) { return prev <= 0 ? v : prev * 0.95 + v * 0.05; }
+
+static std::atomic<ProxySwapChain*> s_active { nullptr };
+ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
+
+bool WantHudless() { return CurrentSettings().hudless && s_active.load() != nullptr; }
+bool WantGuides() { return CurrentSettings().temporal && s_active.load() != nullptr; }
+void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state)
+{
+    if (auto* p = s_active.load())
+        p->RecordHudless(cl, src, state);
+}
+void CaptureGuides(ID3D12GraphicsCommandList* cl, const Guides& g)
+{
+    if (auto* p = s_active.load())
+        p->RecordGuides(cl, g);
+}
+
+// Same bits per texel and channel order: a texture copy between the two is legal.
+static int FormatFamily(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+        return 1;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return 2;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return 3;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return 4;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT:
+        return 5;
+    default:
+        return 0;
+    }
+}
+
+static D3D12_RESOURCE_BARRIER Tr(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
+{
+    D3D12_RESOURCE_BARRIER v {};
+    v.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    v.Transition = { r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, a, b };
+    return v;
+}
+
+static ComPtr<ID3D12Resource> Tex(ID3D12Device* d, UINT64 w, UINT h, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS fl,
+                                  D3D12_RESOURCE_STATES st)
+{
+    D3D12_RESOURCE_DESC t {};
+    t.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    t.Width = w;
+    t.Height = h;
+    t.DepthOrArraySize = 1;
+    t.MipLevels = 1;
+    t.Format = f;
+    t.SampleDesc.Count = 1;
+    t.Flags = fl;
+    D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
+    ComPtr<ID3D12Resource> r;
+    if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &t, st, nullptr, IID_PPV_ARGS(&r))))
+        return nullptr;
+    return r;
+}
 
 static UINT RealFlags(UINT gameFlags, bool tearing)
 {
@@ -133,9 +205,12 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
     if (desc->Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
         _waitable = CreateSemaphoreW(nullptr, (LONG) _maxLatency, 64, nullptr);
 
+    _wantHud = CurrentSettings().hudless;
+    _wantMv = CurrentSettings().temporal;
     if (FAILED(hr = CreateBuffers()))
         return hr;
     StartPresenter();
+    s_active = this;
     {
         std::lock_guard g(StatsMutex());
         MutableStats().presenter = true;
@@ -151,9 +226,10 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
                            wr.bottom - wr.top, wr.left, wr.top, mi.rcMonitor.right - mi.rcMonitor.left,
                            mi.rcMonitor.bottom - mi.rcMonitor.top, (int) aw));
     }
-    Log(0, std::format("proxy swapchain {}x{} fmt {} game buffers {} real buffers {} tearing {} waitable {}",
+    Log(0, std::format("proxy swapchain {}x{} fmt {} game buffers {} real buffers {} tearing {} waitable {} hudless {} "
+                       "motion {}",
                        _gameDesc.Width, _gameDesc.Height, (int) _gameDesc.Format, _gameCount, _realCount, _tearing,
-                       _waitable != nullptr));
+                       _waitable != nullptr, _wantHud, _wantMv));
     return S_OK;
 }
 
@@ -201,7 +277,42 @@ HRESULT ProxySwapChain::CreateBuffers()
     UINT64 rowBytes = 0, total = 0;
     _rdev->GetCopyableFootprints(&t, 0, 1, 0, &_fp, &rows, &rowBytes, &total);
     _payloadBytes = UINT64(rows) * rowBytes;
-    _slotBytes = AlignUp(total, 65536);
+    // Slot: back buffer, then the HUD-less colour (same footprint), then motion vectors (up to 4 bytes per pixel).
+    UINT64 slot = AlignUp(total, 65536);
+    _hudOffset = _mvOffset = _mvCap = 0;
+    {
+        std::lock_guard g(_capM);
+        _hudR.clear();
+        _mvR.clear();
+        _hudTag.assign(_gameCount, 0);
+        _mvTag.assign(_gameCount, 0);
+        _mvConst.assign(_gameCount, Guides {});
+        if (_wantHud)
+        {
+            _hudOffset = slot;
+            slot += AlignUp(total, 65536);
+            D3D12_RESOURCE_DESC s = t;
+            s.Flags = D3D12_RESOURCE_FLAG_NONE;
+            _hudR.resize(_gameCount);
+            for (UINT i = 0; i < _gameCount; ++i)
+                if (FAILED(hr = _rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &s, D3D12_RESOURCE_STATE_COMMON,
+                                                               nullptr, IID_PPV_ARGS(&_hudR[i]))))
+                    return hr;
+        }
+        if (_wantMv)
+        {
+            D3D12_RESOURCE_DESC m = t;
+            m.Format = DXGI_FORMAT_R16G16_FLOAT;
+            m.Flags = D3D12_RESOURCE_FLAG_NONE;
+            UINT64 mt = 0;
+            _rdev->GetCopyableFootprints(&m, 0, 1, 0, nullptr, nullptr, nullptr, &mt);
+            _mvOffset = slot;
+            _mvCap = AlignUp(mt, 65536);
+            slot += _mvCap;
+            _mvR.resize(_gameCount);
+        }
+    }
+    _slotBytes = slot;
 
     D3D12_HEAP_DESC hd {};
     hd.SizeInBytes = _slotBytes * K;
@@ -318,6 +429,51 @@ HRESULT ProxySwapChain::CreateBuffers()
                 return hr;
         }
 
+    // Extra regions: per-slot lists recorded at send (render) and at ingest (display).
+    if (_wantHud || _wantMv)
+    {
+        for (UINT s = 0; s < K; ++s)
+        {
+            if (FAILED(hr = _rdev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&_rxAlloc[s]))) ||
+                FAILED(hr = _rdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, _rxAlloc[s].Get(), nullptr,
+                                                     IID_PPV_ARGS(&_rxList[s]))) ||
+                FAILED(hr = _rxList[s]->Close()) ||
+                FAILED(hr = _ddev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_dxAlloc[s]))) ||
+                FAILED(hr = _ddev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _dxAlloc[s].Get(), nullptr,
+                                                     IID_PPV_ARGS(&_dxList[s]))) ||
+                FAILED(hr = _dxList[s]->Close()) ||
+                FAILED(hr = _ddev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_duAlloc[s]))) ||
+                FAILED(hr = _ddev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _duAlloc[s].Get(), nullptr,
+                                                     IID_PPV_ARGS(&_duList[s]))) ||
+                FAILED(hr = _duList[s]->Close()))
+                return hr;
+            _meta[s] = {};
+        }
+    }
+    if (_wantHud)
+    {
+        const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        _hudD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_NONE, ns);
+        _nrD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_NONE, ns);
+        _bbD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_NONE, ns);
+        _compD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!_ui)
+        {
+            _ui = new UiComposite();
+            if (!_ui->Init(_ddev.Get(), rd.Format))
+            {
+                delete _ui;
+                _ui = nullptr;
+            }
+        }
+        if (!_hudD || !_nrD || !_bbD || !_compD || !_ui)
+        {
+            Log(2, "HUD-less resources failed: whole frame");
+            _wantHud = false;
+        }
+    }
+
     std::lock_guard g(StatsMutex());
     auto& st = MutableStats();
     st.width = rd.Width;
@@ -338,6 +494,12 @@ void ProxySwapChain::ReleaseBuffers()
     {
         _slotR[s].Reset();
         _slotD[s].Reset();
+        _rxList[s].Reset();
+        _rxAlloc[s].Reset();
+        _dxList[s].Reset();
+        _dxAlloc[s].Reset();
+        _duList[s].Reset();
+        _duAlloc[s].Reset();
     }
     _heapR.Reset();
     _heapD.Reset();
@@ -347,6 +509,98 @@ void ProxySwapChain::ReleaseBuffers()
     _dReadback.Reset();
     _bb.clear();
     _realBb.clear();
+    {
+        std::lock_guard g(_capM);
+        _hudR.clear();
+        _mvR.clear();
+        _graveR.clear();
+    }
+    _hudD.Reset();
+    _mvD.Reset();
+    _nrD.Reset();
+    _bbD.Reset();
+    _compD.Reset();
+    _graveD.clear();
+}
+
+void ProxySwapChain::RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state)
+{
+    std::lock_guard g(_capM);
+    const UINT i = _bbIndex;
+    if (!_wantHud || i >= _hudR.size() || !_hudR[i] || !src || !cl)
+        return;
+    const auto d = src->GetDesc();
+    if (d.Width != _gameDesc.Width || d.Height != _gameDesc.Height ||
+        FormatFamily(d.Format) != FormatFamily(_gameDesc.Format) || FormatFamily(d.Format) == 0)
+    {
+        if (!_loggedHudFmt)
+            Log(1, std::format("HUD-less candidate {}x{} fmt {} does not match the back buffer {}x{} fmt {}: skipped",
+                               d.Width, d.Height, (int) d.Format, _gameDesc.Width, _gameDesc.Height,
+                               (int) _gameDesc.Format));
+        _loggedHudFmt = true;
+        return;
+    }
+    D3D12_RESOURCE_BARRIER b[2] = { Tr(_hudR[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+                                    Tr(src, state, D3D12_RESOURCE_STATE_COPY_SOURCE) };
+    const UINT nb = state == D3D12_RESOURCE_STATE_COPY_SOURCE ? 1 : 2;
+    cl->ResourceBarrier(nb, b);
+    D3D12_TEXTURE_COPY_LOCATION dl { _hudR[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION sl { src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+    for (auto& x : b)
+        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    cl->ResourceBarrier(nb, b);
+    _hudTag[i] = _scheduled + 1;
+}
+
+void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& gd)
+{
+    std::lock_guard g(_capM);
+    const UINT i = _bbIndex;
+    if (!_wantMv || i >= _mvR.size() || !gd.motion || !cl)
+        return;
+    auto d = gd.motion->GetDesc();
+    UINT64 need = 0;
+    D3D12_RESOURCE_DESC m = d;
+    m.Flags = D3D12_RESOURCE_FLAG_NONE;
+    m.MipLevels = 1;
+    m.DepthOrArraySize = 1;
+    m.Alignment = 0;
+    _rdev->GetCopyableFootprints(&m, 0, 1, 0, nullptr, nullptr, nullptr, &need);
+    if (FormatFamily(d.Format) != 5 || need > _mvCap || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        if (!_loggedMvFmt)
+            Log(1, std::format("motion vectors {}x{} fmt {} not supported (R16G16 float, up to the frame's size): no "
+                               "temporal input",
+                               d.Width, d.Height, (int) d.Format));
+        _loggedMvFmt = true;
+        return;
+    }
+    if (!_mvR[i] || _mvR[i]->GetDesc().Width != m.Width || _mvR[i]->GetDesc().Height != m.Height ||
+        _mvR[i]->GetDesc().Format != m.Format)
+    {
+        if (_mvR[i])
+            _graveR.push_back(_mvR[i]);
+        D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
+        _mvR[i].Reset();
+        if (FAILED(_rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &m, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  IID_PPV_ARGS(&_mvR[i]))))
+            return;
+        Log(0, std::format("motion staging {} {}x{} fmt {}", i, m.Width, m.Height, (int) m.Format));
+    }
+    D3D12_RESOURCE_BARRIER b[2] = { Tr(_mvR[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+                                    Tr(gd.motion, gd.motionState, D3D12_RESOURCE_STATE_COPY_SOURCE) };
+    const UINT nb = gd.motionState == D3D12_RESOURCE_STATE_COPY_SOURCE ? 1 : 2;
+    cl->ResourceBarrier(nb, b);
+    D3D12_TEXTURE_COPY_LOCATION dl { _mvR[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION sl { gd.motion, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+    for (auto& x : b)
+        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    cl->ResourceBarrier(nb, b);
+    _mvConst[i] = gd;
+    _mvConst[i].motion = nullptr;
+    _mvTag[i] = _scheduled + 1;
 }
 
 static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
@@ -410,6 +664,8 @@ void ProxySwapChain::PresenterLoop()
     SetThreadDescription(GetCurrentThread(), L"Mgpu presenter");
     const auto& env = CurrentEnv();
     UINT64 slotDisplayValue[K] {};
+    bool slotCounted[K] {};
+    const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     for (;;)
     {
         std::unique_lock lk(_m);
@@ -423,33 +679,194 @@ void ProxySwapChain::PresenterLoop()
         _picked[s] = g;
         const UINT sync = _sync[s], flags = _flags[s];
         const auto tSched = _tSched[s];
+        const SlotMeta meta = _meta[s];
         lk.unlock();
 
-        // Timestamps of this slot's previous ingest, if done.
+        // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
+        WaitFence(_dFence.Get(), slotDisplayValue[s], 500);
         double ingestMs = -1;
-        if (slotDisplayValue[s] && _dFence->GetCompletedValue() >= slotDisplayValue[s])
+        if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
+        double uiShare = -1;
+        if (slotCounted[s] && _ui)
+        {
+            uiShare = double(_ui->Count(s)) / (double(_gameDesc.Width) * _gameDesc.Height);
+            if (uiShare > CurrentSettings().uiGate && !_gateOn)
+            {
+                _gateOn = true;
+                Log(1, std::format("HUD-less gate: {:.1f}% of pixels differ from the back buffer: whole frame",
+                                   uiShare * 100));
+                std::lock_guard sg(StatsMutex());
+                MutableStats().gateFallbacks++;
+            }
+            else if (uiShare <= CurrentSettings().uiGate && _gateOn)
+            {
+                _gateOn = false;
+                Log(0, std::format("HUD-less gate: {:.1f}% of pixels differ: HUD-less again", uiShare * 100));
+            }
+        }
+        slotCounted[s] = false;
 
         double nrMs = 0;
+        bool hudFrame = false;
         HRESULT hr;
         {
             std::lock_guard sg(_scMutex);
             const UINT m = _real->GetCurrentBackBufferIndex();
             _dq->Wait(_filledD.Get(), g);
-            ID3D12CommandList* l[] = { _dList[s * _realCount + m].Get() };
-            _dq->ExecuteCommandLists(1, l);
+            ID3D12CommandList* l[2] = { _dList[s * _realCount + m].Get(), nullptr };
+            UINT nl = 1;
+            const bool haveHud = meta.hud && _hudD && _ui;
+            bool haveMv = false;
+            if ((haveHud || meta.mv) && _dxList[s])
+            {
+                if (meta.mv && (!_mvD || _mvD->GetDesc().Width != meta.mvDesc.Width ||
+                                _mvD->GetDesc().Height != meta.mvDesc.Height || _mvD->GetDesc().Format != meta.mvDesc.Format))
+                {
+                    if (_mvD)
+                        _graveD.push_back(_mvD);
+                    D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
+                    D3D12_RESOURCE_DESC md = meta.mvDesc;
+                    _mvD.Reset();
+                    _ddev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, ns, nullptr, IID_PPV_ARGS(&_mvD));
+                }
+                haveMv = meta.mv && _mvD;
+                _dxAlloc[s]->Reset();
+                auto* c = _dxList[s].Get();
+                c->Reset(_dxAlloc[s].Get(), nullptr);
+                auto ingest = [&](ID3D12Resource* dstTex, UINT64 offset)
+                {
+                    auto dd = dstTex->GetDesc();
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+                    _ddev->GetCopyableFootprints(&dd, 0, 1, offset, &fp, nullptr, nullptr, nullptr);
+                    auto b = Tr(dstTex, ns, D3D12_RESOURCE_STATE_COPY_DEST);
+                    c->ResourceBarrier(1, &b);
+                    D3D12_TEXTURE_COPY_LOCATION dl { dstTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                    D3D12_TEXTURE_COPY_LOCATION sl { _slotD[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                    sl.PlacedFootprint = fp;
+                    c->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+                    c->ResourceBarrier(1, &b);
+                };
+                if (haveHud)
+                    ingest(_hudD.Get(), _hudOffset);
+                if (haveMv)
+                    ingest(_mvD.Get(), _mvOffset);
+                c->Close();
+                l[nl++] = c;
+            }
+            _dq->ExecuteCommandLists(nl, l);
             _dq->Signal(_releasedD.Get(), g);
             const bool dump = g >= _dumpFrom && g < _dumpTo;
             if (dump)
+            {
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_ingest", g));
+                if (haveHud)
+                    DumpTexture(_ddev.Get(), _dq.Get(), _hudD.Get(), ns, env.dumpDir + std::format(L"\\f{:06}_hudless", g));
+                if (haveMv)
+                    DumpTexture(_ddev.Get(), _dq.Get(), _mvD.Get(), ns, env.dumpDir + std::format(L"\\f{:06}_mv", g));
+            }
+
+            // UI mask from the back buffer against the HUD-less colour: count always, composite unless gated.
+            const bool useHud = haveHud && !_gateOn;
+            auto prepUi = [&]
+            {
+                _duAlloc[s]->Reset();
+                auto* c = _duList[s].Get();
+                c->Reset(_duAlloc[s].Get(), nullptr);
+                D3D12_RESOURCE_BARRIER b[2] = { Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                                                   D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                Tr(_bbD.Get(), ns, D3D12_RESOURCE_STATE_COPY_DEST) };
+                c->ResourceBarrier(2, b);
+                c->CopyResource(_bbD.Get(), _realBb[m].Get());
+                for (auto& x : b)
+                    std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+                c->ResourceBarrier(2, b);
+                return c;
+            };
+
             if (env.nrWanted && env.nrWanted() && env.nrFrame)
             {
+                NrInput in;
+                const auto now = std::chrono::steady_clock::now();
+                const bool gap = _lastNr.time_since_epoch().count() &&
+                                 std::chrono::duration<double, std::milli>(now - _lastNr).count() > 250.0;
+                _lastNr = now;
+                if (haveMv)
+                {
+                    in.motion = _mvD.Get();
+                    in.motionState = ns;
+                    in.guides = meta.g;
+                }
+                const bool mvResized = haveMv && (meta.g.motionW != _lastMvW || meta.g.motionH != _lastMvH);
+                if (haveMv)
+                {
+                    _lastMvW = meta.g.motionW;
+                    _lastMvH = meta.g.motionH;
+                }
+                in.reset = gap || mvResized || (haveMv && meta.g.reset);
+                in.waitAnswer = CurrentSettings().nrEveryFrame;
+                if (useHud)
+                {
+                    in.src = _hudD.Get();
+                    in.srcState = ns;
+                    in.dst = _nrD.Get();
+                    in.dstState = ns;
+                }
+                else
+                {
+                    in.src = in.dst = _realBb[m].Get();
+                    in.srcState = in.dstState = D3D12_RESOURCE_STATE_PRESENT;
+                }
+                ID3D12GraphicsCommandList* c = nullptr;
+                if (haveHud && !useHud)
+                {
+                    // gated: keep measuring on the untouched back buffer, then NR on the whole frame
+                    c = prepUi();
+                    _ui->Record(c, s, _bbD.Get(), _hudD.Get(), nullptr, nullptr, _gameDesc.Width, _gameDesc.Height);
+                    c->Close();
+                    ID3D12CommandList* cl[] = { c };
+                    _dq->ExecuteCommandLists(1, cl);
+                    slotCounted[s] = true;
+                }
                 auto t0 = std::chrono::steady_clock::now();
-                env.nrFrame(_ddev.Get(), _dq.Get(), _realBb[m].Get());
+                const bool wrote = env.nrFrame(_ddev.Get(), _dq.Get(), in);
                 nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (useHud)
+                {
+                    c = prepUi();
+                    _ui->Record(c, s, _bbD.Get(), _hudD.Get(), wrote ? _nrD.Get() : _hudD.Get(), _compD.Get(),
+                                _gameDesc.Width, _gameDesc.Height);
+                    D3D12_RESOURCE_BARRIER b[2] = { Tr(_compD.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                    Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST) };
+                    c->ResourceBarrier(2, b);
+                    c->CopyResource(_realBb[m].Get(), _compD.Get());
+                    for (auto& x : b)
+                        std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+                    c->ResourceBarrier(2, b);
+                    c->Close();
+                    ID3D12CommandList* cl[] = { c };
+                    _dq->ExecuteCommandLists(1, cl);
+                    slotCounted[s] = true;
+                    hudFrame = true;
+                    if (dump && wrote)
+                        DumpTexture(_ddev.Get(), _dq.Get(), _nrD.Get(), ns, env.dumpDir + std::format(L"\\f{:06}_nr", g));
+                }
             }
-            if (dump && nrMs > 0)
+            else if (haveHud)
+            {
+                // NR off: the mask is still measured (and dumped) so the gate can be checked without NR
+                auto* c = prepUi();
+                _ui->Record(c, s, _bbD.Get(), _hudD.Get(), nullptr, nullptr, _gameDesc.Width, _gameDesc.Height);
+                c->Close();
+                ID3D12CommandList* cl[] = { c };
+                _dq->ExecuteCommandLists(1, cl);
+                slotCounted[s] = true;
+            }
+            if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
             BOOL fs = FALSE;
@@ -476,6 +893,17 @@ void ProxySwapChain::PresenterLoop()
         auto& st = MutableStats();
         st.presented++;
         st.skipped += skipped;
+        if (_wantHud)
+        {
+            if (hudFrame)
+                st.hudlessFrames++;
+            else if (!meta.hud)
+                st.hudlessMissed++;
+            if (uiShare >= 0)
+                st.uiShare = uiShare;
+        }
+        if (meta.mv)
+            st.guideFrames++;
         if (_lastDisplay.time_since_epoch().count())
             st.displayFrameMs = Ema(st.displayFrameMs, std::chrono::duration<double, std::milli>(now - _lastDisplay).count());
         _lastDisplay = now;
@@ -490,9 +918,11 @@ void ProxySwapChain::PresenterLoop()
         st.ringDepth = UINT(_scheduled - g);
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
-                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {}",
+                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {}",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
-                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped));
+                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
+                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames));
     }
 }
 
@@ -500,8 +930,10 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
 {
     if (flags & DXGI_PRESENT_TEST)
         return S_OK;
-    const UINT i = _bbIndex;
     const auto& env = CurrentEnv();
+    if (env.onPresent)
+        env.onPresent();
+    const UINT i = _bbIndex;
     const UINT64 next = _scheduled + 1;
     if (!env.dumpDir.empty() && next % 30 == 0)
     {
@@ -539,8 +971,46 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         _rcopy->Wait(_rgameFence.Get(), _rgameValue);
         if (_picked[s])
             _rcopy->Wait(_releasedR.Get(), _picked[s]);
-        ID3D12CommandList* l[] = { _rList[i * K + s].Get() };
-        _rcopy->ExecuteCommandLists(1, l);
+        ID3D12CommandList* l[2] = { _rList[i * K + s].Get(), nullptr };
+        UINT nl = 1;
+        SlotMeta meta {};
+        if (_rxList[s])
+        {
+            std::lock_guard cg(_capM);
+            meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g;
+            meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g;
+            if (meta.hud || meta.mv)
+            {
+                // the slot's previous send list must be done before its allocator is reset
+                if (g > K)
+                    WaitFence(_filledR.Get(), g - K, 500);
+                _rxAlloc[s]->Reset();
+                auto* c = _rxList[s].Get();
+                c->Reset(_rxAlloc[s].Get(), nullptr);
+                auto send = [&](ID3D12Resource* srcTex, UINT64 offset)
+                {
+                    auto sd = srcTex->GetDesc();
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+                    _rdev->GetCopyableFootprints(&sd, 0, 1, offset, &fp, nullptr, nullptr, nullptr);
+                    D3D12_TEXTURE_COPY_LOCATION dl { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                    dl.PlacedFootprint = fp;
+                    D3D12_TEXTURE_COPY_LOCATION sl { srcTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                    c->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                };
+                if (meta.hud)
+                    send(_hudR[i].Get(), _hudOffset);
+                if (meta.mv)
+                {
+                    send(_mvR[i].Get(), _mvOffset);
+                    meta.g = _mvConst[i];
+                    meta.mvDesc = _mvR[i]->GetDesc();
+                }
+                c->Close();
+                l[nl++] = c;
+            }
+        }
+        _meta[s] = meta;
+        _rcopy->ExecuteCommandLists(nl, l);
         _rcopy->Signal(_filledR.Get(), g);
         _sync[s] = sync;
         _flags[s] = flags;
@@ -551,7 +1021,10 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     _cv.notify_all();
 
     // The game's next work on the next back buffer waits for that buffer's last send.
-    _bbIndex = (i + 1) % _gameCount;
+    {
+        std::lock_guard cg(_capM);
+        _bbIndex = (i + 1) % _gameCount;
+    }
     if (_bbFrame[_bbIndex])
         _gameQueue->Wait(_filledR.Get(), _bbFrame[_bbIndex]);
     _presentCount++;
@@ -573,10 +1046,14 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
 
 ProxySwapChain::~ProxySwapChain()
 {
+    ProxySwapChain* self = this;
+    s_active.compare_exchange_strong(self, nullptr);
     if (_thread.joinable())
         StopPresenter();
     DrainRender();
     ReleaseBuffers();
+    delete _ui;
+    _ui = nullptr;
     _real.Reset();
     if (_waitable)
         CloseHandle(_waitable);

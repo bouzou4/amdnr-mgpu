@@ -19,6 +19,34 @@ struct Settings
     bool hudless = false;
     bool presenter = true; // false: let Windows copy the frame (cross-adapter present)
     bool fallbackInline = true;
+    bool nrEveryFrame = false; // the presenter waits for the network's answer each frame
+    bool temporal = false;     // send the render card's motion vectors; NR keeps a network history
+    double uiGate = 0.15;      // HUD-less: above this share of differing pixels the frame runs whole-frame NR
+};
+
+// Upscaler inputs of one frame, taken on the render card at the upscaler's Evaluate.
+struct Guides
+{
+    ID3D12Resource* motion = nullptr;
+    D3D12_RESOURCE_STATES motionState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    UINT motionW = 0, motionH = 0; // active extent of the vectors
+    UINT renderW = 0, renderH = 0;
+    float mvScaleX = 1, mvScaleY = 1, jitterX = 0, jitterY = 0;
+    bool reset = false, depthInverted = false;
+};
+
+// What NR gets on the display card for one frame. `src` is read, the result goes to `dst` (both in their states).
+struct NrInput
+{
+    ID3D12Resource* src = nullptr;
+    D3D12_RESOURCE_STATES srcState = D3D12_RESOURCE_STATE_PRESENT;
+    ID3D12Resource* dst = nullptr;
+    D3D12_RESOURCE_STATES dstState = D3D12_RESOURCE_STATE_PRESENT;
+    ID3D12Resource* motion = nullptr; // null: no motion (no-motion carry)
+    D3D12_RESOURCE_STATES motionState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    Guides guides;     // scalars of the frame `motion` belongs to (resources not valid here)
+    bool reset = false; // history must not be used (resize, gap, camera cut)
+    bool waitAnswer = false;
 };
 
 struct Env
@@ -26,10 +54,11 @@ struct Env
     std::function<void(int level, const std::string&)> log; // 0 info, 1 warn, 2 error
     std::function<IDXGIFactory1*()> createFactory;            // unspoofed factory, caller releases
     std::function<void(const std::function<void()>&)> noSpoof; // runs fn with adapter spoofing off
-    // Whole-frame NR on the display card, recorded and submitted on `queue`. True = wrote `target`.
-    std::function<bool(ID3D12Device*, ID3D12CommandQueue*, ID3D12Resource* target)> nrFrame;
+    // NR on the display card, recorded and submitted on `queue`. True = wrote `in.dst`.
+    std::function<bool(ID3D12Device*, ID3D12CommandQueue*, const NrInput& in)> nrFrame;
     std::function<bool()> nrWanted;
     std::function<std::string()> nrStatus;
+    std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it
 };
 
@@ -58,6 +87,8 @@ struct Stats
     uint64_t slotBytes = 0;
     double renderBusy = -1, displayBusy = -1;        // 3D engine use %, -1 = unknown
     std::string nrStatus;
+    uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0;
+    double uiShare = -1; // share of pixels the UI composite took from the back buffer, last measured
 };
 
 void Configure(const Settings& s, const Env& e);
@@ -82,6 +113,12 @@ HRESULT CreateSwapChainForHwnd(PFN_CreateSwapChainForHwnd original, IDXGIFactory
 
 // NR runs on the display card's presenter (render card's NR must stay off).
 bool NrOnDisplay();
+
+// Render card, recorded on the game's command list. Each copies into the staging of the frame being built.
+bool WantGuides();
+bool WantHudless();
+void CaptureGuides(ID3D12GraphicsCommandList* cl, const Guides& g);
+void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state);
 Stats GetStats();
 
 // internal

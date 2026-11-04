@@ -4,6 +4,9 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
+struct NVSDK_NGX_Parameter;
+class IFeature_Dx12;
+
 namespace MgpuHost
 {
 // D3D12CreateDevice hook
@@ -19,6 +22,13 @@ HRESULT CreateSwapChainForHwnd(void* original, IDXGIFactory2* factory, IUnknown*
 
 // NR runs on the display card: the render card's NR bridge stays idle.
 bool BlockRenderCardNr();
+
+// Upscaler Evaluate done (render card, game's list): motion vectors for the temporal stage, and the HUD-less
+// pick armed for this frame.
+void UpscaleEvaluated(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Parameter* params, IFeature_Dx12* feature);
+// HUDfix hands its pick here instead of to frame generation (Mode=hudless, FG output off).
+bool HudlessSink();
+void HudlessCaptured(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES state);
 
 // UI
 void DrawMenuTab(float scale);

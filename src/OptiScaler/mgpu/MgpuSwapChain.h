@@ -72,6 +72,11 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     // IDXGISwapChain4
     HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE t, UINT s, void* m) override;
 
+    // Render card, on the game's list: copy into the staging of the back buffer being drawn.
+    void RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state);
+    void RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& g);
+    static ProxySwapChain* Active();
+
   private:
     ProxySwapChain() = default;
     ~ProxySwapChain();
@@ -145,5 +150,33 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     std::chrono::steady_clock::time_point _lastRender {}, _lastDisplay {};
     bool _broken = false;
     std::atomic<UINT64> _dumpFrom { 0 }, _dumpTo { 0 }; // frame ids [from, to) to dump
+
+    // HUD-less colour and motion vectors: render-card staging per game back buffer, extra regions in each slot.
+    bool _wantHud = false, _wantMv = false;
+    std::mutex _capM;
+    std::vector<ComPtr<ID3D12Resource>> _hudR, _mvR, _graveR;
+    std::vector<UINT64> _hudTag, _mvTag; // frame id each staging holds
+    std::vector<Guides> _mvConst;
+    UINT64 _hudOffset = 0, _mvOffset = 0, _mvCap = 0;
+    ComPtr<ID3D12CommandAllocator> _rxAlloc[K];
+    ComPtr<ID3D12GraphicsCommandList> _rxList[K];
+    struct SlotMeta
+    {
+        bool hud = false, mv = false;
+        Guides g;
+        D3D12_RESOURCE_DESC mvDesc {};
+    } _meta[K];
+    bool _loggedHudFmt = false, _loggedMvFmt = false;
+
+    // display card
+    ComPtr<ID3D12Resource> _hudD, _mvD, _nrD, _bbD, _compD;
+    std::vector<ComPtr<ID3D12Resource>> _graveD;
+    ComPtr<ID3D12CommandAllocator> _dxAlloc[K], _duAlloc[K]; // ingest of the extras, UI pass
+    ComPtr<ID3D12GraphicsCommandList> _dxList[K], _duList[K];
+    class UiComposite* _ui = nullptr;
+    UINT64 _gateUntil = 0;
+    bool _gateOn = false;
+    std::chrono::steady_clock::time_point _lastNr {};
+    UINT64 _lastMvW = 0, _lastMvH = 0;
 };
 } // namespace Mgpu

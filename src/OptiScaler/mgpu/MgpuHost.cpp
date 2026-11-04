@@ -9,6 +9,10 @@
 #include <proxies/Dxgi_Proxy.h>
 #include <dlssnr/amd/PresentExperimental.h>
 #include <dlssnr/menu/NeuralUi.h>
+#include <dlssnr/lmxxf/LmxxfBackend.h>
+#include <hudfix/Hudfix_Dx12.h>
+#include <upscalers/IFeature_Dx12.h>
+#include <NVNGX_Parameter.h>
 #include <imgui/imgui.h>
 
 #include <mutex>
@@ -28,17 +32,105 @@ static Mgpu::Settings ReadSettings()
     s.hudless = c->MgpuMode.value_or_default() == "hudless";
     s.presenter = c->MgpuPresenter.value_or_default();
     s.fallbackInline = c->MgpuFallback.value_or_default() != "off";
+    s.nrEveryFrame = c->MgpuNrEveryFrame.value_or_default();
+    s.temporal = c->MgpuTemporal.value_or_default();
+    s.uiGate = std::clamp(c->MgpuUiGate.value_or_default(), 0.f, 100.f) / 100.0;
     return s;
 }
 
-// Whole-frame NR on the display card: AMDNR's final image context, on the display device.
+// NR on the display card: AMDNR's final image context, on the display device. Without motion it runs the
+// no-motion carry; with the render card's motion vectors ([Mgpu] Temporal) the backend's motion path, network
+// history on, the post-upscale layout (display-sized colour, render-sized vectors, no jitter).
 static AmdFinalImage::Context* s_nr = nullptr;
 static bool s_nrFailed = false;
 
-static bool NrFrame(ID3D12Device* d, ID3D12CommandQueue* q, ID3D12Resource* target)
+static bool TemporalFrame(AmdFinalImage::Context& c, const Mgpu::NrInput& in, const std::filesystem::path& dir)
+{
+    using AmdFinalImage::Transition;
+    if (c.stopped)
+        return false;
+    const auto desc = in.src->GetDesc();
+    const bool sdr8 = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                      (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM && !State::Instance().isHdrActive);
+    if (!sdr8 && desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+        return false;
+    c.EnsureResources(desc);
+    if (!c.backend)
+    {
+        if (!DlssNr::AmdBridge::LmxxfReady())
+            return false;
+        c.lmxxf = true;
+        c.backend = new Lmxxf::Backend(c.device.Get(), c.queue.Get(), dir);
+        LOG_INFO("[MGPU] NR temporal stage: lmxxf runtime, network history from the render card's motion vectors");
+    }
+    if (!c.backend->Ready() && c.backend->RecordedFrames() != 0)
+        return false;
+    auto& slot = c.ring[c.ringIndex];
+    c.ringIndex = (c.ringIndex + 1) % AmdFinalImage::Context::kRing;
+    c.WaitFor(slot.fenceValue);
+    AmdFinalImage::Check(slot.allocator->Reset(), "allocator reset");
+    AmdFinalImage::Check(slot.cmd->Reset(slot.allocator.Get(), nullptr), "list reset");
+    ID3D12GraphicsCommandList* cmd = slot.cmd.Get();
+    if (!c.guidesCleared)
+        c.ClearGuides(cmd);
+    Transition(cmd, in.src, in.srcState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->CopyResource(c.input.Get(), in.src);
+    Transition(cmd, in.src, D3D12_RESOURCE_STATE_COPY_SOURCE, in.srcState);
+    Transition(cmd, c.input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    AmdPreSr::Frame f {};
+    f.colour = c.input.Get();
+    f.width = c.width;
+    f.height = c.height;
+    f.colourState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    f.depth = c.depth.Get(); // constant: depth does not cross the ring yet
+    f.displayReferred = true;
+    if (in.motion)
+    {
+        f.motion = in.motion;
+        f.motionState = in.motionState;
+        f.motionWidth = in.guides.motionW;
+        f.motionHeight = in.guides.motionH;
+        f.motionScaleX = in.guides.mvScaleX;
+        f.motionScaleY = in.guides.mvScaleY;
+        f.depthInverted = in.guides.depthInverted;
+    }
+    else
+        f.motion = c.motion.Get(); // zero field, history dropped below
+    // The colour is the upscaler's output after post: unjittered.
+    f.jitterX = f.jitterY = 0.f;
+    f.reset = in.reset || !in.motion;
+    if (f.reset)
+        c.backend->InvalidateHistory();
+
+    AmdPreSr::Settings s = DlssNr::AmdBridge::CurrentSettings();
+    s.lmxxfNoMotion = false;
+    s.lmxxfHistory = true;
+    s.rtgi.enabled = false;
+    // the colour is fed as is, like the no-motion carry (an sRGB decode drove auto-exposure to x25)
+    if (!Config::Instance()->AmdNrScale.has_value())
+        s.modelScale = (std::min)(s.modelScale, 0.5f);
+    ID3D12Resource* result = c.backend->Record(cmd, f, s);
+    Transition(cmd, c.input.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    const bool composed = result != nullptr;
+    if (composed)
+        c.Compose(cmd, in.dst, in.dstState, result);
+    AmdFinalImage::Check(cmd->Close(), "close");
+    ID3D12CommandList* lists[] = { cmd };
+    c.backend->Submitting(c.queue.Get(), 1, lists);
+    c.queue->ExecuteCommandLists(1, lists);
+    c.backend->Submitted(c.queue.Get(), 1, lists);
+    slot.fenceValue = ++c.serial;
+    AmdFinalImage::Check(c.queue->Signal(c.fence.Get(), c.serial), "signal");
+    AmdFinalImage::status = std::string(composed ? "Multi-GPU NR (temporal) active: " : "Multi-GPU NR (temporal) waiting: ") +
+                            c.backend->Status();
+    return composed;
+}
+
+static bool NrFrame(ID3D12Device* d, ID3D12CommandQueue* q, const Mgpu::NrInput& in)
 {
     std::lock_guard g(AmdFinalImage::mutex);
-    if (s_nrFailed)
+    if (s_nrFailed || !in.src || !in.dst)
         return false;
     try
     {
@@ -47,8 +139,13 @@ static bool NrFrame(ID3D12Device* d, ID3D12CommandQueue* q, ID3D12Resource* targ
             s_nr = new AmdFinalImage::Context(d, q);
             LOG_INFO("[MGPU] NR context on the display card");
         }
-        return s_nr->FrameFrom(target, D3D12_RESOURCE_STATE_PRESENT, target, D3D12_RESOURCE_STATE_PRESENT,
-                               Util::DllPath().parent_path());
+        const auto dir = Util::DllPath().parent_path();
+        if (Mgpu::CurrentSettings().temporal)
+            return TemporalFrame(*s_nr, in, dir);
+        // NrEveryFrame: wait for the answer in flight so this frame consumes a fresh one
+        if (in.waitAnswer && s_nr->lmxxf && s_nr->backend)
+            static_cast<Lmxxf::Backend*>(s_nr->backend)->WaitAnswer(250);
+        return s_nr->FrameFrom(in.src, in.srcState, in.dst, in.dstState, dir);
     }
     catch (const std::exception& e)
     {
@@ -58,7 +155,6 @@ static bool NrFrame(ID3D12Device* d, ID3D12CommandQueue* q, ID3D12Resource* targ
         return false;
     }
 }
-
 static bool NrWanted()
 {
     return Config::Instance()->DlssNrEnabled.value_or_default() && DlssNr::AmdBridge::LmxxfReady();
@@ -107,6 +203,7 @@ static void EnsureConfigured()
                        e.nrFrame = NrFrame;
                        e.nrWanted = NrWanted;
                        e.nrStatus = [] { return AmdFinalImage::Status(); };
+                       e.onPresent = [] { if (HudlessSink()) Hudfix_Dx12::PresentStart(); };
                        e.dumpDir = (Util::DllPath().parent_path() / L"mgpu_dumps").wstring();
                        Mgpu::Configure(ReadSettings(), e);
                    });
@@ -179,6 +276,75 @@ bool BlockRenderCardNr()
     return s.enabled && !s.fallbackInline && !Mgpu::Redirected(); // Fallback=off
 }
 
+// ---- render-card inputs ------------------------------------------------------------------------------------
+
+bool HudlessSink()
+{
+    return Mgpu::WantHudless() && State::Instance().currentFG == nullptr;
+}
+
+void HudlessCaptured(ID3D12GraphicsCommandList* cl, ID3D12Resource* res, D3D12_RESOURCE_STATES state)
+{
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        auto d = res->GetDesc();
+        LOG_INFO("[MGPU] HUD-less pick from HUDfix: {}x{} fmt {}", d.Width, d.Height, (int) d.Format);
+    }
+    Mgpu::CaptureHudless(cl, res, state);
+}
+
+void UpscaleEvaluated(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Parameter* params, IFeature_Dx12* feature)
+{
+    if (!cl || !params || !feature)
+        return;
+    if (HudlessSink())
+    {
+        static bool warned = false;
+        if (State::Instance().activeFgInput != FGInput::Upscaler && !warned)
+        {
+            warned = true;
+            LOG_WARN("[MGPU] Mode=hudless needs [FrameGen] FGInput=upscaler (HUDfix's resource tracking): whole frame");
+        }
+        // arms HUDfix for this frame; FG would do this in its own UpscaleEnd
+        Hudfix_Dx12::UpscaleEnd(feature->FrameCount(), State::Instance().lastFGFrameTime);
+    }
+    if (!Mgpu::WantGuides())
+        return;
+    Mgpu::Guides g;
+    ID3D12Resource* mv = nullptr;
+    if (params->Get(NVSDK_NGX_Parameter_MotionVectors, &mv) != NVSDK_NGX_Result_Success)
+        params->Get(NVSDK_NGX_Parameter_MotionVectors, (void**) &mv);
+    if (!mv)
+        return;
+    g.motion = mv;
+    g.motionState = (D3D12_RESOURCE_STATES) Config::Instance()->MVResourceBarrier.value_or(
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g.renderW = feature->RenderWidth();
+    g.renderH = feature->RenderHeight();
+    g.motionW = feature->LowResMV() ? g.renderW : feature->DisplayWidth();
+    g.motionH = feature->LowResMV() ? g.renderH : feature->DisplayHeight();
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &g.mvScaleX);
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &g.mvScaleY);
+    params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &g.jitterX);
+    params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &g.jitterY);
+    int reset = 0;
+    params->Get(NVSDK_NGX_Parameter_Reset, &reset);
+    g.reset = reset != 0;
+    g.depthInverted = feature->DepthInverted();
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        auto d = mv->GetDesc();
+        LOG_INFO("[MGPU] motion vectors {}x{} fmt {} active {}x{} scale {} {} render {}x{} lowres {}", d.Width, d.Height,
+                 (int) d.Format, g.motionW, g.motionH, g.mvScaleX, g.mvScaleY, g.renderW, g.renderH,
+                 feature->LowResMV());
+    }
+    Mgpu::CaptureGuides(cl, g);
+}
+
 // ---- UI ---------------------------------------------------------------------------------------------------
 
 static std::string CardLabel(const Mgpu::AdapterView& a)
@@ -242,8 +408,8 @@ void DrawMenuTab(float scale)
     if (UI::Combo("NR input", &mode, modes, 2))
         cfg->MgpuMode = std::string(mode ? "hudless" : "whole-frame");
     UI::Legacy::HelpMarker("Whole frame: NR runs on the presented frame, HUD included.\n"
-                           "HUD-less: NR on the HUD-less colour, the HUD composited back (not built yet: runs whole "
-                           "frame).\n[Mgpu] Mode");
+                           "HUD-less: NR on HUDfix's HUD-less pick, the HUD composited back from the back buffer (needs "
+                           "FGInput=upscaler, FG output off; over 15% differing pixels runs whole frame).\n[Mgpu] Mode");
 
     const char* fb[] = { "Inline NR", "Off" };
     int fbi = cfg->MgpuFallback.value_or_default() == "off" ? 1 : 0;
@@ -292,6 +458,11 @@ void DrawMenuTab(float scale)
     ImGui::Text("Frames sent %llu, presented %llu, skipped %llu", st.produced, st.presented, st.skipped);
     ImGui::Text("Added latency (send to present) %.2f ms", st.latencyMs);
     ImGui::Text("Present: flip model, tearing allowed, on the display card");
+    if (cfg->MgpuMode.value_or_default() == "hudless")
+        ImGui::Text("HUD-less frames %llu, missed %llu, UI %.2f%% of pixels, gate fallbacks %llu", st.hudlessFrames,
+                    st.hudlessMissed, st.uiShare * 100, st.gateFallbacks);
+    if (cfg->MgpuTemporal.value_or_default())
+        ImGui::Text("Frames with motion vectors %llu", st.guideFrames);
     if (st.nrOnDisplay)
     {
         ImGui::Text("NR record+submit %.2f ms", st.nrMs);
