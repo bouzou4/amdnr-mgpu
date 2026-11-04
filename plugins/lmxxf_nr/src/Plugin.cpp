@@ -2,6 +2,8 @@
 // OptiScaler ASI plugin: lmxxf's DLSS 5 Neural Rendering runtime around the upscaler.
 #include "MgpuPlugin.h"
 #include "Nr.h"
+#include "Presets.h"
+#include "mgpu/MgpuCore.h"
 
 #include <detours/detours.h>
 
@@ -11,6 +13,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
+#include <string>
 
 const OptiPluginApi* g_api = nullptr;
 OptiPlugin* g_plugin = nullptr;
@@ -71,6 +74,7 @@ void WriteSettings(const NrSettings& s)
     g_api->SetBool(g_plugin, "Exposure", s.exposure);
     g_api->SetBool(g_plugin, "Temporal", s.temporal);
     g_api->SetBool(g_plugin, "WholeFrameFallback", s.wholeFrameFallback);
+    g_api->SetInt(g_plugin, "Preset", (int32_t) MatchPreset(s));
 }
 
 void Text(const char* fmt, ...)
@@ -159,7 +163,49 @@ void DrawTab(void*)
     const NrSettings active = Engine().Settings();
 
     g_api->Section("Neural Rendering");
-    bool changed = g_api->Checkbox("Enabled", &g_ui.enabled);
+    bool changed = false;
+
+    // Combo order: the presets, then Custom
+    const char* presetNames[kPresetCount + 1];
+    bool presetOff[kPresetCount + 1] = {};
+    const PresetCaps caps { rt.FreeRes(), rt.Models() };
+    std::string tip;
+    for (int32_t i = 0; i < kPresetCount; ++i)
+    {
+        const PresetRows& r = kPresets[i];
+        presetNames[i] = r.name;
+        const char* why = rt.module != nullptr ? PresetBlocked(r.id, caps) : nullptr;
+        presetOff[i] = why != nullptr;
+        tip += std::string(r.name) + ": " + (r.model == 1 ? "Small" : "Full") + ", " + kSizes[(int) r.size] + ", " +
+               std::to_string(r.passes) + (r.passes == 1 ? " pass" : " passes") +
+               (r.temporal && r.passes == 1 ? ", history on" : ", history off (more than one pass)") +
+               ".\n    One GPU: " + r.cost + (why ? std::string(".\n    Unavailable: ") + why : std::string()) + ".\n";
+    }
+    presetNames[kPresetCount] = "Custom";
+    tip += "Custom: the rows below as set by hand.\n"
+           "Multi-GPU: the display card runs the network, so the cost is hidden while it has headroom\n"
+           "(busy % beside the presets). 1080 tier about 8 ms there (measured), Quality about 11 ms and\n"
+           "Ultra about 25 ms (estimated): Ultra at 4K likely exceeds a 60 fps frame even there.\n"
+           "A preset only sets Model, Network size, Passes and history; changing one of them shows Custom.";
+    const Preset current = MatchPreset(g_ui);
+    int32_t presetIdx = kPresetCount;
+    for (int32_t i = 0; i < kPresetCount; ++i)
+        if (kPresets[i].id == current)
+            presetIdx = i;
+    if (g_api->Combo("Preset", &presetIdx, presetNames, kPresetCount + 1, presetOff) && presetIdx < kPresetCount)
+        ApplyPreset(g_ui, kPresets[presetIdx].id), changed = true;
+    g_api->ItemTooltip(tip.c_str());
+    if (MgpuActive())
+    {
+        const double busy = Mgpu::GetStats().displayBusy;
+        g_api->SameLine();
+        if (busy >= 0)
+            Text("display card %.0f%% busy", busy);
+        else
+            g_api->TextDisabled("display card busy: -");
+    }
+
+    changed |= g_api->Checkbox("Enabled", &g_ui.enabled);
 
     int32_t placement = (int32_t) g_ui.placement;
     const bool placementOff[] = { false, false, !g_hasPresent };
@@ -348,6 +394,12 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     g_plugin = plugin;
 
     g_ui = ReadSettings();
+    if (const Preset p = PresetFromIni(g_api->GetInt(g_plugin, "Preset", 0)); p != Preset::Custom)
+    {
+        ApplyPreset(g_ui, p);
+        Log(OptiLog_Info, "preset %s: model %s, size %s, passes %d, history %s", FindPreset(p)->name,
+            kModels[g_ui.model], kSizes[(int) g_ui.size], g_ui.passes, g_ui.temporal ? "on" : "off");
+    }
     ConfigureAll(g_ui);
 
     // The OptiScaler module holds the api table; its folder is where OptiScaler.dll / dxgi.dll lives

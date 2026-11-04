@@ -21,6 +21,7 @@ Install: `<game>\OptiScaler\plugins\lmxxf_nr.asi` (OptiScaler's `MainDllPath` pl
 LoadAsiPlugins=true
 
 [Plugin.lmxxf_nr]
+Preset=0           ; 0 Custom, 1 Performance, 2 Balanced, 3 Quality, 4 Ultra: sets the next four rows at start
 Placement=1        ; 0 before upscaling, 1 after upscaling, 2 terminal (HUD-less, at present)
 NetworkSize=0      ; 0 1080 tier, 1 2560x1440, 2 native (1 and 2 need DLSS5_NETWORK_FREE_RES)
 Model=0            ; 0 Full (71 blocks), 1 Small (31 blocks), DLSS5_MULTI_PASS 1 / 0.5
@@ -33,6 +34,17 @@ RuntimeDir=        ; folder of LmxxfNrRuntime.dll, tried first
 ModulesDir=        ; HIP module folder (SHA256SUMS) of a runtime build
 WeightsDir=        ; tiled weights of a runtime build
 ```
+
+Presets (the first row of the menu) set only Model, Network size, Passes and history; every other row is left alone, and editing one of those four shows Custom. `Preset` is written on Save and, when not 0, overrides those four keys at start. A preset the runtime can't run (no `DLSS5_NETWORK_FREE_RES`, or one model only) is greyed out, its reason in the tooltip. With multi-GPU the display card's busy % is shown beside them as a headroom hint (display only). Network time on one card at 4K output, terminal placement:
+
+| Preset | Model | Network size | Passes | History | Network (one card) |
+|---|---|---|---|---|---|
+| Performance | Small | 1080 tier | 1 | on | about 8 ms (55 fps, 76 without NR) |
+| Balanced | Full | 1080 tier | 1 | on | about 18 ms (48 fps) |
+| Quality | Full | 1440 | 1 | on | about 25 ms (35 fps) |
+| Ultra | Full | native | 1 | on | about 55 ms (estimated, 2.25x the pixels of 1440 at 4K) |
+
+With multi-GPU the display card runs the network beside the game (1080 tier about 8 ms there), so the cost stays hidden while that card has headroom; Ultra at 4K (about 25 ms there, estimated) likely does not fit a 60 fps frame. Passes 2 / 3 are a stronger style, not a higher quality step, so no preset uses them.
 
 Motion vectors for the history are the game's, from the upscale callbacks, at the size the game gives them (render or output size; the runtime samples them over the feed's UV range, nearest texel): before and after upscaling straight from the evaluate, terminal from a copy taken in the evaluate of the same frame and used at its present, multi-GPU over the ring. History is reset on the game's reset flag, after a frame that was not fed, and when the vector extent or the network size changes.
 
