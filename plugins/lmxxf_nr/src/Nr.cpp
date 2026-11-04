@@ -793,6 +793,16 @@ void NrEngine::OnUpscale(OptiUpscaleFrame* f, bool after)
     if (f->api != OptiApi_D3D12 || f->device == nullptr || f->commandList == nullptr || !RuntimeLoaded())
         return;
 
+    const uint32_t gameApi =
+        f->size >= offsetof(OptiUpscaleFrame, gameApi) + sizeof(f->gameApi) ? f->gameApi : uint32_t(OptiApi_D3D12);
+    if (gameApi != _stats.gameApi)
+    {
+        std::lock_guard lock(_mutex);
+        _stats.gameApi = gameApi;
+        Log(OptiLog_Info, "upscale callbacks: game API %u%s", gameApi,
+            (f->flags & OptiUpscale_Bridged) ? ", through OptiScaler's D3D12 bridge" : "");
+    }
+
     NrSettings s;
     {
         std::lock_guard lock(_mutex);

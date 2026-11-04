@@ -73,6 +73,7 @@ struct NrStats
     bool bypassed = false;   // the guard tripped: the edit is not applied
     std::string status; // GetStatus
     std::string source; // terminal: what the network is fed and where the edit goes
+    uint32_t gameApi = OptiApi_D3D12; // of the last upscale callback; D3D11 / Vulkan come through the D3D12 bridge
 };
 
 // One lmxxf session on the game's device, driven from the upscale callbacks
