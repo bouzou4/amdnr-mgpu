@@ -222,6 +222,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.renderBus = api->GetInt(plugin, "MgpuRenderBus", -1);
     s.displayBus = api->GetInt(plugin, "MgpuDisplayBus", -1);
     s.hudless = api->GetBool(plugin, "MgpuHudless", true);
+    s.wholeFrameFallback = api->GetBool(plugin, "WholeFrameFallback", true);
     s.presenter = api->GetBool(plugin, "MgpuPresenter", true);
     s.fallbackInline = api->GetBool(plugin, "MgpuFallbackInline", true);
     s.nrEveryFrame = api->GetBool(plugin, "MgpuNrEveryFrame", true);
@@ -334,6 +335,8 @@ void MgpuDrawTab(const OptiPluginApi* api)
     if (s.hudless)
         line(std::format("HUD-less frames {}, missed {}, UI {:.1f}% of pixels, gate trips {}", st.hudlessFrames,
                          st.hudlessMissed, st.uiShare * 100, st.gateFallbacks));
+    if (!st.nrSource.empty())
+        line("NR source: " + st.nrSource);
     if (!st.nrStatus.empty())
         api->TextDisabled(st.nrStatus.c_str());
 }

@@ -164,7 +164,24 @@ extern "C"
         uint32_t presentFlags;
         uint64_t frameId;        // increments once per present
         uint64_t upscaleFrameId; // OptiUpscaleFrame::frameId of the last evaluate, 0 when none
+        uint32_t hudlessSource;  // OptiHudlessSource of hudless (appended)
+        uint32_t frameGeneration; // OptiFrameGen: generated frames are presented between the game's (appended)
     } OptiPresentFrame;
+
+    typedef enum OptiHudlessSource
+    {
+        OptiHudless_None = 0,
+        OptiHudless_Hudfix = 1, // OptiScaler's HUDfix pick
+        OptiHudless_FfxFG = 2,  // the game's FSR frame generation HUDLessColor (frame generation off)
+    } OptiHudlessSource;
+
+    typedef enum OptiFrameGen
+    {
+        OptiFrameGen_Off = 0,
+        // The game's own frame generation (FSR FG swapchain or DLSS-G) presents through OptiScaler's swapchain:
+        // this present may be a generated frame, and no HUD-less colour is given (it isn't paired with it)
+        OptiFrameGen_Game = 1,
+    } OptiFrameGen;
 
     typedef void (*OptiPresentFn)(OptiPresentFrame* frame, void* userData);
 

@@ -309,7 +309,19 @@ static void FillPluginPresentFrame(OptiPresentFrame& f, IDXGISwapChain* swapChai
     {
         f.hudless = hudless;
         f.hudlessState = D3D12_RESOURCE_STATE_COPY_DEST;
+        f.hudlessSource = OptiHudless_Hudfix;
     }
+
+    // The game's own FG input, valid at this present only while that FG doesn't generate (no presenter thread)
+    uint32_t gameState = 0;
+    bool generating = false;
+    if (auto game = PluginApi::TakeGameHudless(&gameState, &generating); game != nullptr && f.hudless == nullptr)
+    {
+        f.hudless = game;
+        f.hudlessState = gameState;
+        f.hudlessSource = OptiHudless_FfxFG;
+    }
+    f.frameGeneration = generating ? OptiFrameGen_Game : OptiFrameGen_Off;
 
     f.syncInterval = syncInterval;
     f.presentFlags = flags;

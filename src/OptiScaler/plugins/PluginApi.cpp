@@ -1032,6 +1032,47 @@ bool PluginApi::WantsHudless()
 
 uint64_t PluginApi::LastUpscaleFrameId() { return _lastUpscaleFrameId.load(std::memory_order_relaxed); }
 
+namespace
+{
+std::mutex _gameFgMutex;
+ID3D12Resource* _gameHudless = nullptr;
+uint32_t _gameHudlessState = 0;
+std::chrono::steady_clock::time_point _gameFgSeen {};
+bool _gameFgGenerating = false;
+} // namespace
+
+void PluginApi::SetGameFg(const char* source, ID3D12Resource* hudless, uint32_t hudlessState, bool generating)
+{
+    static bool loggedHudless = false, loggedNone = false, lastGenerating = false;
+    std::lock_guard<std::mutex> lock(_gameFgMutex);
+    _gameHudless = hudless;
+    _gameHudlessState = hudlessState;
+    _gameFgGenerating = generating;
+    _gameFgSeen = std::chrono::steady_clock::now();
+    if (hudless != nullptr && !std::exchange(loggedHudless, true))
+    {
+        const auto d = hudless->GetDesc();
+        LOG_INFO("Plugin HUD-less: {} gives one: {:X} {}x{} fmt {} state {:X}", source, (size_t) hudless, d.Width,
+                 d.Height, (UINT) d.Format, hudlessState);
+    }
+    else if (hudless == nullptr && !std::exchange(loggedNone, true))
+        LOG_INFO("Plugin HUD-less: {} runs without one", source);
+    if (generating != std::exchange(lastGenerating, generating))
+        LOG_INFO("Plugin present: {} frame generation {}", source, generating ? "on" : "off");
+}
+
+ID3D12Resource* PluginApi::TakeGameHudless(uint32_t* state, bool* generating)
+{
+    std::lock_guard<std::mutex> lock(_gameFgMutex);
+    // A game that stops configuring its frame generation no longer generates
+    const bool fresh = std::chrono::steady_clock::now() - _gameFgSeen < std::chrono::milliseconds(500);
+    *generating = fresh && _gameFgGenerating;
+    if (!fresh || _gameFgGenerating)
+        return nullptr;
+    *state = _gameHudlessState;
+    return std::exchange(_gameHudless, nullptr);
+}
+
 void PluginApi::RunPresentCallbacks(OptiPresentFrame* frame)
 {
     std::vector<std::shared_ptr<PresentCallback>> callbacks;

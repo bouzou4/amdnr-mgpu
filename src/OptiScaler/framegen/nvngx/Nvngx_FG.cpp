@@ -11,6 +11,7 @@
 #include "Nvngx_Arturs.h"
 #include "Nvngx_FFX.h"
 #include "Nvngx_Combo.h"
+#include <plugins/PluginApi.h>
 #include "Nvngx_Custom.h"
 #include <imgui/ImGuiNotify.hpp>
 #include <nvsdk_ngx_vk.h>
@@ -350,6 +351,10 @@ NVSDK_NGX_Result Nvngx_FG::D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCm
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 
     std::shared_lock lock(((Nvngx_FG_Handle*) InFeatureHandle)->handleMutex);
+
+    // DLSS-G presents generated frames through OptiScaler's swapchain
+    if (PluginApi::WantsHudless())
+        PluginApi::SetGameFg("DLSS-G (NGX)", nullptr, 0, true);
 
     bool applyHudCutoff = Config::Instance()->FGHudCutoff.value_or_default() > 0.0f ||
                           State::Instance().gameQuirks & GameQuirk::FSRFGHudlessMismatchFixup;

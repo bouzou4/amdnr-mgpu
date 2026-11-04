@@ -1237,7 +1237,25 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     }
     if (!s.enabled || s.placement != Placement::Terminal)
         return;
-    if (f->hudless == nullptr)
+
+    // The game's frame generation presents generated frames here too: whole frame on every present (consistent)
+    constexpr size_t kFgEnd = offsetof(OptiPresentFrame, frameGeneration) + sizeof(uint32_t);
+    const bool gameFg = f->size >= kFgEnd && f->frameGeneration != OptiFrameGen_Off;
+    const uint32_t hudSource = f->size >= kFgEnd ? f->hudlessSource : OptiHudless_Hudfix;
+    const bool haveHud = f->hudless != nullptr && !gameFg;
+    _hudlessStreak = haveHud ? 0 : _hudlessStreak + 1;
+    // A lone missed pick keeps the HUD-less mode (no NR that frame); a run of them falls back
+    const bool whole = !haveHud && s.wholeFrameFallback && (gameFg || _hudlessStreak > 30);
+    {
+        std::lock_guard lock(_mutex);
+        _stats.source = haveHud ? (hudSource == OptiHudless_FfxFG ? "HUD-less colour (the game's FSR FG input)"
+                                                                  : "HUD-less colour (OptiScaler HUDfix)")
+                        : whole ? (gameFg ? "whole frame, UI included (the game's frame generation: every present)"
+                                          : "whole frame, UI included (no HUD-less colour)")
+                        : s.wholeFrameFallback ? "waiting for a HUD-less colour"
+                                               : "off: no HUD-less colour (WholeFrameFallback off)";
+    }
+    if (!haveHud && !whole)
     {
         if (_hudlessMissing++ % 600 == 0)
             Log(OptiLog_Info, "terminal: no HUD-less colour this frame (%llu frames so far)",
@@ -1245,9 +1263,12 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         _stats.framesSkipped++;
         return;
     }
+    if (whole && _hudlessStreak % 600 == (gameFg ? 1 : 31))
+        Log(OptiLog_Info, "terminal: whole frame NR, UI included (%s)",
+            gameFg ? "the game's frame generation" : "no HUD-less colour");
 
     auto* bb = static_cast<ID3D12Resource*>(f->backBuffer);
-    auto* hud = static_cast<ID3D12Resource*>(f->hudless);
+    auto* hud = haveHud ? static_cast<ID3D12Resource*>(f->hudless) : nullptr;
     auto* queue = static_cast<ID3D12CommandQueue*>(f->queue);
     const auto bd = bb->GetDesc();
     const uint32_t w = (uint32_t) bd.Width, h = bd.Height;
@@ -1270,7 +1291,18 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         return;
 
     const auto bbState = D3D12_RESOURCE_STATES(f->backBufferState);
-    const auto hudState = D3D12_RESOURCE_STATES(f->hudlessState);
+    auto hudState = D3D12_RESOURCE_STATES(f->hudlessState);
+    if (whole)
+    {
+        // The back buffer's copy stands in for the HUD-less colour: the UI mask is empty, the feed is the frame
+        Barrier(list, bb, bbState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(list, _termCopy.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(_termCopy.Get(), bb);
+        Barrier(list, _termCopy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+        Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, bbState);
+        hud = _termCopy.Get();
+        hudState = kRead;
+    }
     const uint32_t encoding = f->colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? 2
                               : f->colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709  ? 3
                                                                                            : 1;

@@ -87,6 +87,8 @@ typedef struct OptiPresentFrame {
     void* hudless; uint32_t hudlessState;             // HUDfix's capture of this frame, NULL when none
     uint32_t width, height, format, syncInterval, presentFlags;
     uint64_t frameId, upscaleFrameId;
+    uint32_t hudlessSource;    // OptiHudless_None / _Hudfix / _FfxFG (appended)
+    uint32_t frameGeneration;  // OptiFrameGen_Off / _Game (appended)
 } OptiPresentFrame;
 typedef void (*OptiPresentFn)(OptiPresentFrame* frame, void* userData);
 bool (*RegisterPresentCallback)(OptiPlugin* plugin, OptiPresentFn fn, uint32_t requests, void* userData);
@@ -97,7 +99,8 @@ bool (*RegisterPresentCallback)(OptiPlugin* plugin, OptiPresentFn fn, uint32_t r
 
 - Called from `LocalPresent` (`wrapped/wrapped_swapchain.cpp`) for D3D12 swapchains while frame generation is not presenting: once before OptiScaler draws its menu and FPS overlay (`BeforeOverlay`, where a post-process belongs, so OptiScaler's own UI is not processed), once right before the real `Present` (`AfterOverlay`, where a capture or a second presenter belongs). The plugin submits its own command lists to `queue`; it returns the back buffer in `PRESENT`.
 - `OptiPresentRequest_Hudless` keeps HUDfix's HUD-less detection running with frame generation off and whatever `FGInput` is: the resource tracker and its command list hooks are installed at device creation when a plugin asked for it (so it must be asked for in `OptiPluginInit`; the command list hooks were tied to `FGInput=upscaler` before), `Hudfix_Dx12` takes a plugin as an active consumer and tracks bindings the whole frame, the upscale end opens the pick window for the frame like FG does (one pick per upscaled frame), and the present clears the frame's candidates and advances the counter, as `FGPresent` does. The pick is HUDfix's capture buffer as it is (same format group as the swapchain; FG's format conversion needs the FG feature and is skipped), handed over only in the present of the frame it was taken in (`hudless` is NULL otherwise), so a back buffer is never paired with another frame's HUD-less colour.
-- When FG is active nothing changes: FG keeps the HUD-less pick and the callbacks are not called (FG presents interpolated frames through its own swapchain).
+- When OptiScaler's own FG is active nothing changes: FG keeps the HUD-less pick and the callbacks are not called (FG presents interpolated frames through its own swapchain).
+- The game's own frame generation, which presents through OptiScaler's swapchain (FSR FG through the FFX API with OptiScaler's FG off, or DLSS-G through the NGX replacement): `ffxConfigure` with `ffxConfigureDescFrameGeneration` (`FfxApi_Dx12.cpp`) and the DLSS-G evaluate (`Nvngx_FG.cpp`) note the game's HUD-less colour and whether it generates. FG off: the game's `HUDLessColor` goes to the next present as `hudless` (`hudlessSource = OptiHudless_FfxFG`) when HUDfix found none; it is used on the game's queue at that present, before the game's next frame. FG on: `frameGeneration = OptiFrameGen_Game` and no `hudless`: the FFX swapchain presents generated and real frames from its own thread, so a present is not paired with the HUD-less colour and can't be told real from generated here. The lmxxf plugin then runs whole-frame NR on every present (generated and real alike, so the two don't alternate between NR and no NR).
 - SEH guarded like the other callbacks.
 
 **What the plugin taught.**
@@ -106,7 +109,8 @@ bool (*RegisterPresentCallback)(OptiPlugin* plugin, OptiPresentFn fn, uint32_t r
 - Two phases were needed: the terminal NR wants to run before OptiScaler's overlay, the multi-GPU capture after it.
 - Pairing matters: the multi-GPU prototype took the pick when HUDfix found it, while the game was already recording the next frame, and paired back buffers with the wrong frame's HUD-less colour (74.9 % to 100 % of pixels "differing" in Satisfactory, up to 209 gate trips per run). Handing the pick over at the present of the frame it was captured in removes that by construction.
 - Depth and motion vectors at present time are not included: they are the upscaler's inputs, which the upscale callbacks (1) already give, on the game's command list, in the frame they belong to.
-- Not covered: D3D11 swapchains, and frame generation on (a plugin presenting after FG would need FG to hand over its output).
+- CONTROL (FSR 3.1/4 through the FFX API, no Streamline DLSS-G on AMD): HUDfix picks nothing, but the game hands its FSR FG a HUD-less colour (`R10G10B10A2` 3840x2160, same format as the back buffer, `state C0`), also with FG on.
+- Not covered: D3D11 swapchains, OptiScaler's own FG on, and the game's FG on with the HUD-less colour (that needs NR at the game's `Present` on the FFX swapchain, before FFX takes the back buffer and the HUD-less colour, so generated frames are made from NR'd inputs).
 
 ## 5. Adapter override and unhooked device creation
 

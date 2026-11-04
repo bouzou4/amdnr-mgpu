@@ -54,6 +54,7 @@ NrSettings ReadSettings()
     s.serialize = g_api->GetBool(g_plugin, "Serialize", false);
     s.temporal = g_api->GetBool(g_plugin, "Temporal", true);
     s.paperWhite = std::clamp(g_api->GetFloat(g_plugin, "HdrPaperWhite", 200.0f), 80.0f, 1000.0f);
+    s.wholeFrameFallback = g_api->GetBool(g_plugin, "WholeFrameFallback", true);
     return s;
 }
 
@@ -69,6 +70,7 @@ void WriteSettings(const NrSettings& s)
     g_api->SetBool(g_plugin, "MotionVectors", s.motion);
     g_api->SetBool(g_plugin, "Exposure", s.exposure);
     g_api->SetBool(g_plugin, "Temporal", s.temporal);
+    g_api->SetBool(g_plugin, "WholeFrameFallback", s.wholeFrameFallback);
 }
 
 void Text(const char* fmt, ...)
@@ -165,10 +167,17 @@ void DrawTab(void*)
         g_ui.placement = (Placement) placement, changed = true;
     g_api->ItemTooltip("Before upscaling: NR on the render-size colour the upscaler gets.\n"
                        "After upscaling: NR on the upscaler's output, before post-processing and UI.\n"
-                       "Terminal: NR on the HUD-less frame at present, the UI kept as drawn (frame generation\n"
-                       "off; needs a restart when it was not the placement at start).");
+                       "Terminal: NR on the HUD-less frame at present, the UI kept as drawn (needs a restart when\n"
+                       "it was not the placement at start).");
     if (g_ui.placement == Placement::Terminal && !g_hudlessRequested)
         g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "Terminal takes effect after a restart (Save first).");
+    if (g_ui.placement == Placement::Terminal)
+    {
+        if (g_api->Checkbox("Whole frame without a HUD-less colour", &g_ui.wholeFrameFallback))
+            changed = true;
+        g_api->ItemTooltip("No HUD-less colour (none found, or the game's own frame generation is on): NR on the\n"
+                           "whole frame, UI included, on every present. Off: terminal NR waits for a HUD-less colour.");
+    }
 
     int32_t size = (int32_t) g_ui.size;
     const bool sizeOff[] = { false, !rt.FreeRes(), !rt.FreeRes() };
@@ -213,7 +222,8 @@ void DrawTab(void*)
     g_api->ItemTooltip("Runtimes with motion-fed history (lmxxf temporal builds): the network sees its last answer");
     if (g_api->Checkbox("Game exposure", &g_ui.exposure))
         changed = true;
-    g_api->ItemTooltip("Give the runtime the game's exposure texture (lmxxf runtimes that take it)");
+    g_api->ItemTooltip("Before/after upscaling with HDR colour: map it into the network's range with the game's\n"
+                       "exposure texture (off or missing: auto-exposure). SDR: give the runtime the texture.");
 
     if (changed)
         ConfigureAll(g_ui);
@@ -260,6 +270,8 @@ void DrawTab(void*)
         Text("Colour: %s", enc);
     if (st.bypassed)
         g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "NR bypassed: fed median above 1.5 after mapping (colour range not understood)");
+    if (!st.source.empty() && active.placement == Placement::Terminal)
+        Text("Source: %s", st.source.c_str());
     Text("Network history: %s", st.temporal ? "on (motion vectors)" : rt.temporal == 0 ? "not taken by this runtime" : "off");
     Text("Frames: %llu run, %llu skipped", (unsigned long long) st.framesRun, (unsigned long long) st.framesSkipped);
     if (!st.status.empty())

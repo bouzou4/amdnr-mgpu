@@ -976,8 +976,19 @@ void ProxySwapChain::PresenterLoop()
                                    _gameDesc.Width, _gameDesc.Height, sizeHold ? "held" : "resumed"));
             }
 
-            // HUD-less mode never runs NR over the UI: no HUD-less pick, or the gate tripped, presents without NR
-            if (!sizeHold && env.nrWanted && env.nrWanted() && env.nrFrame && (!_wantHud || useHud))
+            // HUD-less mode runs NR over the UI only as the fallback for a game with no HUD-less colour (a run of
+            // misses); a lone miss or the gate presents without NR
+            _hudMissStreak = haveHud ? 0 : _hudMissStreak + 1;
+            const bool whole = _wantHud && !haveHud && CurrentSettings().wholeFrameFallback && _hudMissStreak > 30;
+            if (whole != _wholeFallback)
+            {
+                _wholeFallback = whole;
+                Log(0, whole ? "no HUD-less colour: NR on the whole frame, UI included"
+                             : "HUD-less colour back: NR on it, the UI kept as drawn");
+                std::lock_guard sg(StatsMutex());
+                MutableStats().nrSource = whole ? "whole frame, UI included (no HUD-less colour)" : "HUD-less colour";
+            }
+            if (!sizeHold && env.nrWanted && env.nrWanted() && env.nrFrame && (!_wantHud || useHud || whole))
             {
                 NrInput in;
                 const auto now = std::chrono::steady_clock::now();

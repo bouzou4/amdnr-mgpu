@@ -206,6 +206,8 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     class UiComposite* _ui = nullptr;
     UINT64 _gateUntil = 0;
     bool _gateOn = false;
+    uint32_t _hudMissStreak = 0; // frames in a row without a HUD-less colour
+    bool _wholeFallback = false;
     std::chrono::steady_clock::time_point _lastNr {};
     UINT64 _lastMvW = 0, _lastMvH = 0;
 };

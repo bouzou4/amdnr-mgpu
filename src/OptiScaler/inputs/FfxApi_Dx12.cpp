@@ -11,9 +11,12 @@
 #include "FG/FfxApi_Dx12_FG.h"
 
 #include "ffx_upscale.h"
+#include "ffx_framegeneration.h"
 #include "dx12/ffx_api_dx12.h"
 
 #include <magic_enum.hpp>
+
+#include <plugins/PluginApi.h>
 
 static std::unordered_map<ffxContext, ffxCreateContextDescUpscale> _initParams;
 static std::unordered_map<ffxContext, NVSDK_NGX_Parameter*> _nvParams;
@@ -357,6 +360,46 @@ ffxReturnCode_t ffxDestroyContext_Dx12(ffxContext* context, const ffxAllocationC
     return cdResult;
 }
 
+// The game's FSR FG input for plugin present callbacks (HUD-less colour, generating or not)
+static void NoteGameFgConfigure(const ffxConfigureDescHeader* desc)
+{
+    if (desc->type != FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION || !PluginApi::WantsHudless())
+        return;
+    const auto* fg = reinterpret_cast<const ffxConfigureDescFrameGeneration*>(desc);
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_COMMON;
+    switch ((FfxApiResourceState) fg->HUDLessColor.state)
+    {
+    case FFX_API_RESOURCE_STATE_UNORDERED_ACCESS:
+        st = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        break;
+    case FFX_API_RESOURCE_STATE_COMPUTE_READ:
+        st = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        break;
+    case FFX_API_RESOURCE_STATE_PIXEL_READ:
+        st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        break;
+    case FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ:
+        st = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        break;
+    case FFX_API_RESOURCE_STATE_COPY_SRC:
+        st = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        break;
+    case FFX_API_RESOURCE_STATE_COPY_DEST:
+        st = D3D12_RESOURCE_STATE_COPY_DEST;
+        break;
+    case FFX_API_RESOURCE_STATE_GENERIC_READ:
+        st = D3D12_RESOURCE_STATE_GENERIC_READ;
+        break;
+    case FFX_API_RESOURCE_STATE_RENDER_TARGET:
+        st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        break;
+    default:
+        break;
+    }
+    PluginApi::SetGameFg("FSR FG (game)", static_cast<ID3D12Resource*>(fg->HUDLessColor.resource), (uint32_t) st,
+                         fg->frameGenerationEnabled);
+}
+
 ffxReturnCode_t ffxConfigure_Dx12(ffxContext* context, ffxConfigureDescHeader* desc)
 {
     if (desc == nullptr)
@@ -368,6 +411,10 @@ ffxReturnCode_t ffxConfigure_Dx12(ffxContext* context, ffxConfigureDescHeader* d
     if (type == FFXStructType::SwapchainDX12 || type == FFXStructType::FG)
     {
         ffxReturnCode_t result = PASSTHRU_RETURN_CODE;
+
+        // OptiScaler's own FG (FSRFG input) takes the game's FG: plugin present callbacks are off then
+        if (State::Instance().activeFgInput != FGInput::FSRFG)
+            NoteGameFgConfigure(desc);
 
         if (State::Instance().activeFgInput == FGInput::FSRFG)
             result = ffxConfigure_Dx12FG(context, desc);

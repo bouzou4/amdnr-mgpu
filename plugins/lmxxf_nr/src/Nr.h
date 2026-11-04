@@ -50,6 +50,7 @@ struct NrSettings
     bool temporal = true; // motion-fed network history when the runtime takes it
     bool serialize = false; // the game queue waits for the network right away (measuring, like inline NR)
     float paperWhite = 200.0f; // HDR output: nits the network's 1.0 maps to
+    bool wholeFrameFallback = true; // terminal without a HUD-less colour: NR on the whole frame, UI included
 };
 
 struct NrStats
@@ -71,6 +72,7 @@ struct NrStats
     float guardShare = 0.0f; // share of fed samples above the guard after mapping
     bool bypassed = false;   // the guard tripped: the edit is not applied
     std::string status; // GetStatus
+    std::string source; // terminal: what the network is fed and where the edit goes
 };
 
 // One lmxxf session on the game's device, driven from the upscale callbacks
@@ -207,6 +209,7 @@ class NrEngine
     uint64_t _presentCounter = 0;
     ComPtr<ID3D12Resource> _termCopy, _termOut;
     uint64_t _hudlessMissing = 0;
+    uint32_t _hudlessStreak = 0; // presents in a row without a usable HUD-less colour
     ComPtr<ID3D12DescriptorHeap> _heap;
     uint32_t _heapCursor = 0, _heapStride = 0;
 

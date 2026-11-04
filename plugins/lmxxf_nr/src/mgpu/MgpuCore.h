@@ -17,6 +17,7 @@ struct Settings
     int renderBus = -1;  // -1: the card with no outputs
     int displayBus = -1; // -1: the card with outputs
     bool hudless = false;
+    bool wholeFrameFallback = true; // HUD-less mode with no HUD-less colour for a while: NR on the whole frame
     bool presenter = true; // false: let Windows copy the frame (cross-adapter present)
     bool fallbackInline = true;
     bool nrEveryFrame = false; // the presenter waits for the network's answer each frame
@@ -99,6 +100,7 @@ struct Stats
     std::string nrStatus;
     uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0;
     double uiShare = -1; // share of pixels the UI composite took from the back buffer, last measured
+    std::string nrSource; // what NR runs on (HUD-less mode: the HUD-less colour or the whole-frame fallback)
     bool fallback = false; // display card lost: single-GPU passthrough, no NR
     std::string fallbackReason;
     std::string output; // the display card's output desc
