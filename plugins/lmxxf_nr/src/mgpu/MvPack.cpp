@@ -16,59 +16,17 @@ RWByteAddressBuffer auxB : register(u1);
 cbuffer C : register(b0) { uint w, h, pitch, tilesX, tiles, dataBase, totOff; };
 groupshared uint gMin0, gMin1, gMax0, gMax1;
 groupshared uint gWords[64];
-groupshared uint gPart[1024];
 
 // order-preserving key of a half's bits: -x < -0 < +0 < x, a bijection on 16 bits
 uint Key(uint u) { return (u & 0x8000) ? (~u & 0xFFFF) : (u | 0x8000); }
 uint Unkey(uint k) { return (k & 0x8000) ? (k & 0x7FFF) : (~k & 0xFFFF); }
 uint Bits(uint lo, uint hi) { return hi > lo ? firstbithigh(hi - lo) + 1 : 0; }
-uint TileWords(uint x) { return 2 * ((x & 31) + ((x >> 5) & 31)); }
 
-[numthreads(8, 8, 1)]
-void measure(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID, uint gi : SV_GroupIndex)
-{
-    if (gi == 0) { gMin0 = 0xFFFF; gMin1 = 0xFFFF; gMax0 = 0; gMax1 = 0; }
-    GroupMemoryBarrierWithGroupSync();
-    uint2 p = g.xy * 8 + t.xy;
-    if (p.x < w && p.y < h)
-    {
-        uint v = inB.Load(p.y * pitch + p.x * 4);
-        uint k0 = Key(v & 0xFFFF), k1 = Key(v >> 16);
-        InterlockedMin(gMin0, k0); InterlockedMax(gMax0, k0);
-        InterlockedMin(gMin1, k1); InterlockedMax(gMax1, k1);
-    }
-    GroupMemoryBarrierWithGroupSync();
-    if (gi == 0)
-        outB.Store2((g.y * tilesX + g.x) * 8, uint2(gMin0 | (gMin1 << 16), Bits(gMin0, gMax0) | (Bits(gMin1, gMax1) << 5)));
-}
+// auxB[totOff] counts the packed bytes: header, then each tile's data where its atomic allocation put it
+[numthreads(1, 1, 1)]
+void reset() { auxB.Store(totOff, dataBase); }
 
-// one group: data offset of every tile (in 2-word units, from bit 10 of the header's second word) and the total
-[numthreads(1024, 1, 1)]
-void scan(uint gi : SV_GroupIndex)
-{
-    uint per = (tiles + 1023) / 1024, a = gi * per, e = min(a + per, tiles), s = 0, i;
-    for (i = a; i < e; ++i)
-        s += TileWords(outB.Load(i * 8 + 4));
-    gPart[gi] = s;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint o = 1; o < 1024; o <<= 1)
-    {
-        uint v = gi >= o ? gPart[gi - o] : 0;
-        GroupMemoryBarrierWithGroupSync();
-        gPart[gi] += v;
-        GroupMemoryBarrierWithGroupSync();
-    }
-    uint off = gPart[gi] - s;
-    for (i = a; i < e; ++i)
-    {
-        uint x = outB.Load(i * 8 + 4);
-        outB.Store(i * 8 + 4, (x & 1023) | ((off >> 1) << 10));
-        off += TileWords(x);
-    }
-    if (gi == 1023)
-        auxB.Store(totOff, dataBase + gPart[1023] * 4);
-}
-
+groupshared uint gOff;
 void Put(uint r, uint b, uint bit)
 {
     if (b == 0) return;
@@ -81,20 +39,36 @@ void Put(uint r, uint b, uint bit)
 void pack(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID, uint gi : SV_GroupIndex)
 {
     gWords[gi] = 0;
+    if (gi == 0) { gMin0 = 0xFFFF; gMin1 = 0xFFFF; gMax0 = 0; gMax1 = 0; }
     GroupMemoryBarrierWithGroupSync();
-    uint tile = g.y * tilesX + g.x;
-    uint2 hd = outB.Load2(tile * 8);
-    uint m0 = hd.x & 0xFFFF, m1 = hd.x >> 16, b0 = hd.y & 31, b1 = (hd.y >> 5) & 31;
     uint2 p = g.xy * 8 + t.xy;
-    if (p.x < w && p.y < h)
+    bool inside = p.x < w && p.y < h;
+    uint k0 = 0, k1 = 0;
+    if (inside)
     {
         uint v = inB.Load(p.y * pitch + p.x * 4);
-        Put(Key(v & 0xFFFF) - m0, b0, gi * b0);
-        Put(Key(v >> 16) - m1, b1, 64 * b0 + gi * b1);
+        k0 = Key(v & 0xFFFF);
+        k1 = Key(v >> 16);
+        InterlockedMin(gMin0, k0); InterlockedMax(gMax0, k0);
+        InterlockedMin(gMin1, k1); InterlockedMax(gMax1, k1);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint b0 = Bits(gMin0, gMax0), b1 = Bits(gMin1, gMax1);
+    if (gi == 0)
+    {
+        uint at;
+        auxB.InterlockedAdd(totOff, 8 * (b0 + b1), at);
+        gOff = at;
+        outB.Store2((g.y * tilesX + g.x) * 8, uint2(gMin0 | (gMin1 << 16), b0 | (b1 << 5) | (((at - dataBase) >> 3) << 10)));
+    }
+    if (inside)
+    {
+        Put(k0 - gMin0, b0, gi * b0);
+        Put(k1 - gMin1, b1, 64 * b0 + gi * b1);
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi < 2 * (b0 + b1))
-        outB.Store(dataBase + ((hd.y >> 10) * 2 + gi) * 4, gWords[gi]);
+        outB.Store(gOff + gi * 4, gWords[gi]);
 }
 
 uint Get(uint b, uint base, uint bit)
@@ -142,9 +116,9 @@ bool MvPack::Init(ID3D12Device* dev)
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &err)) ||
         FAILED(dev->CreateRootSignature(0, rs->GetBufferPointer(), rs->GetBufferSize(), IID_PPV_ARGS(&_root))))
         return _err = "root signature", false;
-    const char* entries[4] = { "measure", "scan", "pack", "decode" };
-    ComPtr<ID3D12PipelineState>* psos[4] = { &_measure, &_scan, &_pack, &_decode };
-    for (int i = 0; i < 4; ++i)
+    const char* entries[3] = { "reset", "pack", "decode" };
+    ComPtr<ID3D12PipelineState>* psos[3] = { &_reset, &_pack, &_decode };
+    for (int i = 0; i < 3; ++i)
     {
         ComPtr<ID3DBlob> cs;
         if (FAILED(compile(kMvPackShader, strlen(kMvPackShader), "mgpu_mv_pack", nullptr, nullptr, entries[i], "cs_5_0",
@@ -209,12 +183,9 @@ void MvPack::Encode(ID3D12GraphicsCommandList* cl, UINT slot, ID3D12Resource* sr
     const UINT tx = (w + kTile - 1) / kTile, ty = (h + kTile - 1) / kTile;
     const UINT k[7] = { w, h, Pitch(w), tx, tx * ty, UINT(HeaderBytes(w, h)), (slot % kSlots) * 4 };
     Bind(cl, (slot % kSlots) * 2, src, out, total, k);
-    cl->SetPipelineState(_measure.Get());
-    cl->Dispatch(tx, ty, 1);
-    UavBarrier(cl, out);
-    cl->SetPipelineState(_scan.Get());
+    cl->SetPipelineState(_reset.Get());
     cl->Dispatch(1, 1, 1);
-    UavBarrier(cl, out);
+    UavBarrier(cl, total);
     cl->SetPipelineState(_pack.Get());
     cl->Dispatch(tx, ty, 1);
     UavBarrier(cl, out);

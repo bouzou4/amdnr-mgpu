@@ -1,7 +1,8 @@
 // Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../../LICENSE.
 // Lossless packing of R16G16 motion vectors for the cross-adapter send. Per 8x8 tile and channel: the minimum of an
 // order-preserving 16-bit key of the half-float bits, then every texel's key - minimum in the fewest bits that hold
-// the tile's range. Packed layout: tiles x 2 words of header (minima, bit widths, data offset), then the data.
+// the tile's range. Packed layout: tiles x 2 words of header (minima, bit widths, data offset), then the data, tiles
+// in the order their atomic allocation ran (one pass; the size is deterministic, the layout is not).
 // Only d3d12 and d3dcompiler: the offline test (tools/mvpack_test) builds this file as is.
 #pragma once
 #include <d3d12.h>
@@ -30,7 +31,7 @@ class MvPack
   private:
     Microsoft::WRL::ComPtr<ID3D12Device> _dev;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> _root;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> _measure, _scan, _pack, _decode;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> _reset, _pack, _decode;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> _heap;
     UINT _inc = 0;
     const char* _err = "";
