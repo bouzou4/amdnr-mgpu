@@ -36,6 +36,7 @@
 #include <unordered_set>
 #include <vector>
 #include "resource.h" // VER_PRODUCT_NAME (ProductName)
+#include "NrLooks.h"
 
 // Logger.cpp: this process's session header line (0.3.3.2); empty before BeginLogSession.
 std::string SessionHeaderText();
@@ -921,6 +922,7 @@ int DanielFastModeRuntimeOwn() { return AmdPreSr::RuntimeOwnQuality(); }
 // final image mode, so the two never disagree about what a slider means.
 static AmdPreSr::Settings BuildSettings(float sessionScale)
 {
+    Looks::Apply();
     const auto& cfg = *Config::Instance();
     AmdPreSr::Settings s {};
     s.rtgi.enabled = cfg.AmdRtgiEnabled.value_or_default();
@@ -1090,9 +1092,7 @@ static AmdPreSr::Settings BuildSettings(float sessionScale)
     // giveaway that the 1 was a guess rather than a limit.
     s.tone=s.toneChannels ? std::clamp(cfg.AmdNeuralLightingStrength.value_or_default(),0.f,2.f) : 0.f;
     s.structure = cfg.DlssNrLocalStructure.value_or_default();
-    s.skin = cfg.DlssNrSkinStructure.value_or_default();
-    if (s.skin < 0)
-        s.skin = s.structure;
+    s.skin = Looks::SkinStructure(s.structure, cfg.DlssNrSkinStructure.value_or_default());
     {
         // AMDNR 0.3.4 (plan section 3): carried into Settings only; each field's default is the 0.3.3.2 behaviour.
         // A value outside its range means the default, so a hand-edited typo never changes behaviour: shaper
@@ -1347,7 +1347,7 @@ static bool OneStreamPerFrame(StreamWatch& w, bool post, NVSDK_NGX_Parameter* pa
             char measured[64];
             std::snprintf(measured, sizeof measured, "%.1f", ratio);
             LogLine(std::string("AMD neural: ") + measured + " NR entries per presented frame" +
-                    (post ? " after Ray Regeneration" : "") +
+                    (post ? " after upscaling" : "") +
                     (multi ? " (split view, a scope or a second upscaler context): NR runs on the largest, the others "
                              "pass through untouched ([DlssNr] AmdOneStreamPerFrame)"
                            : " again: every entry runs NR"));
@@ -2023,7 +2023,7 @@ static bool Run(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* params, ID3
         {
             lastState = state;
             ++changes;
-            std::string line = "AMD neural: colour " + std::string(post ? "(after Ray Regeneration) " : "") + "is " +
+            std::string line = "AMD neural: colour " + std::string(post ? "(after upscaling) " : "") + "is " +
                                (f.displayReferred ? "display-referred" : "linear") + " - " +
                                (haveFlags ? (notHdr ? "no IsHDR create flag" : "IsHDR create flag") : "no create flags") +
                                ", DXGI format " + std::to_string(static_cast<int>(format)) +
@@ -2069,13 +2069,26 @@ static bool Run(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* params, ID3
         replacementColour = result;
         params->Set(NVSDK_NGX_Parameter_Color, result);
     }
+    {
+        static int saidLook = -2, saidPost = -1;
+        const int look = Looks::Current();
+        if (look != saidLook || int(post) != saidPost)
+        {
+            saidLook = look;
+            saidPost = int(post);
+            const bool keySet = Config::Instance()->AmdPlacement.value_or_default() >= 0;
+            Message((std::string("AMD neural: NR look ") + Looks::Name(look) + ", placement " +
+                     (post ? "after" : "before") + " upscaling (" + (keySet ? "[DlssNr] AmdPlacement" : "the look") + ")")
+                        .c_str());
+        }
+    }
     // Post-RR: the backend wrote the frame back into the output itself; nothing to swap.
     // One line in amd_bridge.log so a session can be told apart from a pre-SR one.
     static bool saidPost = false;
     if (post && result && !saidPost)
     {
         saidPost = true;
-        Message(("AMD neural after Ray Regeneration: output " + std::to_string(f.width) + "x" +
+        Message(("AMD neural after upscaling: output " + std::to_string(f.width) + "x" +
                  std::to_string(f.height) + ", guides " + std::to_string(f.guideWidth) + "x" +
                  std::to_string(f.guideHeight) + ", NR scale " + std::to_string(sessionScale))
                     .c_str());

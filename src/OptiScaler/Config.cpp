@@ -513,6 +513,10 @@ bool Config::Reload(std::filesystem::path iniPath)
             AmdEditShaperCarryCap.set_from_config(readBool("DlssNr", "AmdEditShaperCarryCap"));
             AmdDanielHighlightGuard.set_from_config(readBool("DlssNr", "AmdDanielHighlightGuard"));
             AmdRuntimeStyle.set_from_config(readInt("DlssNr", "AmdRuntimeStyle"));
+            AmdNrLook.set_from_config(readInt("DlssNr", "AmdNrLook"));
+            AmdPlacement.set_from_config(readString("DlssNr", "AmdPlacement", true).transform(
+                [](const std::string& v) { return v == "post" ? 1 : v == "pre" ? 0 : -1; }));
+            AmdFaceDetail.set_from_config(readBool("DlssNr", "AmdFaceDetail"));
             AmdToneCurve.set_from_config(readInt("DlssNr", "AmdToneCurve"));
             AmdToneLift.set_from_config(readFloat("DlssNr", "AmdToneLift"));
             AmdUseGameExposure.set_from_config(readInt("DlssNr", "AmdUseGameExposure"));
@@ -1695,6 +1699,12 @@ bool Config::SaveIni()
     // AmdEditShaper.
     ini.SetValue("DlssNr", "AmdDanielHighlightGuard", GetBoolValue(Instance()->AmdDanielHighlightGuard.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdRuntimeStyle", GetIntValue(Instance()->AmdRuntimeStyle.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdNrLook", GetIntValue(Instance()->AmdNrLook.value_for_config()).c_str());
+    {
+        const auto placement = Instance()->AmdPlacement.value_for_config();
+        ini.SetValue("DlssNr", "AmdPlacement", !placement.has_value() ? "" : *placement == 1 ? "post" : "pre");
+    }
+    ini.SetValue("DlssNr", "AmdFaceDetail", GetBoolValue(Instance()->AmdFaceDetail.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdToneCurve", GetIntValue(Instance()->AmdToneCurve.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdToneLift", GetFloatValue(Instance()->AmdToneLift.value_for_config()).c_str());
     ini.SetValue("DlssNr", "AmdUseGameExposure", GetIntValue(Instance()->AmdUseGameExposure.value_for_config()).c_str());

@@ -9,6 +9,7 @@
 #include <dlssnr/DlssNrFeature_Dx12.h>
 #include <dlssnr/DlssNrFeature_Vk.h>
 #include <dlssnr/amd/AmdBridge.h>
+#include <dlssnr/amd/NrLooks.h>
 #include <dlssnr/gi/GiSeam.h>
 
 namespace DlssNr
@@ -16,7 +17,8 @@ namespace DlssNr
 namespace
 {
 bool Enabled() { return Config::Instance()->DlssNrEnabled.value_or_default(); }
-bool RunBeforeSr() { return Config::Instance()->DlssNrRunBeforeSr.value_or_default(); }
+// AMD path: AmdPlacement or the NR look (0.3.4.2 ran pre only; post came with 0.3.5).
+bool PostSr() { return DlssNr::Looks::PostPlacement(); }
 } // namespace
 
 void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
@@ -29,7 +31,7 @@ void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramet
     if (AmdnrGi::Seam::Wanted())
         AmdnrGi::Seam::BeforeNr(cmdList, params, timingQueue, submissionEpoch);
 
-    if (Enabled() && RunBeforeSr())
+    if (Enabled() && !PostSr())
         AmdBridge::Before(cmdList, params, timingQueue, submissionEpoch);
 }
 
@@ -39,8 +41,8 @@ void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramete
     if (cmdList == nullptr || params == nullptr || !Enabled())
         return;
 
-    // Post placement: after SR when pre-SR is off, after RR when ApplyAfterRR asks for it.
-    const bool post = forcePost ? Config::Instance()->DlssNrApplyAfterRR.value_or_default() : !RunBeforeSr();
+    // After RR always (AMDNR's ini: no setting), after SR when the placement says post.
+    const bool post = forcePost || PostSr();
     if (post)
         AmdBridge::After(cmdList, params, timingQueue, submissionEpoch);
 }

@@ -612,6 +612,11 @@ class Config
     // AmdUseGameExposure -1..1 (-1 auto = the title's exposure is used when it publishes one; 0 ignore it; 1 use it).
     //   Shared by both runtimes (lmxxf: its title-exposure gate).
     CustomOptional<int> AmdRuntimeStyle { -1 };
+    // 0.3.5 keys rebuilt from AMDNR's published docs (docs/AMDNR_GAPS.md 3.4). AmdNrLook -1 auto (Full Model Look),
+    // 0 NVIDIA look, 1 AMDNR soft. AmdPlacement -1 empty (the look decides), 0 pre, 1 post. AmdFaceDetail: faces 1.5x.
+    CustomOptional<int> AmdNrLook { -1 };
+    CustomOptional<int> AmdPlacement { -1 };
+    CustomOptional<bool> AmdFaceDetail { true };
     CustomOptional<int> AmdToneCurve { -1 };
     CustomOptional<float> AmdToneLift { -1.f };
     CustomOptional<int> AmdUseGameExposure { -1 };

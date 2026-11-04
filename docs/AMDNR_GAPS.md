@@ -34,7 +34,7 @@ Everything in `main/AMDNR-source` that compiles on this base is built unchanged,
 - the `[DlssNr]` config block (`Config.h` / `Config.cpp`), the toggle and capture keys;
 - AMDNR's changes to upstream files that it published (98 files: hooks, menu, framegen, hudfix, resource tracking, upscalers, Streamline hooks, etc.).
 
-The only edit to a published AMDNR file is the raw-literal split in `dlssnr/amd/TemporalStability.h` (4.3).
+Edits to published AMDNR files: the raw-literal split in `dlssnr/amd/TemporalStability.h` (4.3), and the 0.3.5 looks and placement of 3.4 (`Config.h/.cpp`, `dlssnr/amd/AmdBridge.cpp`, `dlssnr/lmxxf/LmxxfBackend.cpp`, `dlssnr/menu/NeuralTop.cpp`; the post placement's log lines say "after upscaling" where 0.3.4.2 said "after Ray Regeneration", its only post case).
 
 ## 3. Gaps and what stands in for them
 
@@ -42,7 +42,7 @@ The only edit to a published AMDNR file is the raw-literal split in `dlssnr/amd/
 
 | Missing file | Stand-in | Effect |
 |---|---|---|
-| `shaders/dlssnr/DlssNr_Dx12.cpp` (the NVIDIA `nvngx_dlssnr` pass, feature lifetime, the evaluate dispatcher, `ScopedNrStateEnvelope`) | Replacement at the same path: the `DlssNr` namespace API routes to `DlssNr::AmdBridge`. `EvaluateBeforeUpscale` runs `AmdBridge::Before` when `[DlssNr] RunBeforeSR` is on (and the GI seam when `[AmdGi]` is on); `EvaluateAfterUpscale` runs `AmdBridge::After` otherwise, or after RR when `ApplyAfterRR`. | AMD path only. The NVIDIA model path is off. No `ScopedNrStateEnvelope`: the NR passes sit inside the upscaler's own root-signature window (upstream `RestoreRoot`, controlled by `RestoreComputeSignature` / `RestoreGraphicSignature`). The presented-frame epoch is passed as 0 (only `AmdOneStreamPerFrame` reads it). Calibration, exposure status, captures and `LastGpuTime` of the NVIDIA path return empty values. |
+| `shaders/dlssnr/DlssNr_Dx12.cpp` (the NVIDIA `nvngx_dlssnr` pass, feature lifetime, the evaluate dispatcher, `ScopedNrStateEnvelope`) | Replacement at the same path: the `DlssNr` namespace API routes to `DlssNr::AmdBridge`. `EvaluateBeforeUpscale` runs `AmdBridge::Before` (and the GI seam when `[AmdGi]` is on) when the placement is pre; `EvaluateAfterUpscale` runs `AmdBridge::After` when it is post, and always after an RR evaluate. The placement is `[DlssNr] AmdPlacement`, or the NR look's own (3.4). `RunBeforeSR` / `ApplyAfterRR` are the NVIDIA path's keys and do not steer the AMD path, as in 0.3.4.2. | AMD path only. The NVIDIA model path is off. No `ScopedNrStateEnvelope`: the NR passes sit inside the upscaler's own root-signature window (upstream `RestoreRoot`, controlled by `RestoreComputeSignature` / `RestoreGraphicSignature`). The presented-frame epoch is passed as 0 (only `AmdOneStreamPerFrame` reads it). Calibration, exposure status, captures and `LastGpuTime` of the NVIDIA path return empty values. |
 | `shaders/dlssnr/DlssNr_Common.h` | Stub with the standard headers the API headers need. | None for the AMD path. |
 | `shaders/dlssnr/DlssNr_Vk.cpp/.h`, `DlssNr_ActiveColor.h`, `precompile/dlssnr.hlsl` | `DlssNr_Vk.cpp` dropped from the project; `dlssnr/DlssNrFeature_Vk.cpp` excluded; the Vk API is stubbed in the replacement above. | No native Vulkan NR. The Vulkan-on-D3D12 bridge path (`IFeature_VkwDx12`) still calls the AMD bridge. |
 | `shaders/fsrd_preprocess/*` (`FSRDPreprocessor_Dx12`, `FSRDShaderUtils.h`, `FSRDRuntimeStatus.h`) | `FSRDRuntimeStatus.h` stub (every value "no RR frame yet"); the rest absent. | FSR Ray Regeneration cannot build: see 3.3. |
@@ -60,6 +60,7 @@ The only edit to a published AMDNR file is the raw-literal split in `dlssnr/amd/
 | `inputs/FG/Upscaler_Inputs_Dx12.cpp` | `CaptureInfo::Upscaler` -> `UpscalerPass` (AMDNR renamed the enumerator). | |
 | `proxies/XeFG_Proxy.h` | `NativeModule`, `NativePath`, `NoteInitResult`, `InitFailedAt`, `InitFailedCode` stubs. | Native-XeFG detection (a game's own `libxess_fg.dll` keeps its own FG) and the init-failure readout. |
 | `proxies/FfxApi_Proxy.h` | `IsDenoiserApiImplementedDx12()` returns false, `DenoiserApiGenerationDx12()` returns `Unsupported`, enum `FfxDenoiserApiGeneration`. | The Ray Regeneration 1.2 ABI check. |
+| `spoofing/Dxgi_Spoofing.cpp` (upstream, not modified by AMDNR's snapshot) | Upstream `8f2a9435` (2026-10-23) backported: `GetDesc1` keeps the real AMD vendor id for `amdxcffx64.dll`. Without it the driver's FSR 4 provider sees the spoofed NVIDIA adapter and refuses, and the FFX Upscaler list has only 3.1.6 and 2.3.4. | 0.3.5.8R13 lists four providers (SDK `4.1.2`, driver `4.1.2 *`, `3.1.6`, `2.3.4`) because it lists the driver provider next to the SDK's itself (the newer upstream `FSR4DriverProvider`). This base lists three: `4.1.2 *`, `3.1.6`, `2.3.4`, so an `[FSR] UpscalerIndex` saved by R13 points one entry further down here (R13's 1 = `4.1.2 *`, here 0). |
 | `shaders/output_scaling/OS_Dx12.cpp` | none (upstream) | AMDNR's dispatch-size fix (`dlssnr/README.md`): only matters when NR calls Output Scaling, which the AMD path does not. |
 | Everything else in `inputs/`, `proxies/`, `shaders/`, `low_latency/` | upstream | Unknown until AMDNR publishes; diff the 0.5.0 tree against `c983a500`. |
 
@@ -75,7 +76,17 @@ The only edit to a published AMDNR file is the raw-literal split in `dlssnr/amd/
 
 ### 3.4 Behaviour that is 0.3.5.x, not 0.3.4.2
 
-The base is the 0.3.4.2 snapshot; the released binary is 0.3.5.8R13. Keys that 0.3.5.x added are ignored by this build (they stay in the ini), notably `[DlssNr] AmdPlacement`, `AmdNrLook` (the Full Model Look and its `[POSTLOOK]` / `[FULLLOOK]` defaults), `AmdLmxxfFreshPrior` and the 2560x1440 network size under the NVIDIA look. Placement here is 0.3.4.2's: after upscaling unless `RunBeforeSR=true`. `LmxxfFullNetwork` exists in both.
+The base is the 0.3.4.2 snapshot; the released binary is 0.3.5.8R13. Rebuilt from AMDNR's published 0.3.5.8 docs (README "NR style" / "Neural placement", the release `OptiScaler.ini`) as parameter presets over keys and runtime controls 0.3.4.2 already has (`dlssnr/amd/NrLooks.h`):
+
+| 0.3.5 item | Here |
+|---|---|
+| `[DlssNr] AmdNrLook`: Full Model Look (`auto`), NVIDIA look (`0`), AMDNR soft (`1`), first in the NR style combo, the named styles (Cinematic, Crisp, Natural, Vivid) after them | Done. A look fills only keys left on auto, as volatile values (never saved): Structure intensity, Edit detail, Edit colour, Residual limit, Edge guard, Temporal stability, Output smoothing, `AmdRuntimeStyle`, `LmxxfFullNetwork`. Picking one in the menu resets those sliders and writes its placement and Full network as the user's values, as R13 does. |
+| lmxxf network style (`AmdRuntimeStyle` 0..2 on lmxxf) | Done: sent as the ABI v1 `control_style` (0.3.4.2 always sent the shipped 1). The controls match R13's log: Full Model Look `ctl=1,1,3,2,0`, NVIDIA look with `AmdPlacement=pre` `ctl=1,1,1.5,1,0`. |
+| `[DlssNr] AmdPlacement` (pre / post / empty = the look's) | Done, plus a Neural placement combo next to NR style. 0.3.4.2 ran the AMD path pre only; post came with 0.3.5. |
+| `[DlssNr] AmdFaceDetail` (faces 1.5x the structure while Character structure follows it, at most 4) | Done (`AmdBridge` BuildSettings). |
+| `AmdLmxxfFreshPrior`, fresh-only carry (`[LMX-CARRY]`), `[LMXHIST]` history tests, `[POSTLOOK] mv-resample=nearest`, `AmdDetailLift` wording, the TDR record / cost gate that moves post back to pre, the 2560x1440 network size under the NVIDIA look (`AmdLmxxfTierCap`), Refine passes, NR resolution above 150 %, HIP cache off (`GPU_RESOURCE_CACHE_SIZE=0`) | Not recovered: host or runtime code that the published docs describe but do not specify. Wait for the 0.5.0 source. |
+
+`LmxxfFullNetwork` exists in both.
 
 ## 4. Toolchain
 

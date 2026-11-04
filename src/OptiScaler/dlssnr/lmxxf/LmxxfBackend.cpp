@@ -2405,7 +2405,7 @@ ID3D12Resource* Backend::Impl::Record(ID3D12GraphicsCommandList* cmd, const AmdP
                  ? " (tier snap: " + std::to_string(askedW) + "x" + std::to_string(askedH) + " grown to fill the " +
                        std::to_string(tierSnap.from) + " tier, the same cost)"
                  : " (tier snap on: kept, the " + std::to_string(tierSnap.from) + " tier)") +
-            (f.writeBack ? " | after Ray Regeneration: depth " + std::to_string(f.guideWidth) + "x" + std::to_string(f.guideHeight) +
+            (f.writeBack ? " | after upscaling: depth " + std::to_string(f.guideWidth) + "x" + std::to_string(f.guideHeight) +
                                " resampled to the output, result written back into the output" : "") +
             " | " + PoolNote() + " | " + MemoryNote());
         // What the title hands us, once: the formats and conventions every carry decision rests on.
@@ -2446,8 +2446,11 @@ ID3D12Resource* Backend::Impl::Record(ID3D12GraphicsCommandList* cmd, const AmdP
     // structure; NrControls.h): a change rebuilds the runtime's network at the next PrepareFrame, exactly as a Full
     // network change does, so the job in flight is abandoned the same way. The built-in values (all the defaults) and a
     // runtime that refused the controls send nothing new: the 0.3.3.2 frame.
-    const AmdPreSr::NrControls wantCtl =
+    AmdPreSr::NrControls wantCtl =
         ctlRefused ? AmdPreSr::NrControls {} : AmdPreSr::ResolveNrControls(cfg.autoMask, cfg.structure, cfg.skin);
+    // 0.3.5 network style (AmdRuntimeStyle 0..2) as the style control; auto keeps the shipped 1.
+    if (!ctlRefused && cfg.runtimeStyle >= 0 && cfg.runtimeStyle <= 2)
+        wantCtl.style = float(cfg.runtimeStyle);
     if (inFlight && ctx && ctx == ctlCtx && wantCtl != ctlSent)
     {
         api.AbandonJob(ctx, job.handle);
@@ -3354,8 +3357,8 @@ ID3D12Resource* Backend::Impl::Record(ID3D12GraphicsCommandList* cmd, const AmdP
                                          : sendCtl ? std::string("ctl=? (runtime did not say)")
                                                    : std::string("no ctl= (built-in)");
                 char values[96] {};
-                std::snprintf(values, sizeof values, "tone %g, structure %g, skin %g, other %g", wantCtl.tone, wantCtl.structure,
-                              wantCtl.skin, wantCtl.other);
+                std::snprintf(values, sizeof values, "tone %g, structure %g, skin %g, other %g, style %g", wantCtl.tone,
+                              wantCtl.structure, wantCtl.skin, wantCtl.other, wantCtl.style);
                 Log(std::string("lmxxf: character mask ") + (cfg.autoMask ? "on" : "off") + " ([DlssNr] AutoMask), controls " + values +
                     (wantCtl.BuiltIn() ? " (lmxxf's built-in values)" : "") + " - runtime " + word +
                     (live ? " - applied live: the runtime rebuilt the network, its history restarts" : ""));

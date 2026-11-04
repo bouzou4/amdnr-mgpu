@@ -5,6 +5,7 @@
 #include "NeuralUi.h"
 
 #include <dlssnr/amd/AmdBridge.h>
+#include <dlssnr/amd/NrLooks.h>
 #include <dlssnr/amd/PresentExperimental.h> // AmdFinalImage (Final image mode)
 #include <dlssnr/lmxxf/LmxxfBackend.h>      // RuntimePath (the runtime DLL's version), LateSubmitNrShare
 #include <dlssnr/lmxxf/LmxxfTierPolicy.h>   // PlanLmxxfSize: the Preset hover's lmxxf tiers (pure, header-only)
@@ -1499,10 +1500,30 @@ void DrawPresetAndStyle(const Ctx& ctx)
     // slots in a popup (0.3.3.2: the "Custom style slots" tree; Save / Load are now Store / Apply, so Store is not
     // mistaken for Save Settings).
     {
+        // 0.3.5: the three looks first, then the named styles over them (AMDNR README "NR style").
         const int match = MatchingStyle(*config);
-        if (BeginCombo("NR style", match < 0 ? "Custom" : kStylePresets[match].name))
+        const int look = Looks::Current();
+        const char* label = match > 0 ? kStylePresets[match].name : Looks::Untouched() ? Looks::Name(look) : "Custom";
+        if (BeginCombo("NR style", label))
         {
-            for (int p = 0; p < kStylePresetCount; ++p)
+            static const char* const kLookHelp[3] = {
+                "NVIDIA's network (style 0, all 71 blocks) with stronger model intensities: Structure 2, Edit detail"
+                " 1.5, Edit colour 1.25, no residual limit or edge guard, Temporal stability 0.5. Runs after"
+                " upscaling unless Neural placement is set.",
+                "The closest to NVIDIA's own output: style 0, all 71 blocks, no residual limit or edge guard."
+                " Before upscaling.",
+                "The earlier AMDNR picture: style 1, three blocks skipped, Residual limit 0.25, Edge guard 0.5."
+                " Softer and steadier. Before upscaling.",
+            };
+            const int looks[3] = { Looks::FullModel, Looks::Nvidia, Looks::Soft };
+            for (int i = 0; i < 3; ++i)
+            {
+                if (ImGui::Selectable(Looks::Name(looks[i]), match <= 0 && look == looks[i] && Looks::Untouched()))
+                    Looks::Pick(looks[i]);
+                HelpForLastItem(kLookHelp[i]);
+            }
+            ImGui::Separator();
+            for (int p = 1; p < kStylePresetCount; ++p)
             {
                 if (ImGui::Selectable(kStylePresets[p].name, p == match))
                     ApplyStyleValues(*config, kStylePresets[p].v);
@@ -1512,9 +1533,34 @@ void DrawPresetAndStyle(const Ctx& ctx)
             }
             ImGui::EndCombo();
         }
-        Help("Named looks: a style sets the Residual, Temporal stability, Sharpening, Detail, Colour and Model"
-             " strength sliders and Output smoothing together (not Colour composition). Each runtime uses the parts"
-             " it has. Custom: the sliders match no style.");
+        Help("The first three are whole looks: picking one also sets Neural placement and Full network. The named"
+             " styles below set the Residual, Temporal stability, Sharpening, Detail, Colour and Model strength"
+             " sliders and Output smoothing together (not Colour composition). Custom: the sliders match no style.",
+             {}, "[DlssNr] AmdNrLook");
+        // 0.3.5 Neural placement (AmdPlacement): empty follows the look.
+        {
+            const int cur = config->AmdPlacement.value_or_default();
+            const char* items[3] = { "Look's default", "Before upscaling", "After upscaling" };
+            int idx = cur == 0 ? 1 : cur == 1 ? 2 : 0;
+            if (BeginCombo("Neural placement", items[idx]))
+            {
+                for (int i = 0; i < 3; ++i)
+                    if (ImGui::Selectable(items[i], i == idx))
+                    {
+                        if (i == 0)
+                            config->AmdPlacement = std::optional<int> {};
+                        else
+                            config->AmdPlacement = i - 1;
+                    }
+                ImGui::EndCombo();
+            }
+            Help(Looks::PostPlacement()
+                     ? "Before upscaling: the network edits the render-resolution picture. After upscaling: it edits"
+                       " the finished output (fitted into the 1080 network size and lifted back). Running: after."
+                     : "Before upscaling: the network edits the render-resolution picture. After upscaling: it edits"
+                       " the finished output (fitted into the 1080 network size and lifted back). Running: before.",
+                 {}, "[DlssNr] AmdPlacement");
+        }
         ImGui::SameLine();
         if (Button("Style slots"))
             ImGui::OpenPopup("nrStyleSlots");
