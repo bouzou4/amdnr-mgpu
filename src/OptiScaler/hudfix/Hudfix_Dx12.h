@@ -146,6 +146,13 @@ class Hudfix_Dx12
     // Frees the capture and format transfer buffers, recreated on the next capture
     static void ReleaseBuffers();
 
+    // HUD-less capture for a plugin present callback (PluginApi::WantsHudless) when frame generation is off
+    static bool PluginOnly();
+    // Last capture (COPY_DEST state) and the upscale counter it was taken in
+    static ID3D12Resource* PluginHudless(UINT64* frame);
+    inline static ID3D12Resource* _pluginHudless = nullptr;
+    inline static UINT64 _pluginHudlessFrame = 0;
+
     static bool GetSkipStatus() { return _skipTracking.load(std::memory_order_acquire); }
     static void SetSkipStatus(bool status) { _skipTracking.store(status, std::memory_order_release); }
 };

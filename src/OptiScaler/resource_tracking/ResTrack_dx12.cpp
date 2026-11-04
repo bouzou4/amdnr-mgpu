@@ -6,6 +6,7 @@
 #include <Util.h>
 
 #include <menu/menu_overlay_dx.h>
+#include <plugins/PluginApi.h>
 
 #include <algorithm>
 #include <future>
@@ -519,6 +520,11 @@ static bool IsDescriptorEnabled(ResourceType type)
 
 bool ResTrack_Dx12::IsHudFixActive()
 {
+    // A plugin's HUD-less capture without frame generation
+    if (Hudfix_Dx12::PluginOnly())
+        return State::Instance().currentFeature != nullptr && _presentDone && !Hudfix_Dx12::SkipHudlessChecks() &&
+               Hudfix_Dx12::IsResourceCheckActive();
+
     if (!Config::Instance()->IsFGEnabled() || !Config::Instance()->FGHUDFix.value_or_default())
     {
         LOG_TRACK("!Config::Instance()->IsFGEnabled() || !Config::Instance()->FGHUDFix.value_or_default()");
@@ -2515,8 +2521,10 @@ void ResTrack_Dx12::HookCommandList(ID3D12Device* InDevice)
                 DetourTransactionBegin();
                 DetourUpdateThread(GetCurrentThread());
 
-                // Only needed for hudfix
-                if (State::Instance().activeFgInput == FGInput::Upscaler)
+                // Only needed for hudfix (FG, or a plugin's HUD-less request)
+                const bool hudfix =
+                    State::Instance().activeFgInput == FGInput::Upscaler || PluginApi::WantsHudless();
+                if (hudfix)
                 {
                     if (o_Reset != nullptr)
                         DetourAttach(&(PVOID&) o_Reset, hkReset);
@@ -2556,7 +2564,7 @@ void ResTrack_Dx12::HookCommandList(ID3D12Device* InDevice)
                     o_Dispatch = nullptr;
                     o_SetComputeRootDescriptorTable = nullptr;
                 }
-                else if (State::Instance().activeFgInput == FGInput::Upscaler)
+                else if (hudfix)
                 {
                     _bindingTrackingEnabled.store(persistentBindings, std::memory_order_release);
                 }
@@ -2578,6 +2586,8 @@ void ResTrack_Dx12::HookDevice(ID3D12Device* device)
 
     if (device == nullptr)
         return;
+
+    LOG_INFO("Resource tracking hooks for HUD-less detection");
 
     bool initializeTracking = false;
     {

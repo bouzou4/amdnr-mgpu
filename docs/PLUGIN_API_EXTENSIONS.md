@@ -8,7 +8,7 @@ Versioning for all of them: the new functions are appended to the end of `OptiPl
 |---|---|---|---|
 | 1 | Upscale callbacks + command list state restore | `RegisterUpscaleCallbacks`, `RestoreCommandListState` | built, used by the plugin |
 | 3 | Overlay text lines | `RegisterOverlayText` | built, used by the plugin |
-| 2 | Present callback with the frame-end resources | see 2 | see 2 |
+| 2 | Present callback + HUD-less colour without frame generation | `RegisterPresentCallback` | built, used by the plugin |
 | 5 | Adapter override + unhooked device creation | see 5 | see 5 |
 | 6 | Swapchain provider | see 6 | see 6 |
 
@@ -70,3 +70,39 @@ bool (*RegisterOverlayText)(OptiPlugin* plugin, const char* label, OptiOverlayTe
 - Registrations made in `OptiPluginInit` are dropped when it returns false.
 
 **What the plugin taught.** A text callback is enough for the NR and multi-GPU stats; graphs (frame time style) would need `PlotLines` (assessment PR 4) and are left out. A Custom-overlay row key per plugin line (so users can place them) is a possible follow-up.
+
+## 2. Present callback and the HUD-less colour without frame generation
+
+**Why.** Work that belongs at the end of the frame (Neural Rendering on the finished picture with the UI kept as drawn, a capture tool, a second GPU that presents) needs the back buffer at present time, and most of it needs the frame before its UI. OptiScaler already finds that HUD-less colour (HUDfix), but only feeds it to its own frame generation, so with FG off it is not found at all, and there is no point where a plugin runs at present.
+
+**ABI.**
+
+```c
+typedef struct OptiPresentFrame {
+    uint32_t size; uint32_t api; uint32_t phase;      // OptiPresent_BeforeOverlay / OptiPresent_AfterOverlay
+    uint32_t reserved;
+    void* device; void* queue; void* swapchain;       // ID3D12Device*, the present queue, the IDXGISwapChain*
+    void* backBuffer; uint32_t backBufferState;       // this frame's buffer, with its UI, PRESENT
+    uint32_t colorSpace;                              // DXGI_COLOR_SPACE_TYPE of the output
+    void* hudless; uint32_t hudlessState;             // HUDfix's capture of this frame, NULL when none
+    uint32_t width, height, format, syncInterval, presentFlags;
+    uint64_t frameId, upscaleFrameId;
+} OptiPresentFrame;
+typedef void (*OptiPresentFn)(OptiPresentFrame* frame, void* userData);
+bool (*RegisterPresentCallback)(OptiPlugin* plugin, OptiPresentFn fn, uint32_t requests, void* userData);
+// requests: OptiPresentRequest_Hudless
+```
+
+**Behaviour.**
+
+- Called from `LocalPresent` (`wrapped/wrapped_swapchain.cpp`) for D3D12 swapchains while frame generation is not presenting: once before OptiScaler draws its menu and FPS overlay (`BeforeOverlay`, where a post-process belongs, so OptiScaler's own UI is not processed), once right before the real `Present` (`AfterOverlay`, where a capture or a second presenter belongs). The plugin submits its own command lists to `queue`; it returns the back buffer in `PRESENT`.
+- `OptiPresentRequest_Hudless` keeps HUDfix's HUD-less detection running with frame generation off: the resource tracker is installed at device creation when a plugin asked for it (so it must be asked for in `OptiPluginInit`), `Hudfix_Dx12` takes a plugin as an active consumer, the upscale end arms it for the frame like FG does, and the present advances its frame counter. The pick is HUDfix's capture buffer as it is (same format group as the swapchain; FG's format conversion needs the FG feature and is skipped), handed over only in the present of the frame it was taken in (`hudless` is NULL otherwise), so a back buffer is never paired with another frame's HUD-less colour.
+- When FG is active nothing changes: FG keeps the HUD-less pick and the callbacks are not called (FG presents interpolated frames through its own swapchain).
+- SEH guarded like the other callbacks.
+
+**What the plugin taught.**
+
+- Two phases were needed: the terminal NR wants to run before OptiScaler's overlay, the multi-GPU capture after it.
+- Pairing matters: the multi-GPU prototype took the pick when HUDfix found it, while the game was already recording the next frame, and paired back buffers with the wrong frame's HUD-less colour (74.9 % to 100 % of pixels "differing" in Satisfactory, up to 209 gate trips per run). Handing the pick over at the present of the frame it was captured in removes that by construction.
+- Depth and motion vectors at present time are not included: they are the upscaler's inputs, which the upscale callbacks (1) already give, on the game's command list, in the frame they belong to.
+- Not covered: D3D11 swapchains, and frame generation on (a plugin presenting after FG would need FG to hand over its output).

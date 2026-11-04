@@ -190,6 +190,36 @@ void UpscalerInputsDx12::UpscaleEnd(ID3D12GraphicsCommandList* InCmdList, NVSDK_
 
     auto fg = State::Instance().currentFG;
 
+    // HUD-less capture for a plugin, frame generation off: the same counters and output check as below
+    if (Hudfix_Dx12::PluginOnly())
+    {
+        Hudfix_Dx12::UpscaleEnd(feature->FrameCount(), State::Instance().lastFGFrameTime);
+
+        ID3D12Resource* output = nullptr;
+        if (InParameters->Get(NVSDK_NGX_Parameter_Output, &output) != NVSDK_NGX_Result_Success)
+            InParameters->Get(NVSDK_NGX_Parameter_Output, (void**) &output);
+
+        if (output != nullptr)
+        {
+            ResourceInfo info {};
+            auto desc = output->GetDesc();
+            info.buffer = output;
+            info.width = desc.Width;
+            info.height = desc.Height;
+            info.format = desc.Format;
+            info.flags = desc.Flags;
+            info.type = UAV;
+            info.captureInfo = CaptureInfo::Upscaler;
+
+            Hudfix_Dx12::CheckForHudless(InCmdList, &info,
+                                         (D3D12_RESOURCE_STATES) Config::Instance()->OutputResourceBarrier.value_or(
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                                         true);
+        }
+
+        return;
+    }
+
     if (fg == nullptr || State::Instance().activeFgInput != FGInput::Upscaler || _device == nullptr)
         return;
 

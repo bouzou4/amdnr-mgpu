@@ -39,4 +39,11 @@ class PluginApi
 
     // The plugins' overlay lines that are shown this frame
     static std::vector<OverlayLine> GetOverlayLines();
+
+    // Present callbacks of the plugins
+    static bool HasPresentCallbacks();
+    static bool WantsHudless(); // a plugin asked for the HUD-less capture without frame generation
+    static uint64_t LastUpscaleFrameId();
+    static void RunPresentCallbacks(OptiPresentFrame* frame);
+
 };

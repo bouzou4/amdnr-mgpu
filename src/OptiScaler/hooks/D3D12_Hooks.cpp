@@ -23,6 +23,7 @@
 #include <misc/IdentifyGpu.h>
 
 #include "Hook_Utils.h"
+#include <plugins/PluginApi.h>
 
 #include <algorithm>
 #include <array>
@@ -2432,8 +2433,10 @@ static void HookToDevice(ID3D12Device* InDevice)
 
     HookToCommandList(InDevice);
 
-    if (State::Instance().activeFgInput == FGInput::Upscaler &&
-        !Config::Instance()->FGDisableHUDFix.value_or_default() &&
+    // Also for a plugin's HUD-less capture without frame generation
+    if (((State::Instance().activeFgInput == FGInput::Upscaler &&
+          !Config::Instance()->FGDisableHUDFix.value_or_default()) ||
+         PluginApi::WantsHudless()) &&
         State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
     {
         ResTrack_Dx12::HookDevice(InDevice);

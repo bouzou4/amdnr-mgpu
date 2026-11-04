@@ -8,6 +8,7 @@
 #include <framegen/IFGFeature_Dx12.h>
 #include <resource_tracking/ResTrack_dx12.h>
 #include <misc/DeferredRelease.h>
+#include <plugins/PluginApi.h>
 
 namespace
 {
@@ -110,6 +111,8 @@ void Hudfix_Dx12::ReleaseBuffers()
     std::unique_lock<std::mutex> checkLock(_checkMutex, std::defer_lock);
     if (!_checkMutexOwned)
         checkLock.lock();
+
+    _pluginHudless = nullptr;
 
     for (int i = 0; i < BUFFER_COUNT; i++)
     {
@@ -476,6 +479,11 @@ UINT64 Hudfix_Dx12::ActivePresentFrame() { return _fgCounter.load(std::memory_or
 
 bool Hudfix_Dx12::IsResourceCheckActive()
 {
+    // A plugin's HUD-less capture: resources are tracked the whole frame (binds can come before the window
+    // opens); CheckForHudless itself still takes one pick per upscaled frame
+    if (PluginOnly())
+        return State::Instance().currentFeature != nullptr && !State::Instance().isShuttingDown;
+
     if (_skipTracking.load(std::memory_order_acquire))
     {
         // LOG_TRACK("_skipHudlessChecks");
@@ -543,11 +551,15 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
 {
     auto& s = State::Instance();
 
-    if (s.currentFG == nullptr)
+    // Without active frame generation only for a plugin that asked for the HUD-less colour
+    const bool pluginOnly = PluginOnly();
+    if (s.currentFG == nullptr && !pluginOnly)
         return false;
 
     if (!IsResourceCheckActive())
         return false;
+
+    static bool pluginCaptured = false;
 
     do
     {
@@ -786,8 +798,8 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
 
         auto fg = s.currentFG;
 
-        // needs conversion?
-        if (!CompareResourceFormats(resource->format, s.currentSwapchainDesc.BufferDesc.Format))
+        // needs conversion? (FG only, a plugin gets the capture as it is)
+        if (!pluginOnly && !CompareResourceFormats(resource->format, s.currentSwapchainDesc.BufferDesc.Format))
         {
             if (_formatTransfer[fIndex] == nullptr ||
                 !_formatTransfer[fIndex]->IsFormatCompatible(s.currentSwapchainDesc.BufferDesc.Format))
@@ -864,7 +876,7 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
             _skipHudlessChecks.store(true, std::memory_order_release);
             LOG_DEBUG("Using _captureBuffer");
 
-            if (fg != nullptr)
+            if (fg != nullptr && !pluginOnly)
             {
                 Dx12Resource setResource {};
                 setResource.type = FG_ResourceType::HudlessColor;
@@ -880,6 +892,15 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
 
                 fg->SetResource(&setResource);
             }
+        }
+
+        if (PluginApi::WantsHudless())
+        {
+            if (!std::exchange(pluginCaptured, true))
+                LOG_INFO("Plugin HUD-less: first capture {:X} ({}x{} fmt {})", (size_t) resource->buffer, resource->width,
+                         resource->height, (UINT) resource->format);
+            _pluginHudless = _captureBuffer[fIndex];
+            _pluginHudlessFrame = upscaleCounter;
         }
 
         if (s.fgCaptureResources)
@@ -939,4 +960,21 @@ void Hudfix_Dx12::ResetCounters()
     _captureCounter[3] = 0;
 
     LOG_DEBUG("_hudlessList: {}", _hudlessList.size());
+}
+
+bool Hudfix_Dx12::PluginOnly()
+{
+    if (!PluginApi::WantsHudless())
+        return false;
+
+    auto fg = State::Instance().currentFG;
+    return fg == nullptr || !fg->IsActive() || !Config::Instance()->IsFGEnabled();
+}
+
+ID3D12Resource* Hudfix_Dx12::PluginHudless(UINT64* frame)
+{
+    std::lock_guard<std::mutex> lock(_checkMutex);
+    if (frame != nullptr)
+        *frame = _pluginHudlessFrame;
+    return _pluginHudless;
 }

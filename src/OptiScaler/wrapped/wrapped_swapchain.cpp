@@ -23,6 +23,9 @@
 #include <magic_enum.hpp>
 
 #include <low_latency/input/input_antilag2.h>
+#include <plugins/PluginApi.h>
+#include <hudfix/Hudfix_Dx12.h>
+#include <resource_tracking/ResTrack_dx12.h>
 
 #ifdef DXGI_DEBUG_ENABLED
 #include <magic_enum.hpp>
@@ -269,6 +272,51 @@ void ReportD3D12LiveObjects(ID3D12Device* device)
 #endif
 #endif
 
+// The present the plugin present callbacks see
+static void FillPluginPresentFrame(OptiPresentFrame& f, IDXGISwapChain* swapChain, ID3D12CommandQueue* queue,
+                                   ID3D12Device* device, UINT syncInterval, UINT flags)
+{
+    static uint64_t frameId = 0;
+    const auto& state = State::Instance();
+
+    f.size = sizeof(OptiPresentFrame);
+    f.api = OptiApi_D3D12;
+    f.device = device;
+    f.queue = queue;
+    f.swapchain = swapChain;
+
+    IDXGISwapChain3* sc3 = nullptr;
+    if (swapChain->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+    {
+        ID3D12Resource* buffer = nullptr;
+        if (sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer)) == S_OK)
+        {
+            f.backBuffer = buffer;
+            buffer->Release(); // the swapchain keeps it
+        }
+        sc3->Release();
+    }
+
+    f.backBufferState = D3D12_RESOURCE_STATE_PRESENT;
+    f.colorSpace = state.outputColorSpace.dxgiColorSpace;
+    f.width = state.currentSwapchainDesc.BufferDesc.Width;
+    f.height = state.currentSwapchainDesc.BufferDesc.Height;
+    f.format = state.currentSwapchainDesc.BufferDesc.Format;
+
+    UINT64 hudlessFrame = 0;
+    auto hudless = Hudfix_Dx12::PluginHudless(&hudlessFrame);
+    if (hudless != nullptr && hudlessFrame == Hudfix_Dx12::ActiveUpscaleFrame())
+    {
+        f.hudless = hudless;
+        f.hudlessState = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+
+    f.syncInterval = syncInterval;
+    f.presentFlags = flags;
+    f.frameId = ++frameId;
+    f.upscaleFrameId = PluginApi::LastUpscaleFrameId();
+}
+
 static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags,
                             const DXGI_PRESENT_PARAMETERS* pPresentParameters, IUnknown* pDevice, HWND hWnd, bool isUWP)
 {
@@ -474,8 +522,33 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                 currentFeature->TickFrozenCheck();
         }
 
+        // Plugin present callbacks, D3D12 with frame generation off
+        OptiPresentFrame pluginPresent {};
+        const bool pluginPresentOn = PluginApi::HasPresentCallbacks() && cq != nullptr && device12 != nullptr &&
+                                     (fg == nullptr || !fg->IsActive() || fg->IsPaused());
+
+        if (pluginPresentOn)
+        {
+            FillPluginPresentFrame(pluginPresent, pSwapChain, cq, device12, SyncInterval, Flags);
+            pluginPresent.phase = OptiPresent_BeforeOverlay;
+            PluginApi::RunPresentCallbacks(&pluginPresent);
+        }
+
         // Draw overlay
         MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
+
+        if (pluginPresentOn)
+        {
+            pluginPresent.phase = OptiPresent_AfterOverlay;
+            PluginApi::RunPresentCallbacks(&pluginPresent);
+
+            // The next frame's HUD-less capture, as FGPresent does it for FG
+            if (Hudfix_Dx12::PluginOnly())
+            {
+                ResTrack_Dx12::ClearPossibleHudless();
+                Hudfix_Dx12::PresentStart();
+            }
+        }
 
         if (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG)
         {

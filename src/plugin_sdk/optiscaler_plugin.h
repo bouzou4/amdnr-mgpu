@@ -126,6 +126,48 @@ extern "C"
     // no D3D / Vulkan calls.
     typedef bool (*OptiOverlayTextFn)(char* buffer, size_t bufferSize, void* userData);
 
+    // Present callbacks (RegisterPresentCallback) -------------------------------------------------------------
+
+    typedef enum OptiPresentPhase
+    {
+        OptiPresent_BeforeOverlay = 0, // OptiScaler's menu and FPS overlay are not drawn yet
+        OptiPresent_AfterOverlay = 1,  // right before the swapchain Present
+    } OptiPresentPhase;
+
+    typedef enum OptiPresentRequest
+    {
+        // Capture the HUD-less colour (HUDfix's detection) even without frame generation. Ask in OptiPluginInit:
+        // the resource tracking it needs is set up when the game creates its device.
+        OptiPresentRequest_Hudless = 1 << 0,
+    } OptiPresentRequest;
+
+    // One D3D12 present of the game's swapchain (frame generation off). The plugin submits its own lists to queue
+    // and leaves backBuffer in backBufferState and hudless in hudlessState.
+    typedef struct OptiPresentFrame
+    {
+        uint32_t size; // sizeof(OptiPresentFrame) of the running OptiScaler, fields are only appended
+        uint32_t api;  // OptiGraphicsApi
+        uint32_t phase; // OptiPresentPhase
+        uint32_t reserved;
+        void* device;    // ID3D12Device*
+        void* queue;     // ID3D12CommandQueue* the swapchain presents with
+        void* swapchain; // IDXGISwapChain* OptiScaler presents
+        void* backBuffer; // ID3D12Resource* the game rendered this frame into, with its UI
+        uint32_t backBufferState; // D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATE_PRESENT
+        uint32_t colorSpace;      // DXGI_COLOR_SPACE_TYPE the swapchain output uses
+        void* hudless; // ID3D12Resource*, the frame before its UI, NULL when not captured this frame
+        uint32_t hudlessState;
+        uint32_t width; // back buffer size and DXGI_FORMAT
+        uint32_t height;
+        uint32_t format;
+        uint32_t syncInterval;
+        uint32_t presentFlags;
+        uint64_t frameId;        // increments once per present
+        uint64_t upscaleFrameId; // OptiUpscaleFrame::frameId of the last evaluate, 0 when none
+    } OptiPresentFrame;
+
+    typedef void (*OptiPresentFn)(OptiPresentFrame* frame, void* userData);
+
     typedef struct OptiPluginApi
     {
         uint32_t size;    // sizeof(OptiPluginApi) of the running OptiScaler
@@ -223,6 +265,12 @@ extern "C"
         // Adds a line "label: value" to the FPS overlay, below OptiScaler's rows, in the Detailed and fuller
         // overlay types and in Custom. One line per call, in registration order.
         bool (*RegisterOverlayText)(OptiPlugin* plugin, const char* label, OptiOverlayTextFn fn, void* userData);
+
+        // Present callback, added after version 1 (check with OPTI_API_HAS) --------------------------------------
+
+        // Calls fn twice per D3D12 present on the presenting thread, phase BeforeOverlay then AfterOverlay.
+        // requests: OptiPresentRequest bits. One registration per plugin, a second one replaces the first.
+        bool (*RegisterPresentCallback)(OptiPlugin* plugin, OptiPresentFn fn, uint32_t requests, void* userData);
 
     } OptiPluginApi;
 

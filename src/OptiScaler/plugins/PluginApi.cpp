@@ -552,6 +552,63 @@ bool Api_RegisterOverlayText(OptiPlugin* plugin, const char* label, OptiOverlayT
     return true;
 }
 
+struct PresentCallback
+{
+    OptiPlugin* plugin;
+    OptiPresentFn fn;
+    uint32_t requests;
+    void* userData;
+    bool faulted = false;
+};
+
+std::vector<std::shared_ptr<PresentCallback>> _presentCallbacks;
+std::atomic<uint32_t> _presentRequests { 0 };
+std::atomic<bool> _hasPresentCallbacks { false };
+std::atomic<uint64_t> _lastUpscaleFrameId { 0 };
+
+bool CallPresent(OptiPresentFn fn, OptiPresentFrame* frame, void* userData)
+{
+    __try
+    {
+        fn(frame, userData);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+void UpdatePresentRequests()
+{
+    uint32_t requests = 0;
+    for (const auto& c : _presentCallbacks)
+        requests |= c->requests;
+    _presentRequests = requests;
+    _hasPresentCallbacks = !_presentCallbacks.empty();
+}
+
+bool Api_RegisterPresentCallback(OptiPlugin* plugin, OptiPresentFn fn, uint32_t requests, void* userData)
+{
+    if (plugin == nullptr || fn == nullptr)
+        return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (plugin->initState == OptiPlugin::InitState::Declined)
+        return false;
+
+    std::erase_if(_presentCallbacks, [plugin](const auto& c) { return c->plugin == plugin; });
+    auto entry = std::make_shared<PresentCallback>();
+    *entry = { plugin, fn, requests, userData };
+    _presentCallbacks.push_back(std::move(entry));
+    UpdatePresentRequests();
+
+    LOG_INFO("[{}] Registered present callback (requests: {:X})", plugin->name, requests);
+
+    return true;
+}
+
 const OptiPluginApi _api = {
     .size = sizeof(OptiPluginApi),
     .version = OPTI_PLUGIN_API_VERSION,
@@ -597,6 +654,8 @@ const OptiPluginApi _api = {
     .RestoreCommandListState = Api_RestoreCommandListState,
 
     .RegisterOverlayText = Api_RegisterOverlayText,
+
+    .RegisterPresentCallback = Api_RegisterPresentCallback,
 };
 } // namespace
 
@@ -671,6 +730,8 @@ void PluginApi::InitPlugin(HMODULE module, PFN_OptiPluginInit init, const std::s
         std::erase_if(_upscaleCallbacks, [plugin](const auto& c) { return c->plugin == plugin; });
         _hasUpscaleCallbacks = !_upscaleCallbacks.empty();
         std::erase_if(_overlayTexts, [plugin](const auto& t) { return t->plugin == plugin; });
+        std::erase_if(_presentCallbacks, [plugin](const auto& c) { return c->plugin == plugin; });
+        UpdatePresentRequests();
     }
 }
 
@@ -776,6 +837,7 @@ void PluginApi::RunUpscaleCallbacks(bool after, OptiUpscaleFrame* frame)
             continue;
 
         _inUpscaleCallback = true;
+        _lastUpscaleFrameId = frame->frameId;
         const bool finished = CallUpscale(fn, frame, c->userData);
         _inUpscaleCallback = false;
 
@@ -823,3 +885,35 @@ std::vector<PluginApi::OverlayLine> PluginApi::GetOverlayLines()
 
     return lines;
 }
+
+bool PluginApi::HasPresentCallbacks() { return _hasPresentCallbacks.load(std::memory_order_relaxed); }
+
+bool PluginApi::WantsHudless()
+{
+    return (_presentRequests.load(std::memory_order_relaxed) & OptiPresentRequest_Hudless) != 0;
+}
+
+uint64_t PluginApi::LastUpscaleFrameId() { return _lastUpscaleFrameId.load(std::memory_order_relaxed); }
+
+void PluginApi::RunPresentCallbacks(OptiPresentFrame* frame)
+{
+    std::vector<std::shared_ptr<PresentCallback>> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (const auto& c : _presentCallbacks)
+        {
+            if (!c->faulted && c->plugin->initState == OptiPlugin::InitState::Accepted)
+                callbacks.push_back(c);
+        }
+    }
+
+    for (const auto& c : callbacks)
+    {
+        if (!CallPresent(c->fn, frame, c->userData))
+        {
+            LOG_ERROR("[{}] Crashed in its present callback, disabling it", c->plugin->name);
+            c->faulted = true;
+        }
+    }
+}
+
