@@ -101,6 +101,8 @@ ComPtr<ID3D12Resource> Texture(ID3D12Device* device, uint32_t w, uint32_t h, DXG
     d.Format = fmt;
     d.SampleDesc.Count = 1;
     d.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    if (state & D3D12_RESOURCE_STATE_RENDER_TARGET)
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> r;
     if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r))))
         return nullptr;
@@ -116,6 +118,14 @@ float Median(const float* samples, uint32_t count)
     std::copy(samples, samples + n, tmp);
     std::nth_element(tmp, tmp + n / 2, tmp + n);
     return tmp[n / 2];
+}
+
+// A state shaders can read in, or the one to move to for our passes
+bool Readable(D3D12_RESOURCE_STATES s)
+{
+    return (s & (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) != 0 &&
+           (s & ~(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                  D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)) == 0;
 }
 
 bool IsExposureFormat(DXGI_FORMAT f)
@@ -838,6 +848,15 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
 
     ReadTimings();
 
+    // Our passes read the colour (before upscaling) and the vectors: move them to a shader state when needed
+    const auto mvState = D3D12_RESOURCE_STATES(f->motionVectorsState);
+    const bool colorMove = pre && !Readable(colorState);
+    const bool mvMove = mv != nullptr && !Readable(mvState);
+    if (colorMove)
+        Barrier(list, color, colorState, kRead);
+    if (mvMove)
+        Barrier(list, mv, mvState, kRead);
+
     // Source of this frame (what we feed and what the edit is added to) and where the result goes
     ID3D12Resource* src = nullptr;
     ID3D12Resource* target = nullptr;
@@ -846,9 +865,13 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
     {
         src = color;
         srcDesc = color->GetDesc();
-        if (!_override || _override->GetDesc().Width != srcDesc.Width || _override->GetDesc().Height != srcDesc.Height)
+        if (!_override || _override->GetDesc().Width != srcDesc.Width || _override->GetDesc().Height != srcDesc.Height ||
+            _overrideState != colorState)
+        {
             _override = Texture(_device.Get(), (uint32_t) srcDesc.Width, srcDesc.Height,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT, true, colorState);
+            _overrideState = colorState;
+        }
         target = _override.Get();
     }
     else
@@ -922,7 +945,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         const float spaceW = float(lowResMv ? f->renderWidth : f->outputWidth);
         const float spaceH = float(lowResMv ? f->renderHeight : f->outputHeight);
         _motion.res = mv;
-        _motion.state = D3D12_RESOURCE_STATES(f->motionVectorsState);
+        _motion.state = Readable(D3D12_RESOURCE_STATES(f->motionVectorsState)) ? D3D12_RESOURCE_STATES(f->motionVectorsState) : kRead;
         _motion.w = (uint32_t) spaceW;
         _motion.h = (uint32_t) spaceH;
         _motion.scaleX = f->mvScaleX * float(_feedW) / spaceW;
@@ -946,6 +969,11 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
     }
 
     Produce(list, f, wait);
+
+    if (colorMove)
+        Barrier(list, color, kRead, colorState);
+    if (mvMove)
+        Barrier(list, mv, kRead, mvState);
 }
 
 // Terminal placement: NR on the HUD-less colour, its edit added to the back buffer outside the UI, recorded into

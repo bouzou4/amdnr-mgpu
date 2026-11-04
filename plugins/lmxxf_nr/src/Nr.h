@@ -189,6 +189,7 @@ class NrEngine
     ComPtr<ID3D12Resource> _feed;     // network input, RGBA16F
     ComPtr<ID3D12Resource> _srcCopy;  // after upscaling: copy of the output
     ComPtr<ID3D12Resource> _override; // before upscaling: the color the upscaler gets
+    D3D12_RESOURCE_STATES _overrideState = D3D12_RESOURCE_STATE_COMMON;
     uint32_t _feedW = 0, _feedH = 0;
     uint32_t _srcW = 0, _srcH = 0;
     DXGI_FORMAT _srcFormat = DXGI_FORMAT_UNKNOWN;
