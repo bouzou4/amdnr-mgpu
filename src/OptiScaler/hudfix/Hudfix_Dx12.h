@@ -153,6 +153,24 @@ class Hudfix_Dx12
     inline static ID3D12Resource* _pluginHudless = nullptr;
     inline static UINT64 _pluginHudlessFrame = 0;
 
+    // Plugin pick consistency: the game can offer the same colour from several events (or before and after a
+    // full-screen pass); once one (buffer, event) signature dominates, only it is taken
+    struct PickSig
+    {
+        ID3D12Resource* buffer = nullptr;
+        UINT captureInfo = 0;
+        bool operator==(const PickSig&) const = default;
+    };
+    static bool PluginPickAccept(const PickSig& sig, UINT64 frame);
+    static void PluginPickTaken(const PickSig& sig, UINT64 frame);
+    inline static PickSig _stickySig {};
+    inline static bool _stickyValid = false;
+    inline static UINT64 _stickyLastSeen = 0;
+    inline static PickSig _pickHistory[32] {};
+    inline static UINT _pickHistoryCount = 0;
+    inline static PickSig _lastPick {};
+    inline static UINT64 _pickChanges = 0, _pickRejects = 0;
+
     static bool GetSkipStatus() { return _skipTracking.load(std::memory_order_acquire); }
     static void SetSkipStatus(bool status) { _skipTracking.store(status, std::memory_order_release); }
 };
