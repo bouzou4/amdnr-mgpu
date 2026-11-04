@@ -1,0 +1,292 @@
+// Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../LICENSE.
+// Multi-GPU mode: the game renders on one card, the other card presents and runs NR. The mgpu/ modules do the work;
+// this file connects them to the plugin API (adapter override, swapchain provider, present and upscale callbacks).
+#include "MgpuPlugin.h"
+#include "Nr.h"
+#include "mgpu/MgpuCore.h"
+
+#include <cstdarg>
+#include <filesystem>
+#include <format>
+
+extern const OptiPluginApi* g_api;
+extern OptiPlugin* g_plugin;
+
+namespace
+{
+bool g_on = false;
+uint32_t g_colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+std::wstring g_dir;
+
+HMODULE ModuleOf(const void* address)
+{
+    HMODULE m = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR) address, &m);
+    return m;
+}
+
+// Devices DXGI, D3D12, OptiScaler or this plugin create for themselves stay where they were asked for
+bool SystemCaller(void* caller)
+{
+    HMODULE m = caller ? ModuleOf(caller) : nullptr;
+    if (m == nullptr)
+        return false;
+    if (m == ModuleOf(&SystemCaller) || m == ModuleOf(g_api))
+        return true;
+    wchar_t p[MAX_PATH];
+    if (!GetModuleFileNameW(m, p, MAX_PATH))
+        return false;
+    std::wstring n = std::filesystem::path(p).filename().wstring();
+    for (auto& ch : n)
+        ch = towlower(ch);
+    return n == L"dxgi.dll" || n == L"d3d12.dll" || n == L"d3d12core.dll" || n == L"d3d11.dll" || n == L"dxcore.dll";
+}
+
+void* AdapterOverride(void* requested, void* caller, void*)
+{
+    if (SystemCaller(caller))
+        return nullptr;
+    IUnknown* a = Mgpu::RedirectAdapter(static_cast<IUnknown*>(requested));
+    // The render card, asked for or redirected to: the game's device
+    return Mgpu::Redirected() ? a : nullptr;
+}
+
+HRESULT STDMETHODCALLTYPE CreateUnhooked(IDXGIFactory2* factory, IUnknown* device, HWND hwnd,
+                                         const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs,
+                                         IDXGIOutput* restrict, IDXGISwapChain1** out)
+{
+    return g_api->CreateSwapChainForHwndUnhooked(factory, device, hwnd, desc, fs, restrict, (void**) out);
+}
+
+int32_t SwapchainProvider(void* factory, void* queue, void* hwnd, const void* desc, const void* fs, void* restrict,
+                          void** swapChain, void*)
+{
+    const auto& s = Mgpu::CurrentSettings();
+    if (!s.enabled || !s.presenter || !Mgpu::Redirected() || queue == nullptr)
+        return E_NOTIMPL;
+    ID3D12CommandQueue* q = nullptr;
+    if (static_cast<IUnknown*>(queue)->QueryInterface(IID_PPV_ARGS(&q)) != S_OK)
+        return E_NOTIMPL;
+    q->Release();
+    return Mgpu::CreateSwapChainForHwnd(CreateUnhooked, static_cast<IDXGIFactory2*>(factory), q, (HWND) hwnd,
+                                        static_cast<const DXGI_SWAP_CHAIN_DESC1*>(desc),
+                                        static_cast<const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*>(fs),
+                                        static_cast<IDXGIOutput*>(restrict), (IDXGISwapChain1**) swapChain);
+}
+
+uint32_t Encoding(uint32_t colorSpace)
+{
+    if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+        return 2;
+    if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
+        return 0;
+    return 1;
+}
+
+bool NrFrame(ID3D12Device* d, ID3D12CommandQueue* q, const Mgpu::NrInput& in)
+{
+    MgpuEnsureRuntime(DisplayEngine());
+    NrEngine::OwnFrame f;
+    f.src = in.src;
+    f.srcState = in.srcState;
+    f.dst = in.dst;
+    f.dstState = in.dstState;
+    f.motion = in.motion;
+    f.motionState = in.motionState;
+    f.motionW = in.guides.motionW;
+    f.motionH = in.guides.motionH;
+    f.mvScaleX = in.guides.mvScaleX;
+    f.mvScaleY = in.guides.mvScaleY;
+    f.reset = in.reset;
+    f.waitAnswer = in.waitAnswer;
+    f.encoding = Encoding(g_colorSpace);
+    return DisplayEngine().RunOwn(d, q, f);
+}
+
+// Our own list on the game's queue, executed right before the proxy's Present: the HUD-less pick of this frame
+struct CaptureLists
+{
+    ComPtr<ID3D12CommandAllocator> alloc[4];
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    uint64_t value[4] = {};
+    uint64_t counter = 0;
+    HANDLE event = nullptr;
+} g_cap;
+
+void CaptureHudless(OptiPresentFrame* f)
+{
+    auto* dev = static_cast<ID3D12Device*>(f->device);
+    auto* q = static_cast<ID3D12CommandQueue*>(f->queue);
+    if (!g_cap.list)
+    {
+        for (auto& a : g_cap.alloc)
+            dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+        dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_cap.alloc[0].Get(), nullptr,
+                               IID_PPV_ARGS(&g_cap.list));
+        dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_cap.fence));
+        g_cap.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_cap.list || !g_cap.fence)
+            return;
+        g_cap.list->Close();
+    }
+    const uint32_t s = uint32_t(g_cap.counter % 4);
+    if (g_cap.fence->GetCompletedValue() < g_cap.value[s])
+    {
+        g_cap.fence->SetEventOnCompletion(g_cap.value[s], g_cap.event);
+        WaitForSingleObject(g_cap.event, 500);
+    }
+    g_cap.alloc[s]->Reset();
+    g_cap.list->Reset(g_cap.alloc[s].Get(), nullptr);
+    Mgpu::CaptureHudless(g_cap.list.Get(), static_cast<ID3D12Resource*>(f->hudless),
+                         (D3D12_RESOURCE_STATES) f->hudlessState);
+    g_cap.list->Close();
+    ID3D12CommandList* l[] = { g_cap.list.Get() };
+    o_ExecuteCommandLists ? o_ExecuteCommandLists(q, 1, l) : q->ExecuteCommandLists(1, l);
+    g_cap.value[s] = ++g_cap.counter;
+    q->Signal(g_cap.fence.Get(), g_cap.value[s]);
+}
+
+std::string Busy(double v) { return v < 0 ? std::string("-") : std::format("{:.0f}%", v); }
+} // namespace
+
+void MgpuEnsureRuntime(NrEngine& e)
+{
+    static std::once_flag once;
+    std::call_once(once, [&] { MgpuLoadRuntime(e); });
+}
+
+bool MgpuActive() { return g_on && Mgpu::Redirected(); }
+
+bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& dumpDir)
+{
+    Mgpu::Settings s;
+    s.enabled = api->GetBool(plugin, "MultiGpu", false);
+    if (!s.enabled)
+        return false;
+    if (!OPTI_API_HAS(api, RegisterAdapterOverride) || !OPTI_API_HAS(api, RegisterSwapchainProvider) ||
+        !OPTI_API_HAS(api, CreateD3D12DeviceUnhooked) || !OPTI_API_HAS(api, CreateSwapChainForHwndUnhooked))
+    {
+        Log(OptiLog_Error, "multi-GPU needs the adapter override and swapchain provider API: off");
+        return false;
+    }
+    s.renderBus = api->GetInt(plugin, "MgpuRenderBus", -1);
+    s.displayBus = api->GetInt(plugin, "MgpuDisplayBus", -1);
+    s.hudless = api->GetBool(plugin, "MgpuHudless", true);
+    s.presenter = api->GetBool(plugin, "MgpuPresenter", true);
+    s.fallbackInline = api->GetBool(plugin, "MgpuFallbackInline", true);
+    s.nrEveryFrame = api->GetBool(plugin, "MgpuNrEveryFrame", true);
+    s.temporal = api->GetBool(plugin, "MgpuMotionVectors", true);
+    s.uiGate = std::clamp(api->GetFloat(plugin, "MgpuUiGate", 0.90f), 0.0f, 1.0f);
+    s.maxLead = (unsigned) std::clamp(api->GetInt(plugin, "MgpuMaxFramesAhead", 1), 1, 3);
+
+    g_dir = dumpDir;
+    Mgpu::Env e;
+    e.log = [](int level, const std::string& m)
+    { Log(level >= 2 ? OptiLog_Error : level == 1 ? OptiLog_Warn : OptiLog_Info, "[mgpu] %s", m.c_str()); };
+    e.createFactory = []() -> IDXGIFactory1*
+    {
+        IDXGIFactory1* f = nullptr;
+        return SUCCEEDED(g_api->CreateDxgiFactoryUnhooked(&__uuidof(IDXGIFactory1), (void**) &f)) ? f : nullptr;
+    };
+    e.createDevice = [](IUnknown* adapter, REFIID riid, void** device) -> HRESULT
+    { return g_api->CreateD3D12DeviceUnhooked(adapter, D3D_FEATURE_LEVEL_12_0, &riid, device); };
+    e.noSpoof = [](const std::function<void()>& fn)
+    {
+        if (OPTI_API_HAS(g_api, RunUnspoofed))
+            g_api->RunUnspoofed([](void* u) { (*static_cast<const std::function<void()>*>(u))(); }, (void*) &fn);
+        else
+            fn();
+    };
+    e.nrFrame = NrFrame;
+    e.nrWanted = [] { return Engine().Settings().enabled; };
+    e.nrStatus = []
+    {
+        const auto st = DisplayEngine().Stats();
+        return std::format("display NR {} {}x{} -> {}x{}, {:.2f} ms, {} run {} skipped {}", st.state, st.srcWidth,
+                           st.srcHeight, st.feedWidth, st.feedHeight, st.hipMs, st.framesRun, st.framesSkipped,
+                           st.error);
+    };
+    e.dumpDir = dumpDir;
+    Mgpu::Configure(s, e);
+    DisplayEngine().name = L"display";
+    DisplayEngine().dumpDir = dumpDir;
+
+    api->RegisterAdapterOverride(plugin, AdapterOverride, nullptr);
+    api->RegisterSwapchainProvider(plugin, SwapchainProvider, nullptr);
+    g_on = true;
+    Log(OptiLog_Info, "multi-GPU on: hudless %d, NR every frame %d, motion vectors %d, UI gate %.2f, frames ahead %u",
+        s.hudless, s.nrEveryFrame, s.temporal, s.uiGate, s.maxLead);
+    return true;
+}
+
+bool MgpuWantsHudless() { return g_on && Mgpu::CurrentSettings().hudless; }
+
+void MgpuOnPresent(OptiPresentFrame* f)
+{
+    if (!g_on)
+        return;
+    g_colorSpace = f->colorSpace;
+    if (f->phase == OptiPresent_AfterOverlay && f->hudless != nullptr && Mgpu::WantHudless())
+        CaptureHudless(f);
+}
+
+void MgpuOnUpscale(OptiUpscaleFrame* f)
+{
+    if (!g_on || !Mgpu::WantGuides() || f->motionVectors == nullptr)
+        return;
+    Mgpu::Guides g;
+    g.motion = static_cast<ID3D12Resource*>(f->motionVectors);
+    g.motionState = (D3D12_RESOURCE_STATES) f->motionVectorsState;
+    g.renderW = f->renderWidth;
+    g.renderH = f->renderHeight;
+    const bool display = (f->flags & OptiUpscale_DisplayResMV) != 0;
+    g.motionW = display ? f->outputWidth : f->renderWidth;
+    g.motionH = display ? f->outputHeight : f->renderHeight;
+    g.mvScaleX = f->mvScaleX;
+    g.mvScaleY = f->mvScaleY;
+    g.jitterX = f->jitterX;
+    g.jitterY = f->jitterY;
+    g.reset = (f->flags & OptiUpscale_Reset) != 0;
+    g.depthInverted = (f->flags & OptiUpscale_DepthInverted) != 0;
+    Mgpu::CaptureGuides(static_cast<ID3D12GraphicsCommandList*>(f->commandList), g);
+}
+
+void MgpuDrawTab(const OptiPluginApi* api)
+{
+    if (!g_on)
+    {
+        api->TextDisabled("Off ([Plugin.lmxxf_nr] MultiGpu=true and a restart turn it on).");
+        return;
+    }
+    const auto st = Mgpu::GetStats();
+    const auto& s = Mgpu::CurrentSettings();
+    auto line = [&](const std::string& t) { api->Text(t.c_str()); };
+    line(std::format("State: {}{}", st.state, Mgpu::Redirected() ? "" : " (game device not redirected)"));
+    line(std::format("Render card: {} (bus {}), {} busy", st.render.name, st.render.bus, Busy(st.renderBusy)));
+    line(std::format("Display card: {} (bus {}), {} busy", st.display.name, st.display.bus, Busy(st.displayBusy)));
+    line(std::format("Mode: {}, NR every frame {}, motion vectors {}, frames ahead {}", s.hudless ? "HUD-less" : "whole frame",
+                     s.nrEveryFrame ? "on" : "off", s.temporal ? "on" : "off", s.maxLead));
+    line(std::format("Frame {}x{}, render {:.2f} ms, display {:.2f} ms, added latency {:.2f} ms", st.width, st.height,
+                     st.renderFrameMs, st.displayFrameMs, st.latencyMs));
+    line(std::format("Send {:.2f} ms ({:.1f} GB/s), ingest {:.2f} ms ({:.1f} GB/s)", st.sendMs, st.sendGBs, st.ingestMs,
+                     st.ingestGBs));
+    line(std::format("Frames sent {}, presented {}, skipped {}", st.produced, st.presented, st.skipped));
+    if (s.hudless)
+        line(std::format("HUD-less frames {}, missed {}, UI {:.1f}% of pixels, gate trips {}", st.hudlessFrames,
+                         st.hudlessMissed, st.uiShare * 100, st.gateFallbacks));
+    if (!st.nrStatus.empty())
+        api->TextDisabled(st.nrStatus.c_str());
+}
+
+bool MgpuOverlayText(char* buf, size_t size)
+{
+    if (!g_on || !Mgpu::Redirected())
+        return false;
+    const auto st = Mgpu::GetStats();
+    const auto nr = DisplayEngine().Stats();
+    snprintf(buf, size, "render %s, display %s, +%.1f ms, NR %.1f ms", Busy(st.renderBusy).c_str(),
+             Busy(st.displayBusy).c_str(), st.latencyMs, nr.hipMs);
+    return true;
+}

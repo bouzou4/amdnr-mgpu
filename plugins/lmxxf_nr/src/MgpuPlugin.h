@@ -1,0 +1,18 @@
+// Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../LICENSE.
+#pragma once
+#include <string>
+
+#include "../../../src/plugin_sdk/optiscaler_plugin.h"
+
+class NrEngine;
+
+// From OptiPluginInit: reads the MultiGpu keys and registers the adapter override and swapchain provider
+bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& dumpDir);
+bool MgpuActive(); // the game renders on the render card: no NR there
+bool MgpuWantsHudless();
+void MgpuOnPresent(OptiPresentFrame* frame);
+void MgpuOnUpscale(OptiUpscaleFrame* frame);
+void MgpuDrawTab(const OptiPluginApi* api);
+bool MgpuOverlayText(char* buf, size_t size);
+void MgpuEnsureRuntime(NrEngine& e);
+void MgpuLoadRuntime(NrEngine& e); // Plugin.cpp: the runtime search folders
