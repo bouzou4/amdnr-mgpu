@@ -5,6 +5,9 @@
 #include "Nr.h"
 #include "mgpu/MgpuCore.h"
 
+#include <detours/detours.h>
+#include <intrin.h>
+
 #include <cstdarg>
 #include <filesystem>
 #include <format>
@@ -43,11 +46,54 @@ bool SystemCaller(void* caller)
     return n == L"dxgi.dll" || n == L"d3d12.dll" || n == L"d3d12core.dll" || n == L"d3d11.dll" || n == L"dxcore.dll";
 }
 
+// The render card has no outputs: the game's EnumOutputs on it gets the display card's (HDR state, modes, fullscreen)
+using PFN_EnumOutputs = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter*, UINT, IDXGIOutput**);
+PFN_EnumOutputs o_EnumOutputs = nullptr;
+
+HRESULT STDMETHODCALLTYPE hkEnumOutputs(IDXGIAdapter* self, UINT n, IDXGIOutput** out)
+{
+    const HRESULT hr = o_EnumOutputs(self, n, out);
+    if (hr != DXGI_ERROR_NOT_FOUND || out == nullptr || SystemCaller(_ReturnAddress()))
+        return hr;
+    IDXGIAdapter1* display = Mgpu::DisplayAdapter();
+    DXGI_ADAPTER_DESC d {};
+    const LUID r = Mgpu::RenderLuid();
+    if (display == nullptr || self->GetDesc(&d) != S_OK || d.AdapterLuid.LowPart != r.LowPart ||
+        d.AdapterLuid.HighPart != r.HighPart)
+        return hr;
+    const HRESULT hd = o_EnumOutputs(display, n, out);
+    static bool logged = false;
+    if (!logged && hd == S_OK)
+    {
+        logged = true;
+        Log(OptiLog_Info, "[mgpu] render adapter EnumOutputs(%u): the display card's output", n);
+    }
+    return hd;
+}
+
+void InstallOutputForward()
+{
+    static bool done = false;
+    IDXGIAdapter1* display = Mgpu::DisplayAdapter();
+    if (done || display == nullptr)
+        return;
+    done = true;
+    o_EnumOutputs = reinterpret_cast<PFN_EnumOutputs>((*reinterpret_cast<void***>(display))[7]);
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&(PVOID&) o_EnumOutputs, hkEnumOutputs);
+    const LONG err = DetourTransactionCommit();
+    Log(err == NO_ERROR ? OptiLog_Info : OptiLog_Error, "[mgpu] output forward for the render adapter: %s (%ld)",
+        err == NO_ERROR ? "on" : "failed", err);
+}
+
 void* AdapterOverride(void* requested, void* caller, void*)
 {
     if (SystemCaller(caller))
         return nullptr;
     IUnknown* a = Mgpu::RedirectAdapter(static_cast<IUnknown*>(requested));
+    if (Mgpu::Redirected() && Mgpu::CurrentSettings().forwardOutputs)
+        InstallOutputForward();
     // The render card, asked for or redirected to: the game's device
     return Mgpu::Redirected() ? a : nullptr;
 }
@@ -80,7 +126,7 @@ uint32_t Encoding(uint32_t colorSpace)
     if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
         return 2;
     if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
-        return 0;
+        return 3;
     return 1;
 }
 
@@ -159,6 +205,8 @@ void MgpuEnsureRuntime(NrEngine& e)
 
 bool MgpuActive() { return g_on && Mgpu::Redirected(); }
 
+bool MgpuFallback() { return g_on && Mgpu::GetStats().fallback; }
+
 bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& dumpDir)
 {
     Mgpu::Settings s;
@@ -180,7 +228,9 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.temporal = api->GetBool(plugin, "MgpuMotionVectors", true);
     s.uiGate = std::clamp(api->GetFloat(plugin, "MgpuUiGate", 0.90f), 0.0f, 1.0f);
     s.maxLead = (unsigned) std::clamp(api->GetInt(plugin, "MgpuMaxFramesAhead", 1), 1, 3);
-    s.dred = api->GetBool(plugin, "MgpuDred", false);
+    // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
+    s.dred = std::clamp(api->GetInt(plugin, "MgpuDred", api->GetBool(plugin, "MgpuDred", false) ? 1 : 0), 0, 2);
+    s.forwardOutputs = api->GetBool(plugin, "MgpuForwardOutputs", true);
 
     g_dir = dumpDir;
     Mgpu::Env e;
@@ -202,6 +252,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     };
     e.nrFrame = NrFrame;
     e.nrSettle = [] { DisplayEngine().SettleOwn(); };
+    e.nrQuiesce = [] { DisplayEngine().Quiesce(); };
     e.nrWanted = [] { return Engine().Settings().enabled; };
     e.nrStatus = []
     {
@@ -266,6 +317,11 @@ void MgpuDrawTab(const OptiPluginApi* api)
     const auto& s = Mgpu::CurrentSettings();
     auto line = [&](const std::string& t) { api->Text(t.c_str()); };
     line(std::format("State: {}{}", st.state, Mgpu::Redirected() ? "" : " (game device not redirected)"));
+    if (st.fallback)
+        api->TextColored(1.0f, 0.45f, 0.4f, 1.0f,
+                         ("Display card lost (" + st.fallbackReason + "): single-GPU passthrough on the render card, NR off").c_str());
+    if (!st.output.empty())
+        line("Display output: " + st.output);
     line(std::format("Render card: {} (bus {}), {} busy", st.render.name, st.render.bus, Busy(st.renderBusy)));
     line(std::format("Display card: {} (bus {}), {} busy", st.display.name, st.display.bus, Busy(st.displayBusy)));
     line(std::format("Mode: {}, NR every frame {}, motion vectors {}, frames ahead {}", s.hudless ? "HUD-less" : "whole frame",
@@ -288,6 +344,14 @@ bool MgpuOverlayText(char* buf, size_t size)
         return false;
     const auto st = Mgpu::GetStats();
     const auto nr = DisplayEngine().Stats();
+    if (st.fallback)
+    {
+        snprintf(buf, size, "display card lost: single-GPU present, NR off");
+        static bool logged = false;
+        if (!logged)
+            logged = true, Log(OptiLog_Warn, "[mgpu] overlay: %s", buf);
+        return true;
+    }
     snprintf(buf, size, "render %s, display %s, +%.1f ms, NR %.1f ms", Busy(st.renderBusy).c_str(),
              Busy(st.displayBusy).c_str(), st.latencyMs, nr.hipMs);
     return true;

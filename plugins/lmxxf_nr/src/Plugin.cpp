@@ -6,6 +6,8 @@
 #include <detours/detours.h>
 
 #include <algorithm>
+#include <chrono>
+#include <vector>
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
@@ -49,6 +51,7 @@ NrSettings ReadSettings()
     s.exposure = g_api->GetBool(g_plugin, "Exposure", true);
     s.serialize = g_api->GetBool(g_plugin, "Serialize", false);
     s.temporal = g_api->GetBool(g_plugin, "Temporal", true);
+    s.paperWhite = std::clamp(g_api->GetFloat(g_plugin, "HdrPaperWhite", 200.0f), 80.0f, 1000.0f);
     return s;
 }
 
@@ -106,8 +109,35 @@ void UpscaleAfter(OptiUpscaleFrame* frame, void*)
         Engine().CaptureMotion(frame);
 }
 
+// Game present cadence, logged every 10 s in every mode (PresentMon may see nothing)
+void FramePacing(const OptiPresentFrame* frame)
+{
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last {}, windowStart {};
+    static std::vector<float> ms;
+    const auto now = Clock::now();
+    if (last.time_since_epoch().count())
+        ms.push_back(std::chrono::duration<float, std::milli>(now - last).count());
+    else
+        windowStart = now;
+    last = now;
+    if (now - windowStart < std::chrono::seconds(10) || ms.empty())
+        return;
+    double sum = 0;
+    for (float v : ms)
+        sum += v;
+    std::sort(ms.begin(), ms.end());
+    Log(OptiLog_Info, "pacing: %zu presents, mean %.2f ms, median %.2f, p99 %.2f, max %.2f, %ux%u fmt %u cs %u",
+        ms.size(), sum / ms.size(), ms[ms.size() / 2], ms[std::min(ms.size() - 1, ms.size() * 99 / 100)], ms.back(),
+        frame->width, frame->height, frame->format, frame->colorSpace);
+    ms.clear();
+    windowStart = now;
+}
+
 void Present(OptiPresentFrame* frame, void*)
 {
+    if (frame->phase == OptiPresent_AfterOverlay)
+        FramePacing(frame);
     if (MgpuActive())
         return MgpuOnPresent(frame);
     EnsureRuntime();
@@ -202,6 +232,12 @@ void DrawTab(void*)
     Text("Network + handoff (GPU): %.2f ms", st.hipMs);
     if (rt.hasTimings)
         Text("Network only (runtime): %.2f ms", st.networkMs);
+    static const char* const kEnc[] = { "linear", "SDR (sRGB)", "HDR10 (PQ)", "HDR scRGB" };
+    if (st.encoding >= 2)
+        Text("Colour: %s, the network gets tonemapped values (paper white %.0f nits, HdrPaperWhite)", kEnc[st.encoding & 3],
+             active.paperWhite);
+    else
+        Text("Colour: %s", kEnc[st.encoding & 3]);
     Text("Network history: %s", st.temporal ? "on (motion vectors)" : rt.temporal == 0 ? "not taken by this runtime" : "off");
     Text("Frames: %llu run, %llu skipped", (unsigned long long) st.framesRun, (unsigned long long) st.framesSkipped);
     if (!st.status.empty())
@@ -216,17 +252,22 @@ bool OverlayText(char* buf, size_t size, void*)
     const NrSettings s = Engine().Settings();
     if (!s.enabled || !Engine().RuntimeLoaded())
         return false;
+    if (MgpuFallback())
+    {
+        snprintf(buf, size, "off (display card lost)");
+        return true;
+    }
     NrEngine& nr = MgpuActive() ? DisplayEngine() : Engine();
     const NrStats st = nr.Stats();
     const char* model = nr.GetRuntime().Models() ? (s.model == 1 ? " Small" : " Full") : "";
     if (st.state != "running")
         snprintf(buf, size, "%s", st.state.c_str());
     else if (st.networkMs > 0)
-        snprintf(buf, size, "%ux%u%s%s, %.1f ms (network %.1f)", st.feedWidth, st.feedHeight, model,
-                 st.temporal ? " T" : "", st.hipMs, st.networkMs);
+        snprintf(buf, size, "%ux%u%s%s%s, %.1f ms (network %.1f)", st.feedWidth, st.feedHeight, model,
+                 st.temporal ? " T" : "", st.encoding >= 2 ? " HDR" : "", st.hipMs, st.networkMs);
     else
-        snprintf(buf, size, "%ux%u%s%s, %.1f ms", st.feedWidth, st.feedHeight, model, st.temporal ? " T" : "",
-                 st.hipMs);
+        snprintf(buf, size, "%ux%u%s%s%s, %.1f ms", st.feedWidth, st.feedHeight, model, st.temporal ? " T" : "",
+                 st.encoding >= 2 ? " HDR" : "", st.hipMs);
     return true;
 }
 

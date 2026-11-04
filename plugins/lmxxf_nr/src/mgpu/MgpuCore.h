@@ -23,7 +23,8 @@ struct Settings
     bool temporal = false;     // send the render card's motion vectors; NR keeps a network history
     double uiGate = 0.90;      // HUD-less: above this share of differing pixels the pair is wrong: no NR that frame
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
-    bool dred = false;         // DRED breadcrumbs and page faults on the display device (diagnostics)
+    int dred = 0;              // DRED on the display device: 1 breadcrumbs + page faults, 2 page faults only
+    bool forwardOutputs = true; // the render adapter's EnumOutputs returns the display card's outputs
 };
 
 // Once per device: removed reason and, with DRED on, the page fault and the last breadcrumbs
@@ -65,6 +66,7 @@ struct Env
     std::function<bool(ID3D12Device*, ID3D12CommandQueue*, const NrInput& in)> nrFrame;
     std::function<bool()> nrWanted;
     std::function<void()> nrSettle; // before the present of a frame nrFrame ran on
+    std::function<void()> nrQuiesce; // NR's queued work is done: the resources it was given may be freed
     std::function<std::string()> nrStatus;
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it
@@ -97,6 +99,11 @@ struct Stats
     std::string nrStatus;
     uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0;
     double uiShare = -1; // share of pixels the UI composite took from the back buffer, last measured
+    bool fallback = false; // display card lost: single-GPU passthrough, no NR
+    std::string fallbackReason;
+    std::string output; // the display card's output desc
+    bool outputHdr = false;
+    uint32_t colorSpace = 0; // the game's SetColorSpace1
 };
 
 void Configure(const Settings& s, const Env& e);
@@ -118,6 +125,10 @@ HRESULT CreateSwapChainForHwnd(PFN_CreateSwapChainForHwnd original, IDXGIFactory
                                HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* restrict,
                                IDXGISwapChain1** out);
+
+// The topology's display adapter (unspoofed factory) and the render card's LUID; null / zero without a pair
+IDXGIAdapter1* DisplayAdapter();
+LUID RenderLuid();
 
 // NR runs on the display card's presenter (render card's NR must stay off).
 bool NrOnDisplay();

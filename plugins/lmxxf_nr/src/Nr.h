@@ -46,6 +46,7 @@ struct NrSettings
     bool exposure = true; // pass the game's exposure texture when the runtime takes it
     bool temporal = true; // motion-fed network history when the runtime takes it
     bool serialize = false; // the game queue waits for the network right away (measuring, like inline NR)
+    float paperWhite = 200.0f; // HDR output: nits the network's 1.0 maps to
 };
 
 struct NrStats
@@ -60,6 +61,7 @@ struct NrStats
     uint64_t framesSkipped = 0;
     uint32_t frameInfoSize = 0;
     bool temporal = false; // the runtime gets motion vectors and keeps a history
+    uint32_t encoding = 1; // of the last source: 0 linear, 1 sRGB, 2 PQ, 3 scRGB
     std::string status; // GetStatus
 };
 
@@ -93,10 +95,11 @@ class NrEngine
         float mvScaleX = 1, mvScaleY = 1;
         bool reset = false;
         bool waitAnswer = false;
-        uint32_t encoding = 1; // 0 linear, 1 sRGB, 2 PQ
+        uint32_t encoding = 1; // 0 linear, 1 sRGB, 2 PQ, 3 scRGB
     };
     bool RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in);
     void SettleOwn(); // before presenting a RunOwn frame: its network answer is done
+    void Quiesce();   // CPU wait for all queued network work: its inputs may be freed after
     // Leaves the session alone: the game card's engine while the display card runs NR
     void SetSuspended(bool s) { _suspended = s; }
     bool Suspended() const { return _suspended; }
@@ -224,6 +227,8 @@ class NrEngine
     // History continuity: the last fed frame's upscale id and vector extent
     uint64_t _lastFedUpscale = 0;
     uint32_t _lastMvW = 0, _lastMvH = 0;
+    uint32_t _histSrcW = 0, _histSrcH = 0; // source extent the history was built on
+    bool _extentReset = false;
     uint32_t _loggedMvFlags = ~0u;
     uint64_t _motionUpscale = 0; // upscale frame of _motion
     void LogMotion(const OptiUpscaleFrame* f);

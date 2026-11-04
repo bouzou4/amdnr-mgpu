@@ -212,9 +212,10 @@ static bool EnsureDisplayDevice()
         ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred))))
         {
-            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            if (CurrentSettings().dred == 1)
+                dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            Log(0, "DRED on for the display device");
+            Log(0, std::format("DRED on for the display device ({})", CurrentSettings().dred == 1 ? "breadcrumbs, page faults" : "page faults"));
         }
     }
     ++t_internal;
@@ -286,9 +287,12 @@ void LogDeviceRemoved(ID3D12Device* device, const char* where)
 }
 ID3D12CommandQueue* DisplayQueue() { return EnsureDisplayDevice() ? s_topo->displayQueue.Get() : nullptr; }
 
+IDXGIAdapter1* DisplayAdapter() { return s_topo ? s_topo->display.Get() : nullptr; }
+LUID RenderLuid() { return s_topo ? s_topo->rv.luid : LUID {}; }
+
 bool NrOnDisplay()
 {
-    return s_settings.enabled && s_settings.presenter && s_redirected && s_topo && s_env.nrWanted &&
+    return s_settings.enabled && s_settings.presenter && s_redirected && s_topo && !s_stats.fallback && s_env.nrWanted &&
            s_env.nrWanted();
 }
 

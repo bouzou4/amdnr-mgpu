@@ -9,6 +9,7 @@ class NrEngine;
 // From OptiPluginInit: reads the MultiGpu keys and registers the adapter override and swapchain provider
 bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& dumpDir);
 bool MgpuActive(); // the game renders on the render card: no NR there
+bool MgpuFallback(); // the display card was lost: single-GPU passthrough, NR off
 bool MgpuWantsHudless();
 void MgpuOnPresent(OptiPresentFrame* frame);
 void MgpuOnUpscale(OptiUpscaleFrame* frame);

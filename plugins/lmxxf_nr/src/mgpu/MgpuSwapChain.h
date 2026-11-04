@@ -82,8 +82,14 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     ~ProxySwapChain();
     HRESULT Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2* factory, ID3D12CommandQueue* gameQueue, HWND hwnd,
                  const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* restrict);
-    HRESULT CreateBuffers();
-    void ReleaseBuffers();
+    HRESULT CreateBuffers(bool keepGameBuffers = false);
+    void ReleaseBuffers(bool keepGameBuffers = false, bool retire = false);
+    void ReleaseRetired();
+    void Alive(const char* where);
+    HRESULT CreateFallbackLists();
+    HRESULT EnterFallback();
+    HRESULT PresentFallback(UINT sync, UINT flags);
+    void LogOutput();
     void StartPresenter();
     void StopPresenter();
     void PresenterLoop();
@@ -94,6 +100,10 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
 
     std::atomic<ULONG> _ref { 1 };
     HWND _hwnd = nullptr;
+    PFN_CreateSwapChainForHwnd _original = nullptr;
+    ComPtr<IDXGIFactory2> _factory;
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC _fsDesc {};
+    bool _hasFs = false;
     DXGI_SWAP_CHAIN_DESC1 _gameDesc {};
     UINT _gameCount = 2;
 
@@ -149,6 +159,19 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT _presentCount = 0;
     std::chrono::steady_clock::time_point _lastRender {}, _lastDisplay {};
     bool _broken = false;
+    // Display card removed: the presenter stops, the next game Present moves to a swapchain on the render card
+    std::atomic<bool> _lostPending { false };
+    bool _lost = false;
+    std::vector<ComPtr<ID3D12CommandAllocator>> _fAlloc;
+    std::vector<ComPtr<ID3D12GraphicsCommandList>> _fList; // [bb * realCount + realBb]
+    std::atomic<bool> _nrReset { false }; // extent or format changed: no network history
+    UINT _loggedCs = ~0u;
+    std::vector<ComPtr<IUnknown>> _retired; // the previous size's resources, see ReleaseBuffers
+    std::vector<class UiComposite*> _retiredUi;
+    UINT _retireAfter = 0;
+    bool _sizeHold = false; // window and swapchain sizes differ: no NR
+    std::chrono::steady_clock::time_point _mismatchSince {};
+    std::atomic<int> _probeFrames { 0 }; // fenced removal checks after a (re)start
     std::atomic<UINT64> _dumpFrom { 0 }, _dumpTo { 0 }; // frame ids [from, to) to dump
 
     // HUD-less colour and motion vectors: render-card staging per game back buffer, extra regions in each slot.

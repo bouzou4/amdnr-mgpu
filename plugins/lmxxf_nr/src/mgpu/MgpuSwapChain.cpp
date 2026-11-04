@@ -135,6 +135,10 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
                              IDXGIOutput* restrict)
 {
     _hwnd = hwnd;
+    _original = original;
+    _factory = factory;
+    if (fs)
+        _fsDesc = *fs, _hasFs = true;
     _gameDesc = *desc;
     _gameCount = (std::max)(2u, desc->BufferCount);
     _gameQueue = gameQueue;
@@ -230,10 +234,32 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
                        "motion {}",
                        _gameDesc.Width, _gameDesc.Height, (int) _gameDesc.Format, _gameCount, _realCount, _tearing,
                        _waitable != nullptr, _wantHud, _wantMv));
+    LogOutput();
     return S_OK;
 }
 
-HRESULT ProxySwapChain::CreateBuffers()
+// The display card's output as the game would see it: HDR state, colour space, luminance
+void ProxySwapChain::LogOutput()
+{
+    ComPtr<IDXGIOutput> o;
+    ComPtr<IDXGIOutput6> o6;
+    DXGI_OUTPUT_DESC1 d {};
+    if (FAILED(_real->GetContainingOutput(&o)) || FAILED(o.As(&o6)) || FAILED(o6->GetDesc1(&d)))
+    {
+        Log(1, "display output: no IDXGIOutput6 desc");
+        return;
+    }
+    const auto s = std::format("{}x{}, colour space {}, {} bits, luminance {:.0f}-{:.0f} nits (full frame {:.0f})",
+                               d.DesktopCoordinates.right - d.DesktopCoordinates.left,
+                               d.DesktopCoordinates.bottom - d.DesktopCoordinates.top, (int) d.ColorSpace,
+                               d.BitsPerColor, d.MinLuminance, d.MaxLuminance, d.MaxFullFrameLuminance);
+    Log(0, "display output " + s);
+    std::lock_guard g(StatsMutex());
+    MutableStats().output = s;
+    MutableStats().outputHdr = d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+}
+
+HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
 {
     HRESULT hr;
     DXGI_SWAP_CHAIN_DESC1 rd {};
@@ -242,6 +268,9 @@ HRESULT ProxySwapChain::CreateBuffers()
     _gameDesc.Height = rd.Height;
     _gameDesc.Format = rd.Format;
     _realCount = rd.BufferCount;
+    _nrReset = true;
+    for (auto& m : _meta)
+        m = {};
 
     _realBb.resize(_realCount);
     for (UINT i = 0; i < _realCount; ++i)
@@ -260,18 +289,25 @@ HRESULT ProxySwapChain::CreateBuffers()
     if (_gameDesc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS)
         t.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
-    _bb.resize(_gameCount);
-    _bbFrame.assign(_gameCount, 0);
+    if (!keepGameBuffers)
+    {
+        _bb.resize(_gameCount);
+        _bbFrame.assign(_gameCount, 0);
+        _bbIndex = 0;
+        for (UINT i = 0; i < _gameCount; ++i)
+        {
+            if (FAILED(hr = _rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &t, D3D12_RESOURCE_STATE_PRESENT,
+                                                           nullptr, IID_PPV_ARGS(&_bb[i]))))
+                return hr;
+            _bb[i]->SetName(std::format(L"Mgpu proxy back buffer {}", i).c_str());
+        }
+    }
     for (auto& p : _picked)
         p = 0;
-    _bbIndex = 0;
-    for (UINT i = 0; i < _gameCount; ++i)
-    {
-        if (FAILED(hr = _rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &t, D3D12_RESOURCE_STATE_PRESENT,
-                                                       nullptr, IID_PPV_ARGS(&_bb[i]))))
-            return hr;
-        _bb[i]->SetName(std::format(L"Mgpu proxy back buffer {}", i).c_str());
-    }
+    Log(0, std::format("buffers {}x{} fmt {}, game {} real {}{}", rd.Width, rd.Height, (int) rd.Format, _gameCount,
+                       _realCount, _lost ? ", single-GPU fallback" : ""));
+    if (_lost)
+        return CreateFallbackLists();
 
     UINT rows = 0;
     UINT64 rowBytes = 0, total = 0;
@@ -320,6 +356,7 @@ HRESULT ProxySwapChain::CreateBuffers()
     hd.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
     if (FAILED(hr = _ddev->CreateHeap(&hd, IID_PPV_ARGS(&_heapD))))
         return hr;
+    _heapD->SetName(L"Mgpu ring heap D");
     HANDLE h = nullptr;
     if (FAILED(hr = _ddev->CreateSharedHandle(_heapD.Get(), nullptr, GENERIC_ALL, nullptr, &h)))
         return hr;
@@ -447,7 +484,6 @@ HRESULT ProxySwapChain::CreateBuffers()
                                                      IID_PPV_ARGS(&_duList[s]))) ||
                 FAILED(hr = _duList[s]->Close()))
                 return hr;
-            _meta[s] = {};
         }
     }
     if (_wantHud)
@@ -467,6 +503,10 @@ HRESULT ProxySwapChain::CreateBuffers()
                 _ui = nullptr;
             }
         }
+        for (auto [r, n] : { std::pair { _hudD.Get(), L"Mgpu hudless D" }, { _nrD.Get(), L"Mgpu nr D" },
+                             { _bbD.Get(), L"Mgpu bb copy D" }, { _compD.Get(), L"Mgpu composite D" } })
+            if (r)
+                r->SetName(n);
         if (!_hudD || !_nrD || !_bbD || !_compD || !_ui)
         {
             Log(2, "HUD-less resources failed: whole frame");
@@ -484,45 +524,106 @@ HRESULT ProxySwapChain::CreateBuffers()
     return S_OK;
 }
 
-void ProxySwapChain::ReleaseBuffers()
+HRESULT ProxySwapChain::CreateFallbackLists()
 {
-    _rList.clear();
-    _rAlloc.clear();
-    _dList.clear();
-    _dAlloc.clear();
+    HRESULT hr;
+    _fAlloc.resize(_gameCount * _realCount);
+    _fList.resize(_gameCount * _realCount);
+    for (UINT i = 0; i < _gameCount; ++i)
+        for (UINT m = 0; m < _realCount; ++m)
+        {
+            const UINT n = i * _realCount + m;
+            if (FAILED(hr = _rdev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_fAlloc[n]))) ||
+                FAILED(hr = _rdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _fAlloc[n].Get(), nullptr,
+                                                     IID_PPV_ARGS(&_fList[n]))))
+                return hr;
+            auto* c = _fList[n].Get();
+            D3D12_RESOURCE_BARRIER b[2] = { Tr(_bb[i].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                            Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                                               D3D12_RESOURCE_STATE_COPY_DEST) };
+            c->ResourceBarrier(2, b);
+            c->CopyResource(_realBb[m].Get(), _bb[i].Get());
+            for (auto& x : b)
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            c->ResourceBarrier(2, b);
+            if (FAILED(hr = c->Close()))
+                return hr;
+        }
+    std::lock_guard g(StatsMutex());
+    auto& st = MutableStats();
+    st.width = _gameDesc.Width;
+    st.height = _gameDesc.Height;
+    st.format = _gameDesc.Format;
+    return S_OK;
+}
+
+void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
+{
+    // retire: kept alive until the presenter has shown a few frames on the new buffers
+    auto drop = [&](auto& p)
+    {
+        if (retire && p)
+            _retired.push_back(p);
+        p.Reset();
+    };
+    auto dropAll = [&](auto& v)
+    {
+        for (auto& p : v)
+            drop(p);
+        v.clear();
+    };
+    dropAll(_fList);
+    dropAll(_fAlloc);
+    if (retire && _ui)
+        _retiredUi.push_back(_ui);
+    else
+        delete _ui; // its pipeline is per format
+    _ui = nullptr;
+    dropAll(_rList);
+    dropAll(_rAlloc);
+    dropAll(_dList);
+    dropAll(_dAlloc);
     for (UINT s = 0; s < K; ++s)
     {
-        _slotR[s].Reset();
-        _slotD[s].Reset();
-        _rxList[s].Reset();
-        _rxAlloc[s].Reset();
-        _dxList[s].Reset();
-        _dxAlloc[s].Reset();
-        _duList[s].Reset();
-        _duAlloc[s].Reset();
+        drop(_slotR[s]);
+        drop(_slotD[s]);
+        drop(_rxList[s]);
+        drop(_rxAlloc[s]);
+        drop(_dxList[s]);
+        drop(_dxAlloc[s]);
+        drop(_duList[s]);
+        drop(_duAlloc[s]);
     }
-    _heapR.Reset();
-    _heapD.Reset();
-    _rQuery.Reset();
-    _rReadback.Reset();
-    _dQuery.Reset();
-    _dReadback.Reset();
-    _bb.clear();
+    drop(_heapR);
+    drop(_heapD);
+    drop(_rQuery);
+    drop(_rReadback);
+    drop(_dQuery);
+    drop(_dReadback);
+    if (!keepGameBuffers)
+        _bb.clear();
     _realBb.clear();
     {
         std::lock_guard g(_capM);
-        _hudR.clear();
-        _mvR.clear();
-        _graveR.clear();
+        dropAll(_hudR);
+        dropAll(_mvR);
+        dropAll(_graveR);
     }
-    _hudD.Reset();
-    _mvD.Reset();
-    _nrD.Reset();
-    _bbD.Reset();
-    _compD.Reset();
-    _graveD.clear();
+    drop(_hudD);
+    drop(_mvD);
+    drop(_nrD);
+    drop(_bbD);
+    drop(_compD);
+    dropAll(_graveD);
 }
 
+void ProxySwapChain::ReleaseRetired()
+{
+    _retired.clear();
+    for (auto* u : _retiredUi)
+        delete u;
+    _retiredUi.clear();
+}
 void ProxySwapChain::RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state)
 {
     std::lock_guard g(_capM);
@@ -620,11 +721,23 @@ void ProxySwapChain::DrainRender()
         _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
         WaitFence(_rgameFence.Get(), _rgameValue, 3000);
     }
-    WaitFence(_filledR.Get(), _scheduled, 3000);
+    if (!_lost)
+        WaitFence(_filledR.Get(), _scheduled, 3000);
+}
+
+// Diagnostics: logs the first point after a resize where the display device is found removed
+void ProxySwapChain::Alive(const char* where)
+{
+    if (_lost || !_ddev)
+        return;
+    const HRESULT r = _ddev->GetDeviceRemovedReason();
+    if (FAILED(r))
+        Log(2, std::format("display device removed ({:X}) by: {}", (uint32_t) r, where));
 }
 
 void ProxySwapChain::StartPresenter()
 {
+    _probeFrames = 4;
     _stop = false;
     _thread = std::thread([this] { PresenterLoop(); });
 }
@@ -643,6 +756,9 @@ void ProxySwapChain::StopPresenter()
         _dq->Signal(_dFence.Get(), ++_dValue);
         WaitFence(_dFence.Get(), _dValue, 3000);
     }
+    // the network may still read this side's motion vectors on its own queue
+    if (CurrentEnv().nrQuiesce)
+        CurrentEnv().nrQuiesce();
 }
 
 static double ReadTs(ID3D12Resource* rb, UINT slot, UINT64 freq)
@@ -681,6 +797,20 @@ void ProxySwapChain::PresenterLoop()
         const auto tSched = _tSched[s];
         const SlotMeta meta = _meta[s];
         lk.unlock();
+
+        // Recovery test: <dumpDir>\mgpu_remove.trigger removes the display device
+        if (g % 60 == 0 && !env.dumpDir.empty())
+        {
+            const std::wstring trig = env.dumpDir + L"\\mgpu_remove.trigger";
+            if (GetFileAttributesW(trig.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                DeleteFileW(trig.c_str());
+                ComPtr<ID3D12Device5> d5;
+                Log(1, std::format("test: removing the display device at frame {}", g));
+                if (SUCCEEDED(_ddev.As(&d5)))
+                    d5->RemoveDevice();
+            }
+        }
 
         // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
         WaitFence(_dFence.Get(), slotDisplayValue[s], 500);
@@ -729,6 +859,8 @@ void ProxySwapChain::PresenterLoop()
                     D3D12_RESOURCE_DESC md = meta.mvDesc;
                     _mvD.Reset();
                     _ddev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, ns, nullptr, IID_PPV_ARGS(&_mvD));
+                    if (_mvD)
+                        _mvD->SetName(L"Mgpu motion D");
                 }
                 haveMv = meta.mv && _mvD;
                 _dxAlloc[s]->Reset();
@@ -757,6 +889,15 @@ void ProxySwapChain::PresenterLoop()
             }
             _dq->ExecuteCommandLists(nl, l);
             _dq->Signal(_releasedD.Get(), g);
+            const bool probe = _probeFrames > 0;
+            if (probe)
+            {
+                _probeFrames--;
+                Alive("before ingest");
+                _dq->Signal(_dFence.Get(), ++_dValue);
+                WaitFence(_dFence.Get(), _dValue, 2000);
+                Alive(meta.mv ? "ingest (colour, HUD-less, motion)" : "ingest (colour, HUD-less)");
+            }
             const bool dump = g >= _dumpFrom && g < _dumpTo;
             if (dump)
             {
@@ -786,8 +927,25 @@ void ProxySwapChain::PresenterLoop()
                 return c;
             };
 
+            // The window resized ahead of its ResizeBuffers (or minimised): NR waits for the swapchain to follow
+            RECT rc {};
+            GetClientRect(_hwnd, &rc);
+            const bool mismatch = UINT(rc.right - rc.left) != _gameDesc.Width || UINT(rc.bottom - rc.top) != _gameDesc.Height;
+            if (!mismatch)
+                _mismatchSince = {};
+            else if (!_mismatchSince.time_since_epoch().count())
+                _mismatchSince = std::chrono::steady_clock::now();
+            // a swapchain that stays smaller than its window (stretch scaling) gets NR back after 5 s
+            const bool sizeHold = mismatch && std::chrono::steady_clock::now() - _mismatchSince < std::chrono::seconds(5);
+            if (sizeHold != _sizeHold)
+            {
+                _sizeHold = sizeHold;
+                Log(0, std::format("window {}x{}, swapchain {}x{}: NR {}", rc.right - rc.left, rc.bottom - rc.top,
+                                   _gameDesc.Width, _gameDesc.Height, sizeHold ? "held" : "resumed"));
+            }
+
             // HUD-less mode never runs NR over the UI: no HUD-less pick, or the gate tripped, presents without NR
-            if (env.nrWanted && env.nrWanted() && env.nrFrame && (!_wantHud || useHud))
+            if (!sizeHold && env.nrWanted && env.nrWanted() && env.nrFrame && (!_wantHud || useHud))
             {
                 NrInput in;
                 const auto now = std::chrono::steady_clock::now();
@@ -806,7 +964,7 @@ void ProxySwapChain::PresenterLoop()
                     _lastMvW = meta.g.motionW;
                     _lastMvH = meta.g.motionH;
                 }
-                in.reset = gap || mvResized || (haveMv && meta.g.reset);
+                in.reset = _nrReset.exchange(false) || gap || mvResized || (haveMv && meta.g.reset);
                 in.waitAnswer = CurrentSettings().nrEveryFrame;
                 if (useHud)
                 {
@@ -862,6 +1020,12 @@ void ProxySwapChain::PresenterLoop()
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
             if (env.nrSettle)
                 env.nrSettle();
+            if (probe)
+            {
+                _dq->Signal(_dFence.Get(), ++_dValue);
+                WaitFence(_dFence.Get(), _dValue, 2000);
+                Alive("NR and UI composite");
+            }
             BOOL fs = FALSE;
             _real->GetFullscreenState(&fs, nullptr);
             UINT pf = flags & ~(UINT) DXGI_PRESENT_ALLOW_TEARING;
@@ -871,12 +1035,32 @@ void ProxySwapChain::PresenterLoop()
             _dq->Signal(_dFence.Get(), ++_dValue);
             slotDisplayValue[s] = _dValue;
         }
-        if (FAILED(hr))
+        if (FAILED(hr) || (g % 30 == 0 && FAILED(_ddev->GetDeviceRemovedReason())))
         {
             Log(2, std::format("real Present failed {:X}", (uint32_t) hr));
             LogDeviceRemoved(_ddev.Get(), "display");
+            const HRESULT why = _ddev->GetDeviceRemovedReason();
+            if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG ||
+                FAILED(why))
+            {
+                {
+                    std::lock_guard sg(StatsMutex());
+                    MutableStats().fallbackReason = std::format("display device removed ({:X})", (uint32_t) why);
+                }
+                _lostPending = true;
+                lk.lock();
+                _consumed = _scheduled;
+                lk.unlock();
+                _cv.notify_all();
+                if (_waitable)
+                    ReleaseSemaphore(_waitable, 1, nullptr);
+                Log(2, "presenter stopped: the next frame presents from the render card");
+                break;
+            }
         }
 
+        if (!_retired.empty() && _presentCount >= _retireAfter)
+            ReleaseRetired();
         lk.lock();
         _consumed = g;
         lk.unlock();
@@ -929,6 +1113,14 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     const auto& env = CurrentEnv();
     if (env.onPresent)
         env.onPresent();
+    if (_broken)
+        return DXGI_ERROR_DEVICE_REMOVED;
+    if (_lostPending && !_lost)
+    {
+        HRESULT hr = EnterFallback();
+        if (FAILED(hr))
+            return hr;
+    }
     const UINT i = _bbIndex;
     const UINT64 next = _scheduled + 1;
     if (!env.dumpDir.empty() && next % 30 == 0)
@@ -953,6 +1145,8 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     if (next >= _dumpFrom && next < _dumpTo)
         DumpTexture(_rdev.Get(), _gameQueue.Get(), _bb[i].Get(), D3D12_RESOURCE_STATE_PRESENT,
                     env.dumpDir + std::format(L"\\f{:06}_render", next));
+    if (_lost)
+        return PresentFallback(sync, flags);
     _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
 
     double sendMs = -1;
@@ -1041,6 +1235,111 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     return S_OK;
 }
 
+// Display card gone: the game keeps its back buffers, a swapchain on the render card's queue presents copies of them
+// (Windows' cross-adapter present), no NR
+HRESULT ProxySwapChain::EnterFallback()
+{
+    Log(2, "display card lost: single-GPU passthrough from the render card, NR off");
+    StopPresenter();
+    // Send copies waiting on the display card's release fence would never run
+    const HRESULT hs = _releasedR->Signal(_scheduled + 1000);
+    WaitFence(_filledR.Get(), _scheduled, 2000);
+    if (_filledR->GetCompletedValue() < _scheduled)
+    {
+        Log(1, std::format("send queue stuck (release signal {:X}): filled fence set from the CPU", (uint32_t) hs));
+        _filledR->Signal(_scheduled);
+    }
+    DrainRender();
+    {
+        std::lock_guard g(_m);
+        _consumed = _scheduled;
+    }
+    {
+        std::lock_guard g(_capM);
+        _wantHud = _wantMv = false;
+    }
+    _lost = true;
+    ReleaseBuffers(true);
+    {
+        std::lock_guard g(_scMutex);
+        _real.Reset();
+    }
+    DXGI_SWAP_CHAIN_DESC1 d = _gameDesc;
+    d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    d.BufferCount = _realCount;
+    d.Flags = RealFlags(_gameDesc.Flags, _tearing);
+    d.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    ComPtr<IDXGISwapChain1> sc1;
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 3 && FAILED(hr); ++attempt)
+    {
+        if (attempt)
+            Sleep(100); // the removed swapchain may still be leaving the window
+        hr = _original(_factory.Get(), _gameQueue.Get(), _hwnd, &d, _hasFs ? &_fsDesc : nullptr, nullptr, &sc1);
+    }
+    if (SUCCEEDED(hr))
+        hr = sc1.As(&_real);
+    if (SUCCEEDED(hr))
+        hr = CreateBuffers(true);
+    std::lock_guard g(StatsMutex());
+    auto& st = MutableStats();
+    st.presenter = false;
+    st.fallback = SUCCEEDED(hr);
+    if (FAILED(hr))
+    {
+        _broken = true;
+        Log(2, std::format("single-GPU fallback swapchain failed {:X}", (uint32_t) hr));
+        return hr;
+    }
+    Log(1, std::format("single-GPU fallback presenting {}x{} on bus {}", _gameDesc.Width, _gameDesc.Height, st.render.bus));
+    return S_OK;
+}
+
+HRESULT ProxySwapChain::PresentFallback(UINT sync, UINT flags)
+{
+    const UINT i = _bbIndex;
+    HRESULT hr;
+    {
+        std::lock_guard g(_scMutex);
+        const UINT m = _real->GetCurrentBackBufferIndex();
+        if (i * _realCount + m >= _fList.size())
+            return DXGI_ERROR_INVALID_CALL;
+        ID3D12CommandList* l[] = { _fList[i * _realCount + m].Get() };
+        _gameQueue->ExecuteCommandLists(1, l);
+        BOOL fs = FALSE;
+        _real->GetFullscreenState(&fs, nullptr);
+        UINT pf = flags & ~(UINT) DXGI_PRESENT_ALLOW_TEARING;
+        if (sync == 0 && _tearing && !fs)
+            pf |= DXGI_PRESENT_ALLOW_TEARING;
+        hr = _real->Present(sync, pf);
+    }
+    if (FAILED(hr))
+        Log(2, std::format("fallback Present failed {:X}", (uint32_t) hr));
+    {
+        std::lock_guard cg(_capM);
+        _bbIndex = (i + 1) % _gameCount;
+    }
+    {
+        std::lock_guard g(_m);
+        _consumed = ++_scheduled;
+    }
+    _presentCount++;
+    if (_waitable)
+        ReleaseSemaphore(_waitable, 1, nullptr);
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard sg(StatsMutex());
+    auto& st = MutableStats();
+    st.produced++;
+    st.presented++;
+    if (_lastRender.time_since_epoch().count())
+        st.renderFrameMs = Ema(st.renderFrameMs, std::chrono::duration<double, std::milli>(now - _lastRender).count());
+    st.displayFrameMs = st.renderFrameMs;
+    _lastRender = now;
+    if (_presentCount % 600 == 0)
+        Log(0, std::format("stats: fallback render {:.2f} ms presented {}", st.renderFrameMs, st.presented));
+    return hr;
+}
+
 ProxySwapChain::~ProxySwapChain()
 {
     ProxySwapChain* self = this;
@@ -1049,6 +1348,7 @@ ProxySwapChain::~ProxySwapChain()
         StopPresenter();
     DrainRender();
     ReleaseBuffers();
+    ReleaseRetired();
     delete _ui;
     _ui = nullptr;
     _real.Reset();
@@ -1112,8 +1412,13 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::GetBuffer(UINT i, REFIID riid, void** 
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::SetFullscreenState(BOOL fs, IDXGIOutput* t)
 {
-    std::lock_guard g(_scMutex);
-    return _real->SetFullscreenState(fs, t);
+    HRESULT hr;
+    {
+        std::lock_guard g(_scMutex);
+        hr = _real->SetFullscreenState(fs, t);
+    }
+    Log(0, std::format("SetFullscreenState {} output {} -> {:X}", fs, (void*) t, (uint32_t) hr));
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::GetFullscreenState(BOOL* fs, IDXGIOutput** t)
 {
@@ -1141,9 +1446,35 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::GetDesc(DXGI_SWAP_CHAIN_DESC* d)
 HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
     Log(0, std::format("ResizeBuffers {} {}x{} fmt {} flags {:X}", n, w, h, (int) f, flags));
-    StopPresenter();
+    if (!_lost)
+        StopPresenter();
+    Alive("resize: presenter stopped");
     DrainRender();
-    ReleaseBuffers();
+    {
+        // frames sent but not presented belong to the old buffers
+        std::lock_guard g(_m);
+        const UINT64 dropped = _scheduled - _consumed;
+        _consumed = _scheduled;
+        if (dropped && _waitable)
+            ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(dropped, 8), nullptr);
+        if (dropped)
+            Log(0, std::format("ResizeBuffers: {} unpresented frames dropped", dropped));
+    }
+    if (!_lost && FAILED(_ddev->GetDeviceRemovedReason()))
+    {
+        // lost before or during this resize: resize the single-GPU fallback instead
+        {
+            std::lock_guard sg(StatsMutex());
+            MutableStats().fallbackReason =
+                std::format("display device removed ({:X}) at a resize", (uint32_t) _ddev->GetDeviceRemovedReason());
+        }
+        _lostPending = true;
+        if (FAILED(EnterFallback()))
+            return DXGI_ERROR_DEVICE_REMOVED;
+    }
+    ReleaseBuffers(false, !_lost);
+    _retireAfter = _presentCount + 30;
+    Alive("resize: released");
     if (n)
         _gameCount = (std::max)(2u, n);
     _gameDesc.Flags = flags;
@@ -1154,16 +1485,25 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers(UINT n, UINT w, UINT h, 
     }
     if (FAILED(hr))
         Log(2, std::format("real ResizeBuffers failed {:X}", (uint32_t) hr));
+    Alive("resize: real resized");
     HRESULT hb = CreateBuffers();
+    Alive("resize: buffers created");
     if (FAILED(hb))
         Log(2, std::format("proxy buffers failed {:X}", (uint32_t) hb));
-    StartPresenter();
+    if (!_lost)
+        StartPresenter();
     return FAILED(hr) ? hr : hb;
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeTarget(const DXGI_MODE_DESC* m)
 {
-    std::lock_guard g(_scMutex);
-    return _real->ResizeTarget(m);
+    HRESULT hr;
+    {
+        std::lock_guard g(_scMutex);
+        hr = _real->ResizeTarget(m);
+    }
+    if (m)
+        Log(0, std::format("ResizeTarget {}x{} fmt {} -> {:X}", m->Width, m->Height, (int) m->Format, (uint32_t) hr));
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::GetContainingOutput(IDXGIOutput** o)
 {
@@ -1264,13 +1604,34 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::GetMatrixTransform(DXGI_MATRIX_3X2_F* 
 UINT STDMETHODCALLTYPE ProxySwapChain::GetCurrentBackBufferIndex() { return _bbIndex; }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE c, UINT* s)
 {
-    std::lock_guard g(_scMutex);
-    return _real->CheckColorSpaceSupport(c, s);
+    HRESULT hr;
+    {
+        std::lock_guard g(_scMutex);
+        hr = _real->CheckColorSpaceSupport(c, s);
+    }
+    static UINT logged = 0;
+    if (c < 32 && !(logged & (1u << c)))
+    {
+        logged |= 1u << c;
+        Log(0, std::format("CheckColorSpaceSupport {} -> {:X} support {:X}", (int) c, (uint32_t) hr, s ? *s : 0));
+    }
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::SetColorSpace1(DXGI_COLOR_SPACE_TYPE c)
 {
-    std::lock_guard g(_scMutex);
-    return _real->SetColorSpace1(c);
+    HRESULT hr;
+    {
+        std::lock_guard g(_scMutex);
+        hr = _real->SetColorSpace1(c);
+    }
+    if ((UINT) c != _loggedCs)
+    {
+        _loggedCs = c;
+        Log(0, std::format("SetColorSpace1 {} -> {:X}", (int) c, (uint32_t) hr));
+        std::lock_guard g(StatsMutex());
+        MutableStats().colorSpace = c;
+    }
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers1(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags,
                                                          const UINT*, IUnknown* const*)
@@ -1279,7 +1640,21 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers1(UINT n, UINT w, UINT h,
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::SetHDRMetaData(DXGI_HDR_METADATA_TYPE t, UINT s, void* m)
 {
-    std::lock_guard g(_scMutex);
-    return _real->SetHDRMetaData(t, s, m);
+    HRESULT hr;
+    {
+        std::lock_guard g(_scMutex);
+        hr = _real->SetHDRMetaData(t, s, m);
+    }
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        UINT maxNits = 0;
+        if (t == DXGI_HDR_METADATA_TYPE_HDR10 && m && s >= sizeof(DXGI_HDR_METADATA_HDR10))
+            maxNits = static_cast<DXGI_HDR_METADATA_HDR10*>(m)->MaxContentLightLevel;
+        Log(0, std::format("SetHDRMetaData type {} size {} max content {} nits -> {:X}", (int) t, s, maxNits,
+                           (uint32_t) hr));
+    }
+    return hr;
 }
 } // namespace Mgpu

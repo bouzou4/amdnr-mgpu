@@ -453,7 +453,8 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
         t.motion_height = _motion.h;
         t.motion_scale_x = _motion.scaleX;
         t.motion_scale_y = _motion.scaleY;
-        t.history_reset = _motion.reset ? 1 : 0;
+        t.history_reset = (_motion.reset || _extentReset) ? 1 : 0;
+        _extentReset = false;
         t.passes = 1;
         t.exposure = fi.exposure;
         t.exposure_state = fi.exposure_state;
@@ -710,6 +711,17 @@ bool NrEngine::Begin(ID3D12Device* device, ID3D12CommandQueue* queue, uint32_t s
         std::lock_guard lock(_mutex);
         FeedSize(srcW, srcH, &feedW, &feedH);
         dirty = _dirty;
+        if (srcW != _histSrcW || srcH != _histSrcH)
+        {
+            if (_histSrcW != 0)
+            {
+                _extentReset = true;
+                Log(OptiLog_Info, "NR (%ls): source %ux%u -> %ux%u, history reset", name.c_str(), _histSrcW, _histSrcH,
+                    srcW, srcH);
+            }
+            _histSrcW = srcW;
+            _histSrcH = srcH;
+        }
     }
 
     if (state == State::Idle)
@@ -1128,8 +1140,9 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     const auto bbState = D3D12_RESOURCE_STATES(f->backBufferState);
     const auto hudState = D3D12_RESOURCE_STATES(f->hudlessState);
     const uint32_t encoding = f->colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? 2
-                              : f->colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709  ? 0
+                              : f->colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709  ? 3
                                                                                            : 1;
+    _stats.encoding = encoding;
 
     Barrier(list, hud, hudState, kRead);
 
@@ -1155,6 +1168,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         c.uiLow = _settings.uiLow;
         c.uiHigh = _settings.uiHigh;
         c.encoding = encoding;
+        c.paperWhite = _settings.paperWhite / 80.0f;
         ID3D12Resource* srv[4] = { _termCopy.Get(), enh, _feed.Get(), hud };
         const DXGI_FORMAT fmt[4] = { bd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT, hud->GetDesc().Format };
         Dispatch(list, _psoTerminal.Get(), c, srv, fmt, _termOut.Get(), bd.Format, w, h);
@@ -1177,6 +1191,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         c.srcUvScaleX = float(w) / float(hd.Width);
         c.srcUvScaleY = float(h) / float(hd.Height);
         c.encoding = encoding;
+        c.paperWhite = _settings.paperWhite / 80.0f;
         Barrier(list, _feed.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12Resource* srv[4] = { hud, nullptr, nullptr, nullptr };
         const DXGI_FORMAT fmt[4] = { hd.Format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN };
@@ -1249,6 +1264,14 @@ void NrEngine::SettleOwn()
         WaitForSingleObject(e, 1000);
 }
 
+void NrEngine::Quiesce()
+{
+    if (_state != State::Ready)
+        return;
+    std::lock_guard lock(_mutex);
+    WaitIdle();
+}
+
 bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
 {
     if (_termCopy && _termCopy->GetDesc().Width == bd.Width && _termCopy->GetDesc().Height == bd.Height &&
@@ -1257,9 +1280,12 @@ bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
     _termCopy = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, bd.Format, false, kRead);
     _termOut = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, UavFormat(bd.Format), true,
                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (_termCopy && _termOut)
+        _termCopy->SetName(L"lmxxf_nr source copy"), _termOut->SetName(L"lmxxf_nr result");
     if (!_termCopy || !_termOut)
     {
-        Fail("copy textures failed for format " + std::to_string(bd.Format));
+        Fail("copy textures failed for format " + std::to_string(bd.Format) + ", device " +
+             std::to_string((uint32_t) _device->GetDeviceRemovedReason()));
         return false;
     }
     return true;
@@ -1279,6 +1305,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         return false;
     _stats.srcWidth = w;
     _stats.srcHeight = h;
+    _stats.encoding = in.encoding;
     ReadTimings();
 
     // The source as it is now (src may be dst)
@@ -1297,6 +1324,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         c.sizeY = _feedH;
         c.srcUvScaleX = c.srcUvScaleY = 1.0f;
         c.encoding = in.encoding;
+        c.paperWhite = _settings.paperWhite / 80.0f;
         Barrier(list, _feed.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12Resource* srv[4] = { _termCopy.Get(), nullptr, nullptr, nullptr };
         const DXGI_FORMAT fmt[4] = { sd.Format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN };
@@ -1324,6 +1352,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
         c.encoding = in.encoding;
+        c.paperWhite = _settings.paperWhite / 80.0f;
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12Resource* srv[4] = { _termCopy.Get(), enh, _feed.Get(), c.useMv ? in.motion : nullptr };
         const DXGI_FORMAT fmt[4] = { sd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -1369,6 +1398,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         Produce(list, nullptr, wait);
         lock.unlock();
         SubmitOwn(queue, slot, list, wait);
+        _answerWait = wait; // the present must not queue behind that list's wait
         lock.lock();
         if (_jobState != Job::Enqueued)
             return false;

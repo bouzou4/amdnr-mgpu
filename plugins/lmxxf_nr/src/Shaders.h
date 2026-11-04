@@ -23,8 +23,8 @@ cbuffer C : register(b0)
     uint UseMv;
     float UiLow;  // ApplyTerminal: back buffer - HUD-less difference where the UI mask starts / is full
     float UiHigh;
-    uint Encoding; // Src / Aux: 0 linear, 1 sRGB, 2 PQ (ST 2084, 80 nits = 1.0)
-    uint Pad;
+    uint Encoding; // Src / Aux: 0 linear, 1 sRGB, 2 PQ (ST 2084, 80 nits = 1.0), 3 scRGB display (linear, 80 nits = 1.0)
+    float PaperWhite; // 2 and 3: linear value of paper white
 };
 
 float3 Finite(float3 c) { return all(isfinite(c)) ? max(c, 0) : 0; }
@@ -53,6 +53,28 @@ float3 FromLinear(float3 c)
     return c;
 }
 
+// HDR output (2, 3): the network gets SDR-ish values, paper white at 1, a C1 Reinhard shoulder above 0.8
+float3 ToNet(float3 x)
+{
+    if (Encoding < 2)
+        return x;
+    float3 y = x / PaperWhite;
+    float3 t = (y - 0.8) / 0.2;
+    return y <= 0.8 ? y : 0.8 + 0.2 * t / (1 + t);
+}
+
+// Edit e (network space) on an encoded colour. HDR: additive in paper-white units up to the knee, the same relative
+// change above it (the shoulder's inverse would blow highlights up); no edit, no change; negative scRGB kept
+float3 AddEdit(float3 c, float3 e)
+{
+    float3 x = ToLinear(c);
+    if (Encoding < 2)
+        return FromLinear(max(x + e, 0));
+    float3 xp = max(x, 0);
+    float3 n = ToNet(xp);
+    float3 y = n <= 0.8 ? max(xp + e * PaperWhite, 0) : xp * max(1 + e / n, 0);
+    return FromLinear(x + y - xp);
+}
 // Feed: box filter of Src's used rect into the network size, linear
 [numthreads(8, 8, 1)]
 void Down(uint3 id : SV_DispatchThreadID)
@@ -65,7 +87,7 @@ void Down(uint3 id : SV_DispatchThreadID)
                ToLinear(Src.SampleLevel(Lin, uv + float2(q.x, -q.y), 0).rgb) +
                ToLinear(Src.SampleLevel(Lin, uv + float2(-q.x, q.y), 0).rgb) +
                ToLinear(Src.SampleLevel(Lin, uv + float2(q.x, q.y), 0).rgb);
-    Dst[id.xy] = float4(Finite(c * 0.25), 1);
+    Dst[id.xy] = float4(ToNet(Finite(c * 0.25)), 1);
 }
 
 float3 Edit(float2 uv)
@@ -89,7 +111,7 @@ void Apply(uint3 id : SV_DispatchThreadID)
     {
         float3 e = Edit(prev);
         if (all(isfinite(e)) && all(isfinite(c.rgb)))
-            o.rgb = FromLinear(max(ToLinear(c.rgb) + Strength * e, 0));
+            o.rgb = AddEdit(c.rgb, Strength * e);
     }
     Dst[id.xy] = o;
 }
@@ -108,7 +130,7 @@ void ApplyTerminal(uint3 id : SV_DispatchThreadID)
     float3 e = Edit(uv);
     float3 o = b.rgb;
     if (ui < 1 && all(isfinite(e)))
-        o = lerp(FromLinear(max(ToLinear(b.rgb) + Strength * e, 0)), b.rgb, ui);
+        o = lerp(AddEdit(b.rgb, Strength * e), b.rgb, ui);
     Dst[id.xy] = float4(o, b.a);
 }
 )";
@@ -125,6 +147,6 @@ struct ShaderConstants
     uint32_t useMv;
     float uiLow, uiHigh;
     uint32_t encoding;
-    uint32_t pad;
+    float paperWhite;
 };
 static_assert(sizeof(ShaderConstants) == 72);
