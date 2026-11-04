@@ -34,6 +34,10 @@ void FFXFeature::QueryVersionsDx12(ID3D12Device* device)
     versionQuery.versionIds = State::Instance().ffxUpscalerVersionIds.data();
     versionQuery.versionNames = State::Instance().ffxUpscalerVersionNames.data();
     FfxApiProxy::D3D12_Query(nullptr, &versionQuery.header);
+
+    for (size_t i = 0; i < versionCount; i++)
+        LOG_INFO("FFX upscaler provider {}: {} ({:X})", i, State::Instance().ffxUpscalerVersionNames[i],
+                 State::Instance().ffxUpscalerVersionIds[i]);
 }
 
 void FFXFeature::QueryVersionsVulkan()
