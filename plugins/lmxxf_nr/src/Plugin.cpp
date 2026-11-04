@@ -185,16 +185,18 @@ void DrawTab(void*)
     g_api->ItemTooltip(rt.Models() ? "Full: the 71-block model, Small: 31 blocks (DLSS5_MULTI_PASS 1 / 0.5)"
                                    : "This runtime has one model (no DLSS5_MULTI_PASS)");
 
-    g_api->Disabled(!rt.Models() || g_ui.model != 0);
+    g_api->Disabled(!rt.Models());
     int32_t pass = g_ui.passes - 1;
     if (g_api->Combo("Passes", &pass, kPasses, 3, nullptr))
         g_ui.passes = pass + 1, changed = true;
     g_api->Disabled(false);
     g_api->ItemTooltip(!rt.Models() ? "This runtime has one model (no DLSS5_MULTI_PASS)"
-                       : g_ui.model != 0 ? "Full model only (Small is one pass)"
-                                         : "DLSS5_MULTI_PASS: the Full network runs N times per frame for a stronger style.\n"
-                                           "3 predicts its third pass unless DLSS5_MULTI_PASS_PREDICT=0 is set. 2 and 3 run\n"
-                                           "without network history (the runtime's history takes one pass).");
+                                    : "DLSS5_MULTI_PASS: the Full network runs N times per frame for a stronger style.\n"
+                                      "Full model only: the runtime runs Small once (DLSS5_MULTI_PASS 0.5).\n"
+                                      "3 predicts its third pass unless DLSS5_MULTI_PASS_PREDICT=0 is set. 2 and 3 run\n"
+                                      "without network history (the runtime's history takes one pass).");
+    if (rt.Models() && g_ui.model != 0 && g_ui.passes > 1)
+        g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "Passes apply to the Full model: pick Full to use them.");
 
     g_api->Disabled(!rt.Styles());
     if (g_api->Combo("Style", &g_ui.style, kStyles, 3, nullptr))
