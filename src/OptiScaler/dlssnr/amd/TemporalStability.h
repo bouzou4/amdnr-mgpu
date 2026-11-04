@@ -285,7 +285,8 @@ float4 sampleResid4(float2 posPx) {
  float2 f = posPx - texPos1;
  float2 c0 = f * (-0.5 + f * (1.0 - 0.5*f));
  float2 c1 = 1.0 + f*f * (-2.5 + 1.5*f);
- float2 c2 = f * (0.5 + f * (2.0 - 1.5*f));
+)"
+R"( float2 c2 = f * (0.5 + f * (2.0 - 1.5*f));
  float2 c3 = f*f * (-0.5 + 0.5*f);
  float2 c12 = c1 + c2;
  float2 off12 = c2 / max(c12, 1e-5);
@@ -563,7 +564,8 @@ void stats3Base(int2 p, int2 mx, out float3 mean, out float3 sigma, out float3 n
   [unroll] for (int dx = -1; dx <= 1; ++dx)
   {
    int2 q = clamp(p + int2(dx, dy), int2(0,0), mx);
-   float dq = depthCur.Load(int3(q,0)).r;
+)"
+R"(   float dq = depthCur.Load(int3(q,0)).r;
    if (!isfinite(dq)) continue;
    dNear = min(dNear, dq); dFar = max(dFar, dq);
    // "Nearest" depends on the convention the game hands us, which is why depthInv is a
@@ -820,7 +822,8 @@ void stats3Base(int2 p, int2 mx, out float3 mean, out float3 sigma, out float3 n
  // flicker remain - slight on lmxxf, clearly visible on danielblnc. The danielblnc half has a
  // measured cause. Guided fill v2's filled frame shows the PREVIOUS MODEL PICTURE, reprojected
  // and Catmull-Rom resampled: a one-frame ghost wherever the vectors do not describe the
- // content, and a high band (grain, sparkle, the jitter sample itself) that refreshes at half
+)"
+R"( // content, and a high band (grain, sparkle, the jitter sample itself) that refreshes at half
  // the frame rate - the filled frame's high band correlated 0.83-0.91 with the previous model
  // frame (handoff 2638ae69), and the upscaler was handed the same jitter sample twice. Its
  // model frames were written straight through, undamped, so the network's per-call
@@ -1045,7 +1048,8 @@ void stats3Base(int2 p, int2 mx, out float3 mean, out float3 sigma, out float3 n
    if (keepGeo > 0.5 && gate < 0.5) changeCount.InterlockedAdd(48, 1u);
    if (freshHere) {
     const float lc = dot(tmap(max(c.rgb,0.0)), lwA), lf = dot(tmap(max(oF,0.0)), lwA), lb = dot(tmap(mM), lwA);
-    if (isfinite(lc) && isfinite(lf) && isfinite(lb)) {
+)"
+R"(    if (isfinite(lc) && isfinite(lf) && isfinite(lb)) {
      changeCount.InterlockedAdd(40, uint(saturate(abs(lc - lf)) * 4096.0));  // model detail the fit missed
      changeCount.InterlockedAdd(44, uint(saturate(abs(lc - lb)) * 4096.0));  // model detail in total
     }
@@ -1281,7 +1285,8 @@ void stats3Base(int2 p, int2 mx, out float3 mean, out float3 sigma, out float3 n
   //
   // dlss5-neural-amd measured the failure this is shaped to avoid: with frames skipped,
   // "the correction being pasted on belonged to a picture that had already moved", and it
-  // left a heavy trail. Theirs was pasted WHERE IT WAS. This one is carried to where it
+)"
+R"(  // left a heavy trail. Theirs was pasted WHERE IT WAS. This one is carried to where it
   // belongs first. Same idea, opposite result, and the difference is one reprojection.
   // ============================ GUIDED FILL (preset 5) ==============================
   // Every preset above reprojects a PICTURE and then argues with it: depth, divergence,
@@ -1551,7 +1556,8 @@ void stats3Base(int2 p, int2 mx, out float3 mean, out float3 sigma, out float3 n
    // strategy this pass knows can be GRADED against it: on a model frame, compute what each
    // strategy would have shown for this frame from the same inputs a skipped frame gets,
    // measure its error against the model's actual picture, and keep a smoothed score per
-   // 16x16 tile. On a skipped frame, blend the strategies by those scores. Nothing is decided
+)"
+R"(   // 16x16 tile. On a skipped frame, blend the strategies by those scores. Nothing is decided
    // by a rule someone wrote: where the picture stands still the reprojected picture wins,
    // where a character moves the edit-carry or the position-free curve wins, and it changes
    // its mind within a few model frames when the scene changes. Three candidates:
@@ -1836,7 +1842,8 @@ void stats3Base(int2 p, int2 mx, out float3 mean, out float3 sigma, out float3 n
    // neighbourhood - the detail dominates and the grain is the smaller error, so hand back
    // the frame as it is. Sharp-but-noisy is much closer to the model's output than
    // smooth-but-smeared, because the model keeps the strands too.
-   // v2 shares two measurements between the fallback and the change test below: the
+)"
+R"(   // v2 shares two measurements between the fallback and the change test below: the
    // denoised history's 3x3 sigma (real detail) and the raw's grain, which is what the raw's
    // sigma has in excess of it.
    float3 noiseV2 = 0.0;
@@ -2076,7 +2083,8 @@ void stats3Base(int2 p, int2 mx, out float3 mean, out float3 sigma, out float3 n
     // the line toward the CENTRE of what the neighbourhood contains and stops at the
     // boundary, so the same pixel lands on the asphalt's own colour and leaves nothing.
     //
-    // It is still one scalar - maUnit - dividing the whole offset vector, so it cannot
+)"
+R"(    // It is still one scalar - maUnit - dividing the whole offset vector, so it cannot
     // rotate hue. That is what separates it from the per-channel clamp tried early on,
     // which divided each channel by a different amount and painted teal outlines around
     // the taillights and rainbow speckle through the foliage.

@@ -1,0 +1,1 @@
+Microsoft.Direct3D.D3D12 1.615.1 (nuget.org), sha256 20b67ae94eda93b9e1712362647d4c7b7d3b2d9150fded15950294d81611f17d; headers only
