@@ -2,6 +2,7 @@
 // Multi-GPU mode: the game renders on one card, the other card presents and runs NR. The mgpu/ modules do the work;
 // this file connects them to the plugin API (adapter override, swapchain provider, present and upscale callbacks).
 #include "MgpuPlugin.h"
+#include "Autoconfig.h"
 #include "Nr.h"
 #include "mgpu/MgpuCore.h"
 
@@ -210,7 +211,7 @@ bool MgpuFallback() { return g_on && Mgpu::GetStats().fallback; }
 bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& dumpDir)
 {
     Mgpu::Settings s;
-    s.enabled = api->GetBool(plugin, "MultiGpu", false);
+    s.enabled = g_keys.Bool("MultiGpu", false);
     if (!s.enabled)
         return false;
     if (!OPTI_API_HAS(api, RegisterAdapterOverride) || !OPTI_API_HAS(api, RegisterSwapchainProvider) ||
@@ -219,21 +220,21 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
         Log(OptiLog_Error, "multi-GPU needs the adapter override and swapchain provider API: off");
         return false;
     }
-    s.renderBus = api->GetInt(plugin, "MgpuRenderBus", -1);
-    s.displayBus = api->GetInt(plugin, "MgpuDisplayBus", -1);
-    s.hudless = api->GetBool(plugin, "MgpuHudless", true);
-    s.wholeFrameFallback = api->GetBool(plugin, "WholeFrameFallback", true);
-    s.presenter = api->GetBool(plugin, "MgpuPresenter", true);
-    s.fallbackInline = api->GetBool(plugin, "MgpuFallbackInline", true);
-    s.nrEveryFrame = api->GetBool(plugin, "MgpuNrEveryFrame", true);
-    s.temporal = api->GetBool(plugin, "MgpuMotionVectors", true);
-    s.uiGate = std::clamp(api->GetFloat(plugin, "MgpuUiGate", 0.90f), 0.0f, 1.0f);
-    s.maxLead = (unsigned) std::clamp(api->GetInt(plugin, "MgpuMaxFramesAhead", 1), 1, 3);
-    s.lowLatency = std::clamp(api->GetInt(plugin, "MgpuLowLatency", 2), 0, 2);
-    s.earlySend = api->GetBool(plugin, "MgpuEarlySend", false);
+    s.renderBus = g_keys.Int("MgpuRenderBus", -1);
+    s.displayBus = g_keys.Int("MgpuDisplayBus", -1);
+    s.hudless = g_keys.Bool("MgpuHudless", true);
+    s.wholeFrameFallback = g_keys.Bool("WholeFrameFallback", true);
+    s.presenter = g_keys.Bool("MgpuPresenter", true);
+    s.fallbackInline = g_keys.Bool("MgpuFallbackInline", true);
+    s.nrEveryFrame = g_keys.Bool("MgpuNrEveryFrame", true);
+    s.temporal = g_keys.Bool("MgpuMotionVectors", true);
+    s.uiGate = std::clamp(g_keys.Float("MgpuUiGate", 0.90f), 0.0f, 1.0f);
+    s.maxLead = (unsigned) std::clamp(g_keys.Int("MgpuMaxFramesAhead", 1), 1, 3);
+    s.lowLatency = std::clamp(g_keys.Int("MgpuLowLatency", 2), 0, 2);
+    s.earlySend = g_keys.Bool("MgpuEarlySend", false);
     // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
-    s.dred = std::clamp(api->GetInt(plugin, "MgpuDred", api->GetBool(plugin, "MgpuDred", false) ? 1 : 0), 0, 2);
-    s.forwardOutputs = api->GetBool(plugin, "MgpuForwardOutputs", true);
+    s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", false) ? 1 : 0), 0, 2);
+    s.forwardOutputs = g_keys.Bool("MgpuForwardOutputs", true);
 
     g_dir = dumpDir;
     Mgpu::Env e;

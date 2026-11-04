@@ -374,6 +374,9 @@ echo.
 goto completeSetup
 
 :completeSetup
+REM Plugins extracted into OptiScaler\plugins need ASI loading
+if exist "OptiScaler\plugins\*.asi" if exist OptiScaler.ini powershell -NoProfile -Command "(Get-Content 'OptiScaler.ini') -replace 'LoadAsiPlugins=auto', 'LoadAsiPlugins=true' | Set-Content 'OptiScaler.ini'"
+
 REM Rename OptiScaler file
 echo.
 if "!overwriteChoice!"=="1" (

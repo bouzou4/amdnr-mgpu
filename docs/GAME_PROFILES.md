@@ -37,6 +37,13 @@ What a game needs from the plugin differs per title: where the HUD-less colour c
 - **Satisfactory** (`FactoryGameSteam-Win64-Shipping.exe`, UE5, D3D12, FSR inputs through the FFX API): HUDfix finds the HUD-less colour once its hooks run with FG off (`Source=hudfix`), terminal placement keeps the UI pixels identical. HDR is PQ (`R10G10B10A2`, colour space 12) only with `r.HDR.EnableHDROutput=1` in Engine.ini (`hdr-cvar`); the main menu is capped by `FG.MaxMainMenuFPS` (`menu-cap`). Presets: Performance on one card (54.6 fps against 76 without NR), Balanced with multi-GPU (Full 1080 with history, 56.2 fps, render card bound).
 - **CONTROL** (`CONTROLResonant.exe`, D3D12, FSR 3.1/4 through the FFX API): HUDfix picks nothing; the game hands its FSR FG a HUD-less colour (`R10G10B10A2`, back buffer size), used while its FG is off (`Source=gamefg`); with its FG on NR runs on the whole frame. The colour at the upscale callbacks is scene-linear HDR (median about 1800, peaks 60000): `UpscaleColour=scene`, `Exposure=game`, guard at 1.5 (it trips for a few frames at loading transitions). Creates its swapchain with the legacy `CreateSwapChain` (`legacy-swapchain`). Preset: Performance (Small) multi-GPU, as the play install.
 
+## In this build (spike/autoconfig)
+
+- Read at start from `lmxxf_nr_profiles.ini` beside `lmxxf_nr.asi` (`Autoconfig.cpp`). A second section for the same exe is named `<exe>|<tag>` and carries a `Path=`.
+- Keys read at run time: `Placement`, `Preset` (`MgpuPreset` with `MultiGpu`), `WholeFrameFallback`, `Exposure` (`game` = on, `auto` = off), `HdrPaperWhite`, plus the plain plugin keys `Model`, `NetworkSize`, `MultiPass`, `Temporal`, `Style`, `Strength`, `MotionVectors`, `MgpuHudless`. Other keys (`Source`, `UpscaleColour`, `HdrGuardMedian`, `Quirks`) are logged as not used by this build.
+- `Host.*` keys are not applied: there is no installer any more (OptiScaler's own setup runs instead), and the plugin API has no access to other sections. Satisfactory ran NR with the stock `Dx12Upscaler=auto` (upscale callbacks at 2304x1296 render size), so the seed's `Host.Upscalers.Dx12Upscaler=ffx` is not needed there.
+- A profile `Preset` is skipped when the user set any of the four rows it would override.
+
 ## Later
 
 - Profile keys from the community: a PR to the profiles file, one section per title, with the run that proved it (fps, UI-pixels gate, feed range).

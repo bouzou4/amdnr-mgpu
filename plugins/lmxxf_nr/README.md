@@ -6,7 +6,21 @@ It needs an OptiScaler with the plugin API extensions of this repository (`docs/
 
 ## What the user installs
 
-Nothing of the runtime ships with the plugin. It looks for a user-installed `LmxxfNrRuntime.dll` in `RuntimeDir` (setting), the game's exe folder, the OptiScaler folder and their `DLSS5-AMD\` subfolders, and for its assets:
+A drop-in add-on to an OptiScaler release. Extract OptiScaler into the game, then add `OptiScaler\plugins\lmxxf_nr.asi` and `OptiScaler\plugins\lmxxf_nr_profiles.ini`, then run OptiScaler's `setup_windows.bat`. With a one-line setup change (drafted for upstream; this repository's `src/setup_windows.bat` carries it), setup sets `LoadAsiPlugins=true` when `plugins\` holds an `.asi`; nothing else needs editing. The stock bat sets that key only when it downloads OptiPatcher, and the plugin can't set it itself: plugins reach the plugin API only through `LoadAsiPlugins`. `Remove_OptiScaler.bat` from the same setup deletes `OptiScaler\plugins\*`, the plugin and its profiles included.
+
+Without a `[Plugin.lmxxf_nr]` section every key comes from the game's profile (`lmxxf_nr_profiles.ini` beside the plugin, matched on the exe name, see `docs/GAME_PROFILES.md`) and then from the built-in defaults. Any key set in `[Plugin.lmxxf_nr]` wins; `auto` or empty counts as unset. A profile's `Preset` is skipped when the user set Model, NetworkSize, MultiPass or Temporal. The tab shows `Profile: <Name>, sets <keys>`.
+
+Anti-cheat: at start the plugin looks in the exe folder and up to three parents (and their `Plugins\`) for EasyAntiCheat, BattlEye, ACE, BlackCipher, EQU8, GameGuard, XIGNCODE, mhyprot, PunkBuster, FACEIT, EA Javelin and Denuvo Anti-Cheat files. It also checks a short list of exe names (Vanguard and VAC titles, Fortnite, Apex, R6, PUBG) and the loaded EAC / BattlEye client modules. On a hit it registers nothing but its tab and an overlay line saying it is disabled and why: no hooks, no callbacks, no adapter override.
+
+Nothing of the runtime ships with the plugin. It is searched for in this order, and the first candidate whose dll, assets and module hashes check out is used:
+
+1. `RuntimeDir` (with `ModulesDir` / `WeightsDir`) in `[Plugin.lmxxf_nr]`
+2. `LMXXF_NR_DIR` (environment)
+3. the plugin's folder, then `plugins\lmxxf_nr\`
+4. `%LOCALAPPDATA%\lmxxf-nr\`
+5. the game's exe folder and the OptiScaler folder (with `ModulesDir` / `WeightsDir` when no `RuntimeDir` is set)
+
+The folders in 2-4 may hold a `paths.ini` (`[lmxxf-nr]` with `RuntimeDir`, `ModulesDir`, `WeightsDir`, relative to that folder) for a runtime that lives elsewhere; it is tried before the folder itself. In each candidate folder and its `DLSS5-AMD\`, the plugin looks for `LmxxfNrRuntime.dll` and its assets (below). Every module a `SHA256SUMS` lists must exist and hash right (80 modules: 0.9 s on first read, 50 ms cached), else that candidate is skipped and the reason logged. When nothing is found, the tab lists what was searched and where to put the runtime, and the overlay says `NR: off: no lmxxf runtime found`. The assets:
 
 - **A runtime build with its module folder** (first when `ModulesDir` is set): `ModulesDir` (a HIP module folder with `SHA256SUMS`), else `modules\` or `HIP\` beside the dll, is the runtime's `assets_directory`; `WeightsDir` points the runtime at the tiled weights (`LMXXF_WEIGHTS_DIR`) when they are not beside the modules. Nothing is copied.
 - **lmxxf's own package layout**: `DLSS5-AMD\native-game-tiled-assets\HIP\SHA256SUMS` + the HIP modules, weights in `native-game-tiled-assets\`. The runtime gets the HIP folder as `assets_directory`.
@@ -14,7 +28,7 @@ Nothing of the runtime ships with the plugin. It looks for a user-installed `Lmx
 
 `DLSS5_*` settings the runtime knows (found by name in the dll) are set in the process environment before the session is created; the menu greys out what the runtime does not read. `MultiPass` 2 / 3 ("Passes" in the menu, Full model only) runs the network two or three times per frame for a stronger style: the session is rebuilt off the render thread, without `FULL_NETWORK` (which pins the runtime to one pass). With 2 passes the history stays on when the runtime takes it with more than one pass (the temporal frame info's `passes`; lmxxf-nr `temporal` from 3ee91db6: the warped previous final answer goes into the last pass and the history gate blends the final output); an older runtime refuses it and the session runs without (`runtime takes no motion-fed history with 2 passes`). 3 passes run without history (the runtime takes it only with `DLSS5_MULTI_PASS_PREDICT=0`, at +50 % network time). The runtime keeps the pass count of the last `FULL_NETWORK` frame process-wide, so after a Full session the warm-up runs one `FULL_NETWORK` job before the real one to release it (also for Small). Network time on the temporal runtime, 1080 tier (`nr_sequence --perf`): 1 pass 10.4 ms, 2 passes 22.3 ms, 3 passes 17.7 ms (its default `DLSS5_MULTI_PASS_PREDICT=1` predicts the third pass). A runtime with lmxxf's history ABI (sole export, `GetTimings`, `history_supported = 1`, the `temporal` branch of lmxxf) gets the 168-byte temporal frame info, `FULL_NETWORK` for the Full model, and its history network built during the warm-up.
 
-Install: `<game>\OptiScaler\plugins\lmxxf_nr.asi` (OptiScaler's `MainDllPath` plugins folder) and in `OptiScaler.ini`:
+Keys (all optional; by hand without the setup change: `LoadAsiPlugins=true`):
 
 ```ini
 [Plugins]

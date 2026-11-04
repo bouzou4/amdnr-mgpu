@@ -63,22 +63,12 @@ bool BinaryHas(const std::vector<char>& image, const char* text)
 }
 } // namespace
 
-bool Runtime::Load(const RuntimePaths& paths)
+bool ResolveRuntime(const Autoconfig::RuntimeCandidate& c, const std::wstring& exeDir, RuntimeLayout* out)
 {
-    const std::wstring& exeDir = paths.exe;
-    std::vector<fs::path> dirs;
-    if (!paths.extra.empty())
-        dirs.emplace_back(paths.extra);
-    for (const auto& d : { exeDir, paths.opti })
-    {
-        if (!d.empty())
-        {
-            dirs.emplace_back(d);
-            dirs.emplace_back(fs::path(d) / L"DLSS5-AMD");
-        }
-    }
-
-    for (const auto& dir : dirs)
+    using L = Runtime::Layout;
+    *out = {};
+    out->weights = c.weights;
+    for (const fs::path& dir : { fs::path(c.dir), fs::path(c.dir) / L"DLSS5-AMD" })
     {
         const auto dll = dir / L"LmxxfNrRuntime.dll";
         if (!IsFile(dll))
@@ -86,47 +76,85 @@ bool Runtime::Load(const RuntimePaths& paths)
 
         // Assets: ModulesDir, lmxxf's package layout, a module folder beside the dll, then a pak beside the dll
         std::wstring found;
-        Layout foundLayout = Layout::None;
-        if (!paths.modules.empty() && IsFile(fs::path(paths.modules) / L"SHA256SUMS"))
+        L foundLayout = L::None;
+        if (!c.modules.empty() && IsFile(fs::path(c.modules) / L"SHA256SUMS"))
         {
-            found = paths.modules;
-            foundLayout = Layout::LmxxfBuild;
+            found = c.modules;
+            foundLayout = L::LmxxfBuild;
         }
         for (const auto& root : { dir, dir.parent_path(), fs::path(exeDir) })
         {
-            if (foundLayout != Layout::None)
+            if (foundLayout != L::None)
                 break;
             if (FindPackageAssets(root, &found))
-                foundLayout = Layout::LmxxfPackage;
+                foundLayout = L::LmxxfPackage;
         }
         for (const auto& sub : { dir / L"modules", dir / L"HIP" })
         {
-            if (foundLayout == Layout::None && IsFile(sub / L"SHA256SUMS"))
+            if (foundLayout == L::None && IsFile(sub / L"SHA256SUMS"))
             {
                 found = sub.wstring();
-                foundLayout = Layout::LmxxfBuild;
+                foundLayout = L::LmxxfBuild;
             }
         }
-        if (foundLayout == Layout::None && IsFile(dir / L"LmxxfNrRuntime.pak"))
+        if (foundLayout == L::None && IsFile(dir / L"LmxxfNrRuntime.pak"))
         {
             found = (dir / L"LmxxfNrRuntime.pak").wstring();
-            foundLayout = Layout::RuntimePak;
+            foundLayout = L::RuntimePak;
         }
-        if (foundLayout == Layout::None)
+        if (foundLayout == L::None)
         {
-            error = "LmxxfNrRuntime.dll found but no assets (ModulesDir, DLSS5-AMD\\native-game-tiled-assets, modules\\ "
-                    "or LmxxfNrRuntime.pak)";
+            out->error = "LmxxfNrRuntime.dll found but no assets (ModulesDir, DLSS5-AMD\\native-game-tiled-assets, "
+                         "modules\\ or LmxxfNrRuntime.pak)";
             continue;
         }
+        // Module folders carry SHA256SUMS: every listed module must hash right
+        if (foundLayout != L::RuntimePak)
+        {
+            std::string why;
+            if (!Autoconfig::VerifySha256Sums((fs::path(found) / L"SHA256SUMS").wstring(), &why, &out->hashed))
+            {
+                out->error = "modules " + Autoconfig::Narrow(found) + ": " + why;
+                continue;
+            }
+        }
+        out->dll = dll.wstring();
+        out->assets = found;
+        out->layout = (int) foundLayout;
+        out->error.clear();
+        return true;
+    }
+    if (out->error.empty())
+        out->error = "no LmxxfNrRuntime.dll";
+    return false;
+}
+
+bool Runtime::Load(const RuntimePaths& paths)
+{
+    tried = true;
+    searched.clear();
+    for (const auto& c : paths.candidates)
+    {
+        RuntimeLayout r;
+        if (!ResolveRuntime(c, paths.exe, &r))
+        {
+            searched.push_back(c.source + ": " + Autoconfig::Narrow(c.dir) + ": " + r.error);
+            continue;
+        }
+        const fs::path dll(r.dll);
+        const Layout foundLayout = (Layout) r.layout;
+        const std::wstring found = r.assets;
+        hashed = r.hashed;
 
         // Read by the runtime when the session finds no weights beside its modules
-        if (!paths.weights.empty() && foundLayout != Layout::RuntimePak)
-            SetEnvironmentVariableW(L"LMXXF_WEIGHTS_DIR", paths.weights.c_str());
+        if (!r.weights.empty() && foundLayout != Layout::RuntimePak)
+            SetEnvironmentVariableW(L"LMXXF_WEIGHTS_DIR", r.weights.c_str());
 
         module = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (module == nullptr)
         {
             error = "LoadLibrary(LmxxfNrRuntime.dll) failed: " + std::to_string(GetLastError());
+            searched.push_back(c.source + ": " + error);
             continue;
         }
 
@@ -134,6 +162,7 @@ bool Runtime::Load(const RuntimePaths& paths)
         if (getApi == nullptr)
         {
             error = "LmxxfNrRuntime.dll has no LmxxfNrGetApi export";
+            searched.push_back(c.source + ": " + error);
             FreeLibrary(module);
             module = nullptr;
             continue;
@@ -178,6 +207,7 @@ bool Runtime::Load(const RuntimePaths& paths)
         if (rc != LMXXF_NR_OK || api.Create == nullptr || api.PrepareFrame == nullptr || api.EnqueueHip == nullptr)
         {
             error = "LmxxfNrGetApi failed: " + std::to_string(rc) + " " + LastError();
+            searched.push_back(c.source + ": " + error);
             FreeLibrary(module);
             module = nullptr;
             continue;
@@ -197,12 +227,12 @@ bool Runtime::Load(const RuntimePaths& paths)
         dllPath = dll.wstring();
         assets = found;
         layout = foundLayout;
+        source = c.source;
         error.clear();
         return true;
     }
 
-    if (error.empty())
-        error = "LmxxfNrRuntime.dll not found (game folder, OptiScaler folder or DLSS5-AMD)";
+    error = "no usable lmxxf runtime found";
     return false;
 }
 
