@@ -135,16 +135,17 @@ bool IsExposureFormat(DXGI_FORMAT f)
 }
 } // namespace
 
+// Never destroyed: at process exit a joinable worker would terminate, and D3D12 / HIP teardown in DLL detach is unsafe
 NrEngine& Engine()
 {
-    static NrEngine engine;
-    return engine;
+    static NrEngine* engine = new NrEngine();
+    return *engine;
 }
 
 NrEngine& DisplayEngine()
 {
-    static NrEngine engine;
-    return engine;
+    static NrEngine* engine = new NrEngine();
+    return *engine;
 }
 
 bool NrEngine::LoadRuntime(const RuntimePaths& paths)

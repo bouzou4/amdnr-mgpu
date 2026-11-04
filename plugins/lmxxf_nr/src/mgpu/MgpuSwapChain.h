@@ -87,6 +87,8 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     void ReleaseRetired();
     void Alive(const char* where);
     HRESULT CreateFallbackLists();
+    HRESULT CreateIngestLists();
+    HRESULT RenewReal();
     HRESULT EnterFallback();
     HRESULT PresentFallback(UINT sync, UINT flags);
     void LogOutput();
@@ -152,7 +154,12 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     std::chrono::steady_clock::time_point _tSched[K];
     bool _stop = false;
     std::thread _thread;
-    std::mutex _scMutex; // serialises calls on the real swapchain
+    std::mutex _scMutex; // serialises the game's calls on the real swapchain (not the presenter's Present)
+    std::atomic<BOOL> _fsCached { FALSE };
+    UINT _presentFails = 0, _renewals = 0;
+    std::atomic<bool> _tearingOff { false };
+    std::mutex _fsM;
+    ComPtr<IDXGIOutput> _fsOutput;
 
     HANDLE _waitable = nullptr; // game-facing frame latency semaphore
     UINT _maxLatency = 1;

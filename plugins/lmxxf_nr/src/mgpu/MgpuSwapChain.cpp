@@ -11,6 +11,7 @@ std::mutex& StatsMutex() { return s_statsMutex; }
 
 static inline UINT64 AlignUp(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 static inline double Ema(double prev, double v) { return prev <= 0 ? v : prev * 0.95 + v * 0.05; }
+static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms);
 
 static std::atomic<ProxySwapChain*> s_active { nullptr };
 ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
@@ -432,39 +433,8 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
                 return hr;
         }
 
-    // Display side: one prerecorded ingest per (slot, real back buffer).
-    _dAlloc.resize(K * _realCount);
-    _dList.resize(K * _realCount);
-    for (UINT s = 0; s < K; ++s)
-        for (UINT m = 0; m < _realCount; ++m)
-        {
-            UINT n = s * _realCount + m;
-            if (FAILED(hr = _ddev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_dAlloc[n]))) ||
-                FAILED(hr = _ddev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _dAlloc[n].Get(), nullptr,
-                                                     IID_PPV_ARGS(&_dList[n]))))
-                return hr;
-            auto* c = _dList[n].Get();
-            D3D12_RESOURCE_BARRIER br {};
-            br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            br.Transition = { _realBb[m].Get(), 0, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST };
-            c->ResourceBarrier(1, &br);
-            if (_dQuery)
-                c->EndQuery(_dQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2);
-            D3D12_TEXTURE_COPY_LOCATION dst { _realBb[m].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-            dst.SubresourceIndex = 0;
-            D3D12_TEXTURE_COPY_LOCATION src { _slotD[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-            src.PlacedFootprint = _fp;
-            c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            if (_dQuery)
-            {
-                c->EndQuery(_dQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2 + 1);
-                c->ResolveQueryData(_dQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2, 2, _dReadback.Get(), s * 16);
-            }
-            std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
-            c->ResourceBarrier(1, &br);
-            if (FAILED(hr = c->Close()))
-                return hr;
-        }
+    if (FAILED(hr = CreateIngestLists()))
+        return hr;
 
     // Extra regions: per-slot lists recorded at send (render) and at ingest (display).
     if (_wantHud || _wantMv)
@@ -557,6 +527,67 @@ HRESULT ProxySwapChain::CreateFallbackLists()
     return S_OK;
 }
 
+// Display side: one prerecorded ingest per (slot, real back buffer)
+HRESULT ProxySwapChain::CreateIngestLists()
+{
+    HRESULT hr;
+    _dAlloc.resize(K * _realCount);
+    _dList.resize(K * _realCount);
+    for (UINT s = 0; s < K; ++s)
+        for (UINT m = 0; m < _realCount; ++m)
+        {
+            UINT n = s * _realCount + m;
+            if (FAILED(hr = _ddev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_dAlloc[n]))) ||
+                FAILED(hr = _ddev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _dAlloc[n].Get(), nullptr,
+                                                     IID_PPV_ARGS(&_dList[n]))))
+                return hr;
+            auto* c = _dList[n].Get();
+            D3D12_RESOURCE_BARRIER br {};
+            br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br.Transition = { _realBb[m].Get(), 0, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST };
+            c->ResourceBarrier(1, &br);
+            if (_dQuery)
+                c->EndQuery(_dQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2);
+            D3D12_TEXTURE_COPY_LOCATION dst { _realBb[m].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            dst.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION src { _slotD[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+            src.PlacedFootprint = _fp;
+            c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            if (_dQuery)
+            {
+                c->EndQuery(_dQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2 + 1);
+                c->ResolveQueryData(_dQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2, 2, _dReadback.Get(), s * 16);
+            }
+            std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
+            c->ResourceBarrier(1, &br);
+            if (FAILED(hr = c->Close()))
+                return hr;
+        }
+    return S_OK;
+}
+
+// DXGI left or refused exclusive fullscreen on its own (the window not in front) and rejects presents until the real
+// swapchain is resized: the game's buffers are ours, so the presenter resizes the real one itself
+HRESULT ProxySwapChain::RenewReal()
+{
+    _dq->Signal(_dFence.Get(), ++_dValue);
+    WaitFence(_dFence.Get(), _dValue, 2000);
+    _dList.clear();
+    _dAlloc.clear();
+    _realBb.clear();
+    HRESULT hr = _real->ResizeBuffers(_realCount, _gameDesc.Width, _gameDesc.Height, _gameDesc.Format,
+                                      RealFlags(_gameDesc.Flags, _tearing));
+    BOOL fs = FALSE;
+    _real->GetFullscreenState(&fs, nullptr);
+    _fsCached = fs;
+    _realBb.resize(_realCount);
+    for (UINT i = 0; i < _realCount && SUCCEEDED(hr); ++i)
+        hr = _real->GetBuffer(i, IID_PPV_ARGS(&_realBb[i]));
+    if (SUCCEEDED(hr))
+        hr = CreateIngestLists();
+    Log(FAILED(hr) ? 2 : 1, std::format("real swapchain resized after a refused present: {:X}, fullscreen {}", (uint32_t) hr, fs));
+    return hr;
+}
 void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
 {
     // retire: kept alive until the presenter has shown a few frames on the new buffers
@@ -840,8 +871,9 @@ void ProxySwapChain::PresenterLoop()
         double nrMs = 0;
         bool hudFrame = false;
         HRESULT hr;
+        UINT pfUsed = 0;
         {
-            std::lock_guard sg(_scMutex);
+            // no _scMutex: in exclusive fullscreen Present can wait on the window thread, which may be in a proxy call
             const UINT m = _real->GetCurrentBackBufferIndex();
             _dq->Wait(_filledD.Get(), g);
             ID3D12CommandList* l[2] = { _dList[s * _realCount + m].Get(), nullptr };
@@ -1028,16 +1060,40 @@ void ProxySwapChain::PresenterLoop()
             }
             BOOL fs = FALSE;
             _real->GetFullscreenState(&fs, nullptr);
+            _fsCached = fs;
             UINT pf = flags & ~(UINT) DXGI_PRESENT_ALLOW_TEARING;
-            if (sync == 0 && _tearing && !fs)
+            if (sync == 0 && _tearing && !fs && !_tearingOff)
                 pf |= DXGI_PRESENT_ALLOW_TEARING;
+            pfUsed = pf;
             hr = _real->Present(sync, pf);
+            if (hr == DXGI_ERROR_INVALID_CALL && (pf & DXGI_PRESENT_ALLOW_TEARING))
+            {
+                // DXGI still in (or leaving) exclusive fullscreen: no tearing until the next mode change
+                _tearingOff = true;
+                Log(1, "Present with tearing refused during a fullscreen change: tearing off until the next one");
+                hr = _real->Present(sync, pf & ~(UINT) DXGI_PRESENT_ALLOW_TEARING);
+            }
             _dq->Signal(_dFence.Get(), ++_dValue);
             slotDisplayValue[s] = _dValue;
         }
+        if (hr == DXGI_ERROR_INVALID_CALL && SUCCEEDED(_ddev->GetDeviceRemovedReason()) && _renewals < 8)
+        {
+            _renewals++;
+            if (SUCCEEDED(RenewReal()))
+                hr = S_OK, _presentFails = 0;
+        }
         if (FAILED(hr) || (g % 30 == 0 && FAILED(_ddev->GetDeviceRemovedReason())))
         {
-            Log(2, std::format("real Present failed {:X}", (uint32_t) hr));
+            if (_presentFails++ < 3)
+            {
+                DXGI_SWAP_CHAIN_DESC1 rd {};
+                DXGI_SWAP_CHAIN_FULLSCREEN_DESC fd {};
+                _real->GetDesc1(&rd);
+                _real->GetFullscreenDesc(&fd);
+                Log(2, std::format("real Present({}, {:X}) failed {:X}: fullscreen {}, {}x{} fmt {} flags {:X}, windowed {}",
+                                   sync, pfUsed, (uint32_t) hr, (int) _fsCached, rd.Width, rd.Height, (int) rd.Format,
+                                   rd.Flags, fd.Windowed));
+            }
             LogDeviceRemoved(_ddev.Get(), "display");
             const HRESULT why = _ddev->GetDeviceRemovedReason();
             if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG ||
@@ -1410,20 +1466,43 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::GetBuffer(UINT i, REFIID riid, void** 
         return DXGI_ERROR_INVALID_CALL;
     return _bb[i]->QueryInterface(riid, pp);
 }
+// Mode changes run with the presenter stopped: DXGI sends them to the window thread while a Present may wait for it
 HRESULT STDMETHODCALLTYPE ProxySwapChain::SetFullscreenState(BOOL fs, IDXGIOutput* t)
 {
+    const bool running = _thread.joinable();
+    if (running)
+        StopPresenter();
     HRESULT hr;
     {
         std::lock_guard g(_scMutex);
         hr = _real->SetFullscreenState(fs, t);
+        _tearingOff = false;
+        BOOL now = FALSE;
+        ComPtr<IDXGIOutput> o;
+        _real->GetFullscreenState(&now, &o);
+        _fsCached = now;
+        std::lock_guard fg(_fsM);
+        _fsOutput = o;
     }
-    Log(0, std::format("SetFullscreenState {} output {} -> {:X}", fs, (void*) t, (uint32_t) hr));
+    if (running)
+        StartPresenter();
+    Log(0, std::format("SetFullscreenState {} output {} -> {:X}, now {}", fs, (void*) t, (uint32_t) hr, (int) _fsCached));
     return hr;
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::GetFullscreenState(BOOL* fs, IDXGIOutput** t)
 {
-    std::lock_guard g(_scMutex);
-    return _real->GetFullscreenState(fs, t);
+    // the presenter keeps the state current; the real call could block behind a Present
+    const BOOL now = _fsCached;
+    if (fs)
+        *fs = now;
+    if (t)
+    {
+        std::lock_guard fg(_fsM);
+        *t = now ? _fsOutput.Get() : nullptr;
+        if (*t)
+            (*t)->AddRef();
+    }
+    return S_OK;
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::GetDesc(DXGI_SWAP_CHAIN_DESC* d)
 {
@@ -1496,11 +1575,16 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers(UINT n, UINT w, UINT h, 
 }
 HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeTarget(const DXGI_MODE_DESC* m)
 {
+    const bool running = _thread.joinable();
+    if (running)
+        StopPresenter();
     HRESULT hr;
     {
         std::lock_guard g(_scMutex);
         hr = _real->ResizeTarget(m);
     }
+    if (running)
+        StartPresenter();
     if (m)
         Log(0, std::format("ResizeTarget {}x{} fmt {} -> {:X}", m->Width, m->Height, (int) m->Format, (uint32_t) hr));
     return hr;
