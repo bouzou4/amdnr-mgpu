@@ -12,7 +12,6 @@
 #include "upscalers/fsr2/FSR2Feature_Dx12.h"
 #include "upscalers/fsr2_212/FSR2Feature_Dx12_212.h"
 #include "upscalers/ffx/FFXFeature_Dx12.h"
-#include "upscalers/fsr31/FSRDFeature_Dx12.h"
 #include "upscalers/xess/XeSSFeature_Dx12.h"
 #include "FeatureProvider_Dx11.h"
 #include <misc/IdentifyGpu.h>
@@ -104,7 +103,9 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
                      "Trying the denoiser anyway; if it fails to initialise the upscaler falls back to FSR 3.1/4 "
                      "(or FSR 2.1.2).",
                      primaryGpu.name);
-        *feature = std::make_unique<FSRDFeatureDx12>(handleId, parameters);
+        // AMDNR gap (docs/AMDNR_GAPS.md): FSRDFeatureDx12 is not buildable from the published source.
+        *feature = std::make_unique<FFXFeatureDx12>(handleId, parameters);
+        upscaler = Upscaler::FFX;
         break;
 
     default:

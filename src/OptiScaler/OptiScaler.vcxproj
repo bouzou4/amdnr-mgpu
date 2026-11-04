@@ -827,9 +827,12 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="upscalers\fsr2_212\FSR2Feature_Vk_212.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature.cpp" />
     <ClCompile Include="upscalers\fsr31\FSR31Feature_Dx11.cpp" />
-    <ClCompile Include="upscalers\fsr31\FSR31Feature_Dx12.cpp" />
-    <ClCompile Include="upscalers\fsr31\FSRDFeature_Dx12.cpp" />
-    <ClCompile Include="shaders\fsrd_preprocess\FSRDPreprocessor_Dx12.cpp" />
+    <ClCompile Include="upscalers\fsr31\FSR31Feature_Dx12.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="upscalers\fsr31\FSRDFeature_Dx12.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx11On12.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx12.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Vk.cpp" />
@@ -887,8 +890,9 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="inputs\NVNGX_DLSS_Dx11.cpp" />
     <ClCompile Include="shaders\dlssnr\DlssNr_Dx12.cpp" />
     <ClInclude Include="shaders\dlssnr\DlssNr_ActiveColor.h" />
-    <ClCompile Include="shaders\dlssnr\DlssNr_Vk.cpp" />
-    <ClCompile Include="dlssnr\DlssNrFeature_Vk.cpp" />
+    <ClCompile Include="dlssnr\DlssNrFeature_Vk.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="dlssnr\DlssNr_ExposureScan.cpp" />
     <ClCompile Include="dlssnr\DlssNr_Proxy.cpp" />
     <ClCompile Include="dlssnr\DlssNr_Menu.cpp" />

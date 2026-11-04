@@ -11,6 +11,7 @@
 #include <xefg_swapchain.h>
 #include <xefg_swapchain_d3d12.h>
 #include <xefg_swapchain_debug.h>
+#include <proxies/XeFGPacing.h>
 
 #pragma comment(lib, "Version.lib")
 
@@ -117,6 +118,13 @@ class XeFGProxy
     }
 
   public:
+    // AMDNR gap stubs (docs/AMDNR_GAPS.md): native-XeFG detection and init bookkeeping are not published.
+    static HMODULE NativeModule() { return nullptr; }
+    static std::wstring NativePath() { return {}; }
+    static void NoteInitResult(int, int32_t) {}
+    static int InitFailedAt() { return 0; }
+    static int InitFailedCode() { return 0; }
+
     static HMODULE Module() { return _dll; }
     static std::wstring Module_Path() { return _dllPath; }
 
