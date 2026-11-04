@@ -6,7 +6,8 @@ inline constexpr const char kShaderSource[] = R"(
 Texture2D<float4> Src : register(t0);
 Texture2D<float4> Enh : register(t1);
 Texture2D<float4> Fed : register(t2);
-Texture2D<float4> Aux : register(t3); // motion vectors (Apply) or the HUD-less colour (ApplyTerminal)
+Texture2D<float4> Aux : register(t3); // motion vectors (Apply), HUD-less colour (ApplyTerminal), game exposure (Stats)
+Texture2D<float4> Norm : register(t4); // Stats' output: x net units per scene unit, y share fed above the guard
 RWTexture2D<float4> Dst : register(u0);
 SamplerState Lin : register(s0);
 SamplerState Pt : register(s1);
@@ -23,9 +24,16 @@ cbuffer C : register(b0)
     uint UseMv;
     float UiLow;  // ApplyTerminal: back buffer - HUD-less difference where the UI mask starts / is full
     float UiHigh;
-    uint Encoding; // Src / Aux: 0 linear, 1 sRGB, 2 PQ (ST 2084, 80 nits = 1.0), 3 scRGB display (linear, 80 nits = 1.0)
+    uint Encoding; // Src / Aux: 0 linear, 1 sRGB, 2 PQ (ST 2084, 80 nits = 1.0), 3 scRGB display (linear, 80 nits = 1.0),
+                   // 4 scene-linear HDR (exposure from Norm)
     float PaperWhite; // 2 and 3: linear value of paper white
+    uint UseNorm;     // Norm bound (upscale placements): the guard can bypass Apply
+    float ExpoMul;    // Stats: game exposure * ExpoMul = net units per scene unit (1 / pre-exposure); 0 = auto
 };
+
+static const float kGuard = 1.5; // fed median above this after mapping: bypass
+
+float NetScale() { return Encoding == 4 ? Norm.Load(int3(0, 0, 0)).x : 1.0 / PaperWhite; }
 
 float3 Finite(float3 c) { return all(isfinite(c)) ? max(c, 0) : 0; }
 
@@ -53,12 +61,12 @@ float3 FromLinear(float3 c)
     return c;
 }
 
-// HDR output (2, 3): the network gets SDR-ish values, paper white at 1, a C1 Reinhard shoulder above 0.8
+// HDR (2, 3, 4): the network gets SDR-ish values, paper white (4: exposed 1.0) at 1, a C1 Reinhard shoulder above 0.8
 float3 ToNet(float3 x)
 {
     if (Encoding < 2)
         return x;
-    float3 y = x / PaperWhite;
+    float3 y = x * NetScale();
     float3 t = (y - 0.8) / 0.2;
     return y <= 0.8 ? y : 0.8 + 0.2 * t / (1 + t);
 }
@@ -72,7 +80,7 @@ float3 AddEdit(float3 c, float3 e)
         return FromLinear(max(x + e, 0));
     float3 xp = max(x, 0);
     float3 n = ToNet(xp);
-    float3 y = n <= 0.8 ? max(xp + e * PaperWhite, 0) : xp * max(1 + e / n, 0);
+    float3 y = n <= 0.8 ? max(xp + e / NetScale(), 0) : xp * max(1 + e / n, 0);
     return FromLinear(x + y - xp);
 }
 // Feed: box filter of Src's used rect into the network size, linear
@@ -87,7 +95,60 @@ void Down(uint3 id : SV_DispatchThreadID)
                ToLinear(Src.SampleLevel(Lin, uv + float2(q.x, -q.y), 0).rgb) +
                ToLinear(Src.SampleLevel(Lin, uv + float2(-q.x, q.y), 0).rgb) +
                ToLinear(Src.SampleLevel(Lin, uv + float2(q.x, q.y), 0).rgb);
-    Dst[id.xy] = float4(ToNet(Finite(c * 0.25)), 1);
+    Dst[id.xy] = float4(saturate(ToNet(Finite(c * 0.25))), 1);
+}
+
+float Luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// One 16x16 group over a 64x64 grid of Src's used rect: the scene-to-net scale (game exposure or a smoothed
+// auto-exposure, key 0.18) and the share of samples whose mapped luma is above kGuard, into Dst (1x1)
+groupshared float gsLog[256];
+groupshared float gsHigh[256];
+groupshared float gsPrev;
+[numthreads(16, 16, 1)]
+void Stats(uint3 gt : SV_GroupThreadID)
+{
+    uint i = gt.y * 16 + gt.x;
+    float l[16];
+    float lsum = 0;
+    for (uint k = 0; k < 16; k++)
+    {
+        float2 g = float2(gt.x * 4 + k % 4, gt.y * 4 + k / 4) + 0.5;
+        l[k] = Luma(Finite(ToLinear(Src.SampleLevel(Pt, g / 64.0 * SrcUvScale, 0).rgb)));
+        lsum += log(max(l[k], 1e-6));
+    }
+    gsLog[i] = lsum;
+    if (i == 0)
+        gsPrev = Dst[uint2(0, 0)].z;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (i < s)
+            gsLog[i] += gsLog[i + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float scale = 1, autoScale = 0;
+    if (Encoding == 4)
+    {
+        autoScale = 0.18 / exp(gsLog[0] / 4096.0);
+        if (gsPrev > 0 && isfinite(gsPrev))
+            autoScale = exp(lerp(log(gsPrev), log(autoScale), 0.05));
+        float game = Aux.Load(int3(0, 0, 0)).x * ExpoMul;
+        scale = ExpoMul > 0 && isfinite(game) && game > 0 ? game : autoScale;
+    }
+    float high = 0;
+    for (uint k2 = 0; k2 < 16; k2++)
+        high += l[k2] * scale > kGuard ? 1 : 0;
+    gsHigh[i] = high;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s2 = 128; s2 > 0; s2 >>= 1)
+    {
+        if (i < s2)
+            gsHigh[i] += gsHigh[i + s2];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (i == 0)
+        Dst[uint2(0, 0)] = float4(scale, gsHigh[0] / 4096.0, autoScale, 0);
 }
 
 float3 Edit(float2 uv)
@@ -107,6 +168,8 @@ void Apply(uint3 id : SV_DispatchThreadID)
     if (UseMv != 0)
         prev = uv + Aux.SampleLevel(Pt, uv * MvUvScale, 0).xy * MvToUv;
     float4 o = c;
+    if (UseNorm != 0 && Norm.Load(int3(0, 0, 0)).y > 0.5)
+        prev = -1; // guard: bypassed
     if (all(prev >= 0) && all(prev <= 1))
     {
         float3 e = Edit(prev);
@@ -148,5 +211,7 @@ struct ShaderConstants
     float uiLow, uiHigh;
     uint32_t encoding;
     float paperWhite;
+    uint32_t useNorm;
+    float expoMul;
 };
-static_assert(sizeof(ShaderConstants) == 72);
+static_assert(sizeof(ShaderConstants) == 80);

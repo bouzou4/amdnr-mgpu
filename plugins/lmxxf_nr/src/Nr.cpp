@@ -22,7 +22,7 @@ namespace
 {
 constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr uint32_t kHeapSlots = 64;
-constexpr uint32_t kSlotDescriptors = 5;
+constexpr uint32_t kSlotDescriptors = 6;
 
 DXGI_FORMAT ViewFormat(DXGI_FORMAT f)
 {
@@ -298,20 +298,22 @@ bool NrEngine::CreatePipelines()
         return false;
     }
 
-    ComPtr<ID3DBlob> down, apply, terminal, err;
+    ComPtr<ID3DBlob> down, apply, terminal, stats, err;
     if (FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Down", "cs_5_0",
                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &down, &err)) ||
         FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Apply", "cs_5_0",
                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &apply, &err)) ||
         FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "ApplyTerminal",
-                       "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &terminal, &err)))
+                       "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &terminal, &err)) ||
+        FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Stats", "cs_5_0",
+                       D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &stats, &err)))
     {
         Fail(std::string("shader compile failed: ") + (err ? (const char*) err->GetBufferPointer() : "?"));
         return false;
     }
 
     D3D12_DESCRIPTOR_RANGE ranges[2] {};
-    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0 };
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0 };
     ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
     D3D12_ROOT_PARAMETER params[3] {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -349,6 +351,9 @@ bool NrEngine::CreatePipelines()
     pd.CS = { terminal->GetBufferPointer(), terminal->GetBufferSize() };
     if (FAILED(_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_psoTerminal))))
         return Fail("pipeline creation failed"), false;
+    pd.CS = { stats->GetBufferPointer(), stats->GetBufferSize() };
+    if (FAILED(_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_psoStats))))
+        return Fail("pipeline creation failed"), false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSlots * kSlotDescriptors,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
@@ -360,7 +365,7 @@ bool NrEngine::CreatePipelines()
 
 void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, const ShaderConstants& c,
                         ID3D12Resource* const srv[4], const DXGI_FORMAT srvFmt[4], ID3D12Resource* uav,
-                        DXGI_FORMAT uavFmt, uint32_t w, uint32_t h)
+                        DXGI_FORMAT uavFmt, uint32_t w, uint32_t h, ID3D12Resource* norm)
 {
     // A ring of descriptor slots, the GPU is never kHeapSlots dispatches behind
     const uint32_t slot = (_heapCursor++ % kHeapSlots) * kSlotDescriptors;
@@ -379,10 +384,18 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
         D3D12_CPU_DESCRIPTOR_HANDLE h2 { cpu.ptr + SIZE_T(i) * _heapStride };
         _device->CreateShaderResourceView(srv[i], &sd, h2);
     }
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd {};
+        sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        _device->CreateShaderResourceView(norm, &sd, { cpu.ptr + SIZE_T(4) * _heapStride });
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC ud {};
     ud.Format = UavFormat(uavFmt);
     ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(4) * _heapStride });
+    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(5) * _heapStride });
 
     ID3D12DescriptorHeap* heaps[] = { _heap.Get() };
     list->SetDescriptorHeaps(1, heaps);
@@ -390,7 +403,7 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
     list->SetPipelineState(pso);
     list->SetComputeRoot32BitConstants(0, sizeof(ShaderConstants) / 4, &c, 0);
     list->SetComputeRootDescriptorTable(1, gpu);
-    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(4) * _heapStride });
+    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(5) * _heapStride });
     list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 }
 
@@ -436,7 +449,7 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
     fi.model_scale = 1.0f;
     fi.pre_exposure = 1.0f;
     fi.exposure_scale = 1.0f;
-    if (frame != nullptr && _settings.exposure && frame->exposure != nullptr)
+    if (frame != nullptr && _settings.exposure && frame->exposure != nullptr && !_feedNormalised)
     {
         auto* exp = static_cast<ID3D12Resource*>(frame->exposure);
         const auto d = exp->GetDesc();
@@ -962,6 +975,12 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
     const uint32_t w = pre ? f->renderWidth : f->outputWidth;
     const uint32_t h = pre ? f->renderHeight : f->outputHeight;
 
+    // HDR colour is in scene units: exposure-mapped into the network range, the guard checks the result
+    const uint32_t encoding = (f->flags & OptiUpscale_Hdr) ? 4 : 0;
+    _stats.encoding = encoding;
+    _feedNormalised = encoding == 4;
+    ID3D12Resource* norm = RunStats(list, f, src, srcDesc.Format, w, h, encoding);
+
     // The previous job's answer for the previous frame, moved onto this one
     uint64_t wait = 0;
     ID3D12Resource* enh = nullptr;
@@ -988,6 +1007,8 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
+        c.encoding = encoding;
+        c.useNorm = norm != nullptr;
 
         const D3D12_RESOURCE_STATES targetState = pre ? colorState : outputState;
         Barrier(list, target, targetState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -995,10 +1016,10 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         const DXGI_FORMAT fmt[4] = { srcDesc.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                      mv ? mv->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT };
         Dispatch(list, _psoApply.Get(), c, srv, fmt, target, pre ? DXGI_FORMAT_R16G16B16A16_FLOAT : srcDesc.Format,
-                 w, h);
+                 w, h, norm);
         UavBarrier(list, target);
         Barrier(list, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, targetState);
-        MaybeDump(list, enh, target, targetState);
+        MaybeDump(list, enh, target, targetState, src);
         if (pre)
             f->colorOverride = target;
     }
@@ -1021,10 +1042,12 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         c.sizeY = _feedH;
         c.srcUvScaleX = float(w) / float(srcDesc.Width);
         c.srcUvScaleY = float(h) / float(srcDesc.Height);
+        c.encoding = encoding;
         Barrier(list, _feed.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12Resource* srv[4] = { src, nullptr, nullptr, nullptr };
         const DXGI_FORMAT fmt[4] = { srcDesc.Format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN };
-        Dispatch(list, _psoDown.Get(), c, srv, fmt, _feed.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, _feedW, _feedH);
+        Dispatch(list, _psoDown.Get(), c, srv, fmt, _feed.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, _feedW, _feedH,
+                 norm);
         UavBarrier(list, _feed.Get());
         Barrier(list, _feed.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
     }
@@ -1035,6 +1058,94 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         Barrier(list, color, kRead, colorState);
     if (mvMove)
         Barrier(list, mv, kRead, mvState);
+}
+
+// Stats pass on this frame's source (see the Stats shader); nullptr when it can't run, Apply then has no guard
+ID3D12Resource* NrEngine::RunStats(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* f, ID3D12Resource* src,
+                                   DXGI_FORMAT srcFmt, uint32_t w, uint32_t h, uint32_t encoding)
+{
+    if (!_norm)
+    {
+        _norm = Texture(_device.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, kRead);
+        D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
+        D3D12_RESOURCE_DESC d {};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        d.Width = kNormSlots * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        d.Height = d.DepthOrArraySize = d.MipLevels = 1;
+        d.SampleDesc.Count = 1;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        void* p = nullptr;
+        if (_norm && SUCCEEDED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                IID_PPV_ARGS(&_normReadback))) &&
+            SUCCEEDED(_normReadback->Map(0, nullptr, &p)))
+            _normMapped = static_cast<const float*>(p);
+        if (!_norm || !_normMapped)
+        {
+            _norm.Reset();
+            _normReadback.Reset();
+            _normMapped = nullptr;
+            Log(OptiLog_Warn, "stats pass unavailable: no exposure mapping or HDR guard");
+            return nullptr;
+        }
+    }
+
+    // The oldest slot of the ring, a few frames old (a status: the GPU applies the guard itself)
+    if (_normFrame >= kNormSlots)
+    {
+        const float* v = _normMapped + ((_normFrame + 1) % kNormSlots) * (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT / 4);
+        const bool bypassed = v[1] > 0.5f;
+        if (bypassed != _stats.bypassed)
+            Log(bypassed ? OptiLog_Warn : OptiLog_Info,
+                bypassed ? "HDR guard: fed median above 1.5 after mapping (scale %g), NR bypassed"
+                         : "HDR guard: fed median back in range (scale %g), NR applied",
+                v[0]);
+        _stats.netScale = v[0];
+        _stats.guardShare = v[1];
+        _stats.bypassed = bypassed;
+    }
+
+    // Game exposure (1x1 float) unless disabled or absent, auto-exposure otherwise
+    auto* exp = static_cast<ID3D12Resource*>(f->exposure);
+    if (exp != nullptr)
+    {
+        const auto d = exp->GetDesc();
+        if (d.Width != 1 || d.Height != 1 || !IsExposureFormat(d.Format))
+            exp = nullptr;
+    }
+    const bool useGame = encoding == 4 && _settings.exposure && exp != nullptr;
+    _stats.gameExposure = useGame;
+    const auto expState = D3D12_RESOURCE_STATES(f->exposureState);
+    const bool expMove = useGame && !Readable(expState);
+    if (expMove)
+        Barrier(list, exp, expState, kRead);
+
+    ShaderConstants c {};
+    c.sizeX = c.sizeY = 8; // one group
+    c.srcUvScaleX = float(w) / float(src->GetDesc().Width);
+    c.srcUvScaleY = float(h) / float(src->GetDesc().Height);
+    c.encoding = encoding;
+    c.expoMul = useGame ? 1.0f / (f->preExposure > 0.0f ? f->preExposure : 1.0f) : 0.0f;
+    Barrier(list, _norm.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* srv[4] = { src, nullptr, nullptr, useGame ? exp : nullptr };
+    const DXGI_FORMAT fmt[4] = { srcFmt, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                 useGame ? exp->GetDesc().Format : DXGI_FORMAT_UNKNOWN };
+    Dispatch(list, _psoStats.Get(), c, srv, fmt, _norm.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 8, 8);
+    UavBarrier(list, _norm.Get());
+    Barrier(list, _norm.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst {}, from {};
+    dst.pResource = _normReadback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = (_normFrame % kNormSlots) * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT };
+    from.pResource = _norm.Get();
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
+    Barrier(list, _norm.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, kRead);
+    _normFrame++;
+    if (expMove)
+        Barrier(list, exp, kRead, expState);
+    return _norm.Get();
 }
 
 // History is dropped on a cut, after a frame that was not fed and when the vector extent changes

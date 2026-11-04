@@ -64,7 +64,12 @@ struct NrStats
     uint64_t framesSkipped = 0;
     uint32_t frameInfoSize = 0;
     bool temporal = false; // the runtime gets motion vectors and keeps a history
-    uint32_t encoding = 1; // of the last source: 0 linear, 1 sRGB, 2 PQ, 3 scRGB
+    uint32_t encoding = 1; // of the last source: 0 linear, 1 sRGB, 2 PQ, 3 scRGB, 4 scene HDR
+    // Upscale placements: net units per scene unit, its source, and the HDR guard (a few frames old)
+    float netScale = 1.0f;
+    bool gameExposure = false;
+    float guardShare = 0.0f; // share of fed samples above the guard after mapping
+    bool bypassed = false;   // the guard tripped: the edit is not applied
     std::string status; // GetStatus
 };
 
@@ -144,7 +149,7 @@ class NrEngine
     void ApplyEnv();
     void Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, const ShaderConstants& c,
                   ID3D12Resource* const srv[4], const DXGI_FORMAT srvFmt[4], ID3D12Resource* uav, DXGI_FORMAT uavFmt,
-                  uint32_t w, uint32_t h);
+                  uint32_t w, uint32_t h, ID3D12Resource* norm = nullptr);
 
     Runtime _rt;
     std::mutex _mutex; // every runtime call, the job state and the stats
@@ -166,7 +171,14 @@ class NrEngine
     HANDLE _event = nullptr;
 
     ComPtr<ID3D12RootSignature> _rootSig;
-    ComPtr<ID3D12PipelineState> _psoDown, _psoApply, _psoTerminal;
+    ComPtr<ID3D12PipelineState> _psoDown, _psoApply, _psoTerminal, _psoStats;
+    // Upscale placements: Stats' 1x1 output and a readback ring of it for the menu
+    static constexpr uint32_t kNormSlots = 3;
+    ComPtr<ID3D12Resource> _norm, _normReadback;
+    const float* _normMapped = nullptr;
+    uint64_t _normFrame = 0;
+    ID3D12Resource* RunStats(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* f, ID3D12Resource* src,
+                             DXGI_FORMAT srcFmt, uint32_t w, uint32_t h, uint32_t encoding);
 
     // Terminal placement: own lists on the present queue
     static constexpr uint32_t kPresentLists = 6;
@@ -227,6 +239,7 @@ class NrEngine
         bool reset = false;
     } _motion;
     bool _feedValid = false; // _feed holds what the enqueued job was fed
+    bool _feedNormalised = false; // the feed is exposure-mapped: the runtime gets no exposure
     // History continuity: the last fed frame's upscale id and vector extent
     uint64_t _lastFedUpscale = 0;
     uint32_t _lastMvW = 0, _lastMvH = 0;

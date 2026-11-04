@@ -248,12 +248,18 @@ void DrawTab(void*)
     Text("Network + handoff (GPU): %.2f ms", st.hipMs);
     if (rt.hasTimings)
         Text("Network only (runtime): %.2f ms", st.networkMs);
-    static const char* const kEnc[] = { "linear", "SDR (sRGB)", "HDR10 (PQ)", "HDR scRGB" };
-    if (st.encoding >= 2)
-        Text("Colour: %s, the network gets tonemapped values (paper white %.0f nits, HdrPaperWhite)", kEnc[st.encoding & 3],
+    static const char* const kEnc[] = { "linear", "SDR (sRGB)", "HDR10 (PQ)", "HDR scRGB", "scene HDR" };
+    const char* enc = kEnc[std::min<uint32_t>(st.encoding, 4)];
+    if (st.encoding == 4)
+        Text("Colour: %s, the network gets exposure-mapped values (%s exposure, x%.3g, shoulder above 0.8)", enc,
+             st.gameExposure ? "game" : "auto", st.netScale);
+    else if (st.encoding >= 2)
+        Text("Colour: %s, the network gets tonemapped values (paper white %.0f nits, HdrPaperWhite)", enc,
              active.paperWhite);
     else
-        Text("Colour: %s", kEnc[st.encoding & 3]);
+        Text("Colour: %s", enc);
+    if (st.bypassed)
+        g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, "NR bypassed: fed median above 1.5 after mapping (colour range not understood)");
     Text("Network history: %s", st.temporal ? "on (motion vectors)" : rt.temporal == 0 ? "not taken by this runtime" : "off");
     Text("Frames: %llu run, %llu skipped", (unsigned long long) st.framesRun, (unsigned long long) st.framesSkipped);
     if (!st.status.empty())
@@ -279,6 +285,8 @@ bool OverlayText(char* buf, size_t size, void*)
     const char* model = nr.GetRuntime().Models() ? (s.model == 1 ? " Small" : fulls[std::clamp(s.passes, 1, 3) - 1]) : "";
     if (st.state != "running")
         snprintf(buf, size, "%s", st.state.c_str());
+    else if (st.bypassed)
+        snprintf(buf, size, "bypassed (HDR range)");
     else if (st.networkMs > 0)
         snprintf(buf, size, "%ux%u%s%s%s, %.1f ms (network %.1f)", st.feedWidth, st.feedHeight, model,
                  st.temporal ? " T" : "", st.encoding >= 2 ? " HDR" : "", st.hipMs, st.networkMs);
