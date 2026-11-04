@@ -60,6 +60,65 @@ extern "C"
         OptiLog_Error = 3,
     } OptiLogLevel;
 
+    // Upscale callbacks (RegisterUpscaleCallbacks) -----------------------------------------------------------
+
+    typedef enum OptiGraphicsApi
+    {
+        OptiApi_D3D12 = 1,
+    } OptiGraphicsApi;
+
+    typedef enum OptiUpscaleFlags
+    {
+        OptiUpscale_Reset = 1 << 0,              // history should be dropped this frame
+        OptiUpscale_DepthInverted = 1 << 1,      // 1 = near, 0 = far
+        OptiUpscale_JitteredMV = 1 << 2,         // motion vectors include the jitter
+        OptiUpscale_DisplayResMV = 1 << 3,       // motion vectors are at output size
+        OptiUpscale_Hdr = 1 << 4,                // color is linear HDR
+        OptiUpscale_AutoExposure = 1 << 5,       // no exposure texture, the upscaler computes it
+        OptiUpscale_RayReconstruction = 1 << 6,  // the evaluate also denoises (DLSS-D / FSR Ray Regeneration)
+        OptiUpscale_StatesAssumed = 1 << 7,      // *State fields are the API's convention, not set by the game config
+    } OptiUpscaleFlags;
+
+    // One upscaler evaluate. Resources are ID3D12Resource*, NULL when the game doesn't provide them.
+    // The plugin records into commandList and must leave every resource in its *State when it returns.
+    // Descriptor heaps, root signatures and pipeline state may be changed, like the upscaler itself does; the game
+    // rebinds after an evaluate (OptiScaler restores them after the callbacks when root signature restore is on).
+    typedef struct OptiUpscaleFrame
+    {
+        uint32_t size; // sizeof(OptiUpscaleFrame) of the running OptiScaler, fields are only appended
+        uint32_t api;  // OptiGraphicsApi
+        void* device;       // ID3D12Device*
+        void* commandList;  // ID3D12GraphicsCommandList* of the game, open
+        void* commandQueue; // ID3D12CommandQueue* the game presents with, NULL when not known yet
+        void* color;
+        void* output;
+        void* depth;
+        void* motionVectors;
+        void* exposure;
+        uint32_t colorState; // D3D12_RESOURCE_STATES
+        uint32_t outputState;
+        uint32_t depthState;
+        uint32_t motionVectorsState;
+        uint32_t exposureState;
+        uint32_t renderWidth; // part of color the game rendered to
+        uint32_t renderHeight;
+        uint32_t outputWidth;
+        uint32_t outputHeight;
+        float jitterX; // in render pixels
+        float jitterY;
+        float mvScaleX; // motion vector * scale = offset in render pixels to the previous frame
+        float mvScaleY;
+        float preExposure;
+        uint32_t flags; // OptiUpscaleFlags
+        uint64_t frameId; // increments once per evaluate
+        // Before callbacks only: set to an ID3D12Resource* (render size or larger, colorState, shader readable) to
+        // use it as the upscaler's color for this evaluate. The last plugin that sets it wins.
+        void* colorOverride;
+    } OptiUpscaleFrame;
+
+    // before runs ahead of the upscaler, after runs once it has recorded into frame->commandList
+    typedef void (*OptiUpscaleFn)(OptiUpscaleFrame* frame, void* userData);
+
     typedef struct OptiPluginApi
     {
         uint32_t size;    // sizeof(OptiPluginApi) of the running OptiScaler
@@ -141,6 +200,16 @@ extern "C"
 
         // Writes to the OptiScaler log, prefixed with the plugin name
         void (*Log)(OptiPlugin* plugin, OptiLogLevel level, const char* message);
+
+        // Upscale callbacks, added after version 1 (check with OPTI_API_HAS) -------------------------------------
+
+        // Calls before / after (either can be NULL) on the render thread around every upscaler evaluate,
+        // D3D12 for now (native D3D12 inputs). One registration per plugin, a second one replaces the first.
+        bool (*RegisterUpscaleCallbacks)(OptiPlugin* plugin, OptiUpscaleFn before, OptiUpscaleFn after, void* userData);
+        // Rebinds the root signatures, root arguments and (with ExtendedStateRestore) descriptor heaps and pipeline
+        // state the game had set on commandList before the evaluate. Does nothing when the game config has root
+        // signature restore off, or outside of an upscale callback.
+        void (*RestoreCommandListState)(void* commandList);
 
     } OptiPluginApi;
 

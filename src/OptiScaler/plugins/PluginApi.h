@@ -26,4 +26,8 @@ class PluginApi
 
     // Draws a registered tab inside of the menu, colorMap adjusts colors for the HDR menu
     static void DrawTab(size_t index, float menuScale, ImVec4 (*colorMap)(const ImVec4&));
+
+    // Upscale callbacks of the plugins, around a D3D12 evaluate
+    static bool HasUpscaleCallbacks();
+    static void RunUpscaleCallbacks(bool after, OptiUpscaleFrame* frame);
 };

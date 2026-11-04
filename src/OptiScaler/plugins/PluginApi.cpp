@@ -4,6 +4,7 @@
 
 #include "Config.h"
 #include "menu/menu_common.h"
+#include "hooks/D3D12_Hooks.h"
 
 #include <imgui/imgui_internal.h>
 
@@ -454,6 +455,60 @@ void Api_Log(OptiPlugin* plugin, OptiLogLevel level, const char* message)
     }
 }
 
+struct UpscaleCallbacks
+{
+    OptiPlugin* plugin;
+    OptiUpscaleFn before;
+    OptiUpscaleFn after;
+    void* userData;
+    bool faulted = false;
+};
+
+std::vector<std::shared_ptr<UpscaleCallbacks>> _upscaleCallbacks;
+std::atomic<bool> _hasUpscaleCallbacks { false };
+thread_local bool _inUpscaleCallback = false;
+
+bool CallUpscale(OptiUpscaleFn fn, OptiUpscaleFrame* frame, void* userData)
+{
+    __try
+    {
+        fn(frame, userData);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool Api_RegisterUpscaleCallbacks(OptiPlugin* plugin, OptiUpscaleFn before, OptiUpscaleFn after, void* userData)
+{
+    if (plugin == nullptr || (before == nullptr && after == nullptr))
+        return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (plugin->initState == OptiPlugin::InitState::Declined)
+        return false;
+
+    std::erase_if(_upscaleCallbacks, [plugin](const auto& c) { return c->plugin == plugin; });
+    auto entry = std::make_shared<UpscaleCallbacks>();
+    *entry = { plugin, before, after, userData };
+    _upscaleCallbacks.push_back(std::move(entry));
+    _hasUpscaleCallbacks = true;
+
+    LOG_INFO("[{}] Registered upscale callbacks (before: {}, after: {})", plugin->name, before != nullptr,
+             after != nullptr);
+
+    return true;
+}
+
+void Api_RestoreCommandListState(void* commandList)
+{
+    if (commandList != nullptr && _inUpscaleCallback)
+        D3D12Hooks::RestoreRoot(static_cast<ID3D12GraphicsCommandList*>(commandList));
+}
+
 const OptiPluginApi _api = {
     .size = sizeof(OptiPluginApi),
     .version = OPTI_PLUGIN_API_VERSION,
@@ -494,6 +549,9 @@ const OptiPluginApi _api = {
     .SaveSettings = Api_SaveSettings,
 
     .Log = Api_Log,
+
+    .RegisterUpscaleCallbacks = Api_RegisterUpscaleCallbacks,
+    .RestoreCommandListState = Api_RestoreCommandListState,
 };
 } // namespace
 
@@ -562,6 +620,12 @@ void PluginApi::InitPlugin(HMODULE module, PFN_OptiPluginInit init, const std::s
     }
 
     std::erase_if(_pendingTabs, [plugin](const auto& tab) { return tab->plugin == plugin; });
+
+    if (plugin->initState != OptiPlugin::InitState::Accepted)
+    {
+        std::erase_if(_upscaleCallbacks, [plugin](const auto& c) { return c->plugin == plugin; });
+        _hasUpscaleCallbacks = !_upscaleCallbacks.empty();
+    }
 }
 
 std::vector<PluginApi::TabInfo> PluginApi::GetTabs()
@@ -642,4 +706,37 @@ void PluginApi::DrawTab(size_t index, float menuScale, ImVec4 (*colorMap)(const 
     ImGui::PopItemWidth();
     ImGui::PopID();
     ImGui::PopID();
+}
+
+bool PluginApi::HasUpscaleCallbacks() { return _hasUpscaleCallbacks.load(std::memory_order_relaxed); }
+
+void PluginApi::RunUpscaleCallbacks(bool after, OptiUpscaleFrame* frame)
+{
+    std::vector<std::shared_ptr<UpscaleCallbacks>> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (const auto& c : _upscaleCallbacks)
+        {
+            // Not before OptiPluginInit returned true
+            if (!c->faulted && c->plugin->initState == OptiPlugin::InitState::Accepted)
+                callbacks.push_back(c);
+        }
+    }
+
+    for (const auto& c : callbacks)
+    {
+        auto fn = after ? c->after : c->before;
+        if (fn == nullptr)
+            continue;
+
+        _inUpscaleCallback = true;
+        const bool finished = CallUpscale(fn, frame, c->userData);
+        _inUpscaleCallback = false;
+
+        if (!finished)
+        {
+            LOG_ERROR("[{}] Crashed in an upscale callback, disabling its callbacks", c->plugin->name);
+            c->faulted = true;
+        }
+    }
 }

@@ -23,6 +23,7 @@
 #include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
+#include <plugins/PluginApi.h>
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static std::unordered_map<unsigned int, NVSDK_NGX_Feature> HandleToFeature;
@@ -947,6 +948,79 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
     return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
 }
 
+static ID3D12Resource* GetNgxResource(NVSDK_NGX_Parameter* params, const char* name)
+{
+    ID3D12Resource* res = nullptr;
+    if (params->Get(name, &res) != NVSDK_NGX_Result_Success)
+        params->Get(name, (void**) &res);
+    return res;
+}
+
+// The inputs of one evaluate for the plugin upscale callbacks
+static void FillPluginUpscaleFrame(OptiUpscaleFrame& f, ID3D12GraphicsCommandList* cmdList,
+                                   NVSDK_NGX_Parameter* params, IFeature_Dx12* feature)
+{
+    static std::atomic<uint64_t> frameId { 0 };
+    const Config& cfg = *Config::Instance();
+
+    f.size = sizeof(OptiUpscaleFrame);
+    f.api = OptiApi_D3D12;
+    f.device = D3D12Device;
+    f.commandList = cmdList;
+    f.commandQueue = State::Instance().currentCommandQueue;
+    f.color = GetNgxResource(params, NVSDK_NGX_Parameter_Color);
+    f.output = GetNgxResource(params, NVSDK_NGX_Parameter_Output);
+    f.depth = GetNgxResource(params, NVSDK_NGX_Parameter_Depth);
+    f.motionVectors = GetNgxResource(params, NVSDK_NGX_Parameter_MotionVectors);
+    f.exposure = GetNgxResource(params, NVSDK_NGX_Parameter_ExposureTexture);
+
+    // The configured barriers name the game's states, else the NGX convention the upscalers assume
+    constexpr int32_t read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const bool assumed = !cfg.ColorResourceBarrier.has_value() || !cfg.OutputResourceBarrier.has_value();
+    f.colorState = (uint32_t) cfg.ColorResourceBarrier.value_or(read);
+    f.outputState = (uint32_t) cfg.OutputResourceBarrier.value_or(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    f.depthState = (uint32_t) cfg.DepthResourceBarrier.value_or(read);
+    f.motionVectorsState = (uint32_t) cfg.MVResourceBarrier.value_or(read);
+    f.exposureState = (uint32_t) cfg.ExposureResourceBarrier.value_or(read);
+
+    unsigned int renderWidth = 0, renderHeight = 0;
+    if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &renderWidth) != NVSDK_NGX_Result_Success ||
+        params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &renderHeight) != NVSDK_NGX_Result_Success ||
+        renderWidth == 0 || renderHeight == 0)
+    {
+        renderWidth = feature->RenderWidth();
+        renderHeight = feature->RenderHeight();
+    }
+    f.renderWidth = renderWidth;
+    f.renderHeight = renderHeight;
+    f.outputWidth = feature->TargetWidth();
+    f.outputHeight = feature->TargetHeight();
+
+    params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &f.jitterX);
+    params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &f.jitterY);
+    f.mvScaleX = 1.0f;
+    f.mvScaleY = 1.0f;
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &f.mvScaleX);
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &f.mvScaleY);
+    f.preExposure = 1.0f;
+    params->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &f.preExposure);
+    if (!(f.preExposure > 0.0f))
+        f.preExposure = 1.0f;
+
+    unsigned int reset = 0;
+    params->Get(NVSDK_NGX_Parameter_Reset, &reset);
+
+    const auto type = feature->GetUpscalerType();
+    f.flags = (reset == 1 ? OptiUpscale_Reset : 0) | (feature->DepthInverted() ? OptiUpscale_DepthInverted : 0) |
+              (feature->JitteredMV() ? OptiUpscale_JitteredMV : 0) |
+              (!feature->LowResMV() ? OptiUpscale_DisplayResMV : 0) | (feature->IsHdr() ? OptiUpscale_Hdr : 0) |
+              (feature->AutoExposure() ? OptiUpscale_AutoExposure : 0) |
+              (type == Upscaler::DLSSD ? OptiUpscale_RayReconstruction : 0) |
+              (assumed ? OptiUpscale_StatesAssumed : 0);
+    f.frameId = ++frameId;
+    f.colorOverride = nullptr;
+}
+
 static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdList,
                                                const NVSDK_NGX_Handle* InFeatureHandle,
                                                NVSDK_NGX_Parameter* InParameters,
@@ -1056,11 +1130,37 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
     FSR3FG::SetUpscalerInputs(InCmdList, InParameters, feature);
     XeFGInputs::SetUpscalerInputs(InCmdList, InParameters, feature);
 
+    // Plugin upscale callbacks, the before ones may replace the color
+    const bool pluginCallbacks = PluginApi::HasUpscaleCallbacks();
+    OptiUpscaleFrame pluginFrame {};
+    ID3D12Resource* originalColor = nullptr;
+
+    if (pluginCallbacks)
+    {
+        FillPluginUpscaleFrame(pluginFrame, InCmdList, InParameters, feature);
+        PluginApi::RunUpscaleCallbacks(false, &pluginFrame);
+
+        if (pluginFrame.colorOverride != nullptr && pluginFrame.colorOverride != pluginFrame.color)
+        {
+            originalColor = static_cast<ID3D12Resource*>(pluginFrame.color);
+            InParameters->Set(NVSDK_NGX_Parameter_Color, static_cast<ID3D12Resource*>(pluginFrame.colorOverride));
+        }
+    }
+
     // Evaluate the feature
     bool evalSuccess = false;
     {
         ScopedSkipHeapCapture skip {};
         evalSuccess = feature->Evaluate(InCmdList, InParameters);
+
+        if (originalColor != nullptr)
+            InParameters->Set(NVSDK_NGX_Parameter_Color, originalColor);
+
+        if (pluginCallbacks && evalSuccess)
+        {
+            pluginFrame.colorOverride = nullptr;
+            PluginApi::RunUpscaleCallbacks(true, &pluginFrame);
+        }
 
         // Resource tracking
         UpscalerInputsDx12::UpscaleEnd(InCmdList, InParameters, feature);
