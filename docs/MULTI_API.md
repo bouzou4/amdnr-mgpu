@@ -30,6 +30,16 @@ Native D3D11 upscalers (`fsr22`, `xess` on D3D11) have no D3D12 list; callbacks 
 - Cost: the bridge's copies are paid by the `*_12` upscaler already; NR adds the same work as on D3D12.
 - Test: `plugins/lmxxf_nr/tools/d3d11_harness` (a D3D11 app that upscales through OptiScaler's NGX D3D11 exports and presents the output).
 
+Measured (harness, 1280x720 -> 1920x1080, after upscaling, Performance preset = Small 1080 tier with history, 20 s per case):
+
+| Upscaler | Evaluates | NR (GPU network + handoff) | Feed | Edit (dump) | fps |
+|---|---|---|---|---|---|
+| `fsr31_12` (FSR 4 on the bridge) | 2176 ok, 0 failed | 5.3 ms median, 0 skipped | 0.000-1.000 | mean 0.013, 99.6 % of pixels changed | 120-139 |
+| `xess_12` | 2270 ok, 0 failed | 5.2 ms median, 0 skipped | 0.000-1.000 | mean 0.015, 99.9 % | 119-134 |
+| `fsr31_12`, plugin not loaded | 16555 ok | - | - | - | 1100-1600 |
+
+The plugin log shows `game API 2, through OptiScaler's D3D12 bridge`, the network built on the bridge's device, and the game's vectors at render size. The edit is smaller than on game frames (flat synthetic bars). The first two runs of the first build crashed (access violation) during the bridge's feature creation, before any callback ran. The rebuilt host passed 3 of 3. The cause is not known; a crash trace is built into the harness.
+
 ## Test titles
 
 - D3D11: Baldur's Gate 3 (`bin/bg3_dx11.exe`, ships `libxess_dx11.dll` and `nvngx_dlss.dll`, no anti-cheat); Satisfactory with `-dx11` (ships the NGX D3D11 RHI). Which upscaler a profile has selected must be read from the game's settings before a run.
