@@ -342,3 +342,127 @@ void TileDiff::Unmap()
     _readback->Unmap(0, &w);
 }
 } // namespace Mgpu
+
+namespace Mgpu
+{
+static const char* kScatterShader = R"(
+ByteAddressBuffer src : register(t0);
+StructuredBuffer<uint4> tiles : register(t1);
+RWTexture2D<float4> dst : register(u0);
+cbuffer C : register(b0) { uint base; };
+[numthreads(16, 16, 1)]
+void main(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID)
+{
+    uint4 e = tiles[base + g.x];
+    uint x0 = e.x & 0xFFFF, y0 = e.x >> 16, w = e.w & 0xFFFF, h = e.w >> 16;
+    [unroll] for (uint y = 0; y < 4; ++y)
+    [unroll] for (uint x = 0; x < 4; ++x)
+    {
+        uint2 p = t.xy + uint2(x, y) * 16;
+        if (p.x < w && p.y < h)
+        {
+            uint v = src.Load(e.y + p.y * e.z + p.x * 4);
+            dst[uint2(x0, y0) + p] = float4(float(v & 1023u) / 1023.0, float((v >> 10) & 1023u) / 1023.0,
+                                            float((v >> 20) & 1023u) / 1023.0, float(v >> 30) / 3.0);
+        }
+    }
+}
+)";
+
+bool TileScatter::Init(ID3D12Device* dev)
+{
+    _dev = dev;
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m ? (PFN_Compile) GetProcAddress(m, "D3DCompile") : nullptr;
+    if (!compile)
+        return false;
+    ComPtr<ID3DBlob> cs, err;
+    if (FAILED(compile(kScatterShader, strlen(kScatterShader), "mgpu_tile_scatter", nullptr, nullptr, "main", "cs_5_0",
+                       D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err)))
+    {
+        Log(2, std::format("tile scatter: compile failed: {}", err ? (const char*) err->GetBufferPointer() : "?"));
+        return false;
+    }
+    D3D12_DESCRIPTOR_RANGE ranges[2] {};
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0 };
+    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2 };
+    D3D12_ROOT_PARAMETER params[2] {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = { 2, ranges };
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = { 0, 0, 1 };
+    D3D12_ROOT_SIGNATURE_DESC rd { 2, params };
+    ComPtr<ID3DBlob> rs;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &err)) ||
+        FAILED(dev->CreateRootSignature(0, rs->GetBufferPointer(), rs->GetBufferSize(), IID_PPV_ARGS(&_root))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};
+    pd.pRootSignature = _root.Get();
+    pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_pso))))
+        return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3 * kSlots,
+                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap))))
+        return false;
+    _inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_RESOURCE_DESC b {};
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    b.Width = UINT64(sizeof(Tile)) * kSlots * kMaxTiles;
+    b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+    b.SampleDesc.Count = 1;
+    b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES up { D3D12_HEAP_TYPE_UPLOAD };
+    if (FAILED(dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                            IID_PPV_ARGS(&_table))))
+        return false;
+    D3D12_RANGE none { 0, 0 };
+    return SUCCEEDED(_table->Map(0, &none, (void**) &_mapped));
+}
+
+void TileScatter::Record(ID3D12GraphicsCommandList* cl, UINT slot, ID3D12Resource* stage, ID3D12Resource* dst,
+                         const Tile* tiles, UINT count)
+{
+    count = (std::min)(count, kMaxTiles);
+    if (!count)
+        return;
+    memcpy(_mapped + SIZE_T(slot) * kMaxTiles, tiles, SIZE_T(count) * sizeof(Tile));
+    auto cpu = _heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(slot) * 3 * _inc;
+    auto gpu = _heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += UINT64(slot) * 3 * _inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC s {};
+    s.Format = DXGI_FORMAT_R32_TYPELESS;
+    s.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    s.Buffer.NumElements = UINT(stage->GetDesc().Width / 4);
+    s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    _dev->CreateShaderResourceView(stage, &s, cpu);
+    cpu.ptr += _inc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC st {};
+    st.Format = DXGI_FORMAT_UNKNOWN;
+    st.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    st.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    st.Buffer.NumElements = kSlots * kMaxTiles;
+    st.Buffer.StructureByteStride = sizeof(Tile);
+    _dev->CreateShaderResourceView(_table.Get(), &st, cpu);
+    cpu.ptr += _inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u {};
+    u.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    u.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    _dev->CreateUnorderedAccessView(dst, nullptr, &u, cpu);
+
+    ID3D12DescriptorHeap* heaps[] = { _heap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootSignature(_root.Get());
+    cl->SetPipelineState(_pso.Get());
+    cl->SetComputeRootDescriptorTable(0, gpu);
+    const UINT base = slot * kMaxTiles;
+    cl->SetComputeRoot32BitConstants(1, 1, &base, 0);
+    cl->Dispatch(count, 1, 1);
+    D3D12_RESOURCE_BARRIER b {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    b.UAV.pResource = dst;
+    cl->ResourceBarrier(1, &b);
+}
+} // namespace Mgpu

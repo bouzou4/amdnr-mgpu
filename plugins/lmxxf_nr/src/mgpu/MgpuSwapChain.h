@@ -171,6 +171,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     std::vector<ComPtr<ID3D12Resource>> _hudR, _mvR, _graveR;
     std::vector<UINT64> _hudTag, _mvTag, _diffTag; // frame id each staging (and its tile flags) holds
     class TileDiff* _diff = nullptr;
+    class TileScatter* _scatter = nullptr;
     std::vector<Guides> _mvConst;
     UINT64 _hudOffset = 0, _mvOffset = 0, _mvCap = 0;
     ComPtr<ID3D12CommandAllocator> _rxAlloc[K];
@@ -185,6 +186,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
         bool hud = false, mv = false;
         bool tiles = false; // hud holds only the runs, the rest of the HUD-less colour is the back buffer
         std::vector<TileRun> runs;
+        UINT64 tileBytes = 0;
         Guides g;
         D3D12_RESOURCE_DESC mvDesc {};
     } _meta[K];
@@ -198,7 +200,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT64 _dummyKey = 0;
 
     // display card
-    ComPtr<ID3D12Resource> _hudD, _mvD, _nrD, _bbD, _compD;
+    ComPtr<ID3D12Resource> _hudD, _mvD, _nrD, _bbD, _compD, _tileStageD;
     std::vector<ComPtr<ID3D12Resource>> _graveD;
     ComPtr<ID3D12CommandAllocator> _dxAlloc[K], _duAlloc[K]; // ingest of the extras, UI pass
     ComPtr<ID3D12GraphicsCommandList> _dxList[K], _duList[K];

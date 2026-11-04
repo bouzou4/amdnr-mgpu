@@ -461,11 +461,32 @@ HRESULT ProxySwapChain::CreateBuffers()
     if (_wantHud)
     {
         const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        _hudD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_NONE, ns);
+        _hudD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ns);
+        if (!_scatter && FormatFamily(rd.Format) == 1)
+        {
+            _scatter = new TileScatter();
+            if (!_scatter->Init(_ddev.Get()))
+            {
+                delete _scatter;
+                _scatter = nullptr;
+            }
+        }
         _nrD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_NONE, ns);
         _bbD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_NONE, ns);
         _compD = Tex(_ddev.Get(), rd.Width, rd.Height, rd.Format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        {
+            D3D12_RESOURCE_DESC sb {};
+            sb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            sb.Width = _slotBytes - _hudOffset;
+            sb.Height = sb.DepthOrArraySize = sb.MipLevels = 1;
+            sb.SampleDesc.Count = 1;
+            sb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            D3D12_HEAP_PROPERTIES dp { D3D12_HEAP_TYPE_DEFAULT };
+            _tileStageD.Reset();
+            _ddev->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &sb, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           IID_PPV_ARGS(&_tileStageD));
+        }
         if (!_ui)
         {
             _ui = new UiComposite();
@@ -631,6 +652,7 @@ void ProxySwapChain::ReleaseBuffers()
     _nrD.Reset();
     _bbD.Reset();
     _compD.Reset();
+    _tileStageD.Reset();
     _graveD.clear();
 }
 
@@ -827,6 +849,9 @@ void ProxySwapChain::PresenterLoop()
             }
         }
         slotCounted[s] = false;
+        // the frame's send is complete (CPU) before any display work or Present is queued behind it
+        if (!(Perf().skip.load() & 64))
+            WaitFence(_filledD.Get(), g, 1000);
 
         double nrMs = 0;
         bool hudFrame = false;
@@ -837,7 +862,7 @@ void ProxySwapChain::PresenterLoop()
             _dq->Wait(_filledD.Get(), g);
             ID3D12CommandList* l[2] = { _dList[s * _realCount + m].Get(), nullptr };
             UINT nl = 1;
-            const bool haveHud = meta.hud && _hudD && _ui;
+            const bool haveHud = meta.hud && _hudD && _ui && (!meta.tiles || (_tileStageD && _scatter));
             bool haveMv = false;
             if ((haveHud || meta.mv) && _dxList[s])
             {
@@ -877,16 +902,28 @@ void ProxySwapChain::PresenterLoop()
                                                     Tr(_hudD.Get(), ns, D3D12_RESOURCE_STATE_COPY_DEST) };
                     c->ResourceBarrier(2, b);
                     c->CopyResource(_hudD.Get(), _realBb[m].Get());
+                    // one linear read of the shared heap into VRAM, a compute pass writes the tiles from there
+                    auto t0 = Tr(_tileStageD.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                    c->ResourceBarrier(1, &t0);
+                    c->CopyBufferRegion(_tileStageD.Get(), 0, _slotD[s].Get(), _hudOffset, meta.tileBytes);
+                    D3D12_RESOURCE_BARRIER t1[2] = { Tr(_tileStageD.Get(), D3D12_RESOURCE_STATE_COPY_DEST, ns),
+                                                     Tr(_hudD.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS) };
+                    c->ResourceBarrier(2, t1);
+                    std::vector<TileScatter::Tile> tl;
+                    const UINT T = TileDiff::kTile;
                     for (const auto& r : meta.runs)
                     {
-                        D3D12_RESOURCE_DESC rdsc = _hudD->GetDesc();
-                        rdsc.Width = r.w;
-                        rdsc.Height = r.h;
-                        D3D12_TEXTURE_COPY_LOCATION dl { _hudD.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
-                        D3D12_TEXTURE_COPY_LOCATION sl { _slotD[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-                        _ddev->GetCopyableFootprints(&rdsc, 0, 1, r.offset, &sl.PlacedFootprint, nullptr, nullptr, nullptr);
-                        c->CopyTextureRegion(&dl, r.x, r.y, 0, &sl, nullptr);
+                        const UINT pitch = UINT((UINT64(r.w) * 4 + 255) & ~UINT64(255));
+                        for (UINT x = 0; x < r.w; x += T)
+                            tl.push_back({ (r.x + x) | (r.y << 16), UINT(r.offset - _hudOffset) + x * 4, pitch,
+                                           (std::min)(T, r.w - x) | (r.h << 16) });
                     }
+                    _scatter->Record(c, s, _tileStageD.Get(), _hudD.Get(), tl.data(), UINT(tl.size()));
+                    D3D12_RESOURCE_BARRIER t2[2] = { Tr(_tileStageD.Get(), ns, D3D12_RESOURCE_STATE_COMMON),
+                                                     Tr(_hudD.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST) };
+                    c->ResourceBarrier(2, t2);
                     for (auto& x : b)
                         std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
                     c->ResourceBarrier(2, b);
@@ -1230,7 +1267,7 @@ void ProxySwapChain::Send(const Job& j)
                         for (UINT k = 0; k < tx * ty; ++k)
                             on += f[k] ? 1 : 0;
                         tileShare = double(on) / double(tx * ty);
-                        if (tileShare <= 0.6)
+                        if (tileShare <= 0.6 && on > 0 && FormatFamily(_gameDesc.Format) == 1)
                         {
                             meta.tiles = true;
                             UINT64 off = _hudOffset;
@@ -1261,6 +1298,7 @@ void ProxySwapChain::Send(const Job& j)
                                     off = AlignUp(off + bytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
                                     x = e;
                                 }
+                            meta.tileBytes = off - _hudOffset;
                         }
                         _diff->Unmap();
                         static int logged = 0;
@@ -1337,6 +1375,8 @@ ProxySwapChain::~ProxySwapChain()
     _ui = nullptr;
     delete _diff;
     _diff = nullptr;
+    delete _scatter;
+    _scatter = nullptr;
     _real.Reset();
     if (_waitable)
         CloseHandle(_waitable);

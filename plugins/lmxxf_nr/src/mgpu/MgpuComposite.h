@@ -53,4 +53,29 @@ class TileDiff
     DXGI_FORMAT _fmt = DXGI_FORMAT_UNKNOWN;
     UINT _inc = 0, _w = 0, _h = 0, _tx = 0, _ty = 0, _n = 0;
 };
+
+// Display card: writes the sent tiles (packed rows of R10G10B10A2 texels in `stage`) into the HUD-less colour
+// with a compute pass. Copies into sub-rectangles of the texture hung the display device.
+class TileScatter
+{
+  public:
+    struct Tile
+    {
+        UINT xy, offset, pitch, wh; // x | y << 16, byte offset in stage, row pitch, w | h << 16
+    };
+    static constexpr UINT kSlots = 3, kMaxTiles = 4096;
+    bool Init(ID3D12Device* dev);
+    // stage in NON_PIXEL_SHADER_RESOURCE, dst (R10G10B10A2_UNORM, UAV allowed) in UNORDERED_ACCESS
+    void Record(ID3D12GraphicsCommandList* cl, UINT slot, ID3D12Resource* stage, ID3D12Resource* dst,
+                const Tile* tiles, UINT count);
+
+  private:
+    Microsoft::WRL::ComPtr<ID3D12Device> _dev;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> _root;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> _pso;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> _heap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> _table; // upload, kSlots * kMaxTiles entries
+    Tile* _mapped = nullptr;
+    UINT _inc = 0;
+};
 } // namespace Mgpu
