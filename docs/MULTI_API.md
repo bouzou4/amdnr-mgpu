@@ -17,7 +17,7 @@ In both, the bridge records the upscaler on its own D3D12 list and submits it on
 
 | | D3D12 | D3D11 | Vulkan |
 |---|---|---|---|
-| Before / after upscaling | done | **prototype** (this branch): the bridge fires the upscale callbacks, `gameApi = OptiApi_D3D11`, `OptiUpscale_Bridged` | same change at `dx12Feature->Evaluate` in `IFeature_VkwDx12::Evaluate`: about 0.5-1 day with a test |
+| Before / after upscaling | done | **prototype, works on the harness** (this branch): the bridge fires the upscale callbacks, `gameApi = OptiApi_D3D11`, `OptiUpscale_Bridged` | same change, built on this branch, not run yet: needs a Vulkan title or harness (about 1 day) |
 | Terminal (HUD-less, at present) | done | needs the D3D11 -> D3D12 swapchain interop (`Dx11wDx12SC`, upstream, today only built for OptiScaler's FG) on a plugin request, present callbacks in its `Present` on the D3D12 back buffer, and the HUD-less pick from `Hudfix_Dx11` copied into a shared texture: 3-5 days | `vkQueuePresentKHR` hook exists for the overlay; needs a copy of the swapchain image into a D3D12-importable image, NR, copy back, semaphores both ways inside the present: 1-2 weeks |
 | Multi-GPU | done | on top of the swapchain interop: the D3D12 swapchain becomes the provider's proxy (ext 6), the D3D11 device goes to the render card through an adapter override in the D3D11 device creation hook (ext 5 extended); the bridge's D3D12 device follows the D3D11 adapter: 1-2 weeks after terminal | no cross-adapter present in Vulkan: the plugin must give the game proxy swapchain images on the render card and present them on the display card through DXGI (a WSI replacement): 3-5 weeks, high risk |
 
