@@ -78,6 +78,7 @@ struct NrStats
     // Flicker meter, seq_metrics units: answer change minus input change, mean of the last frames (NAN: none)
     float flkStatic = NAN, flkMc = NAN;
     uint32_t flkFrames = 0;
+    uint32_t gameApi = OptiApi_D3D12; // of the last upscale callback; D3D11 / Vulkan come through the D3D12 bridge
 };
 
 // One lmxxf session on the game's device, driven from the upscale callbacks

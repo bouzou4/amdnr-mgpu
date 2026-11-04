@@ -13,6 +13,7 @@
 
 #include <misc/IdentifyGpu.h>
 #include <misc/DeferredRelease.h>
+#include <plugins/PluginApi.h>
 
 #include <magic_enum.hpp>
 #include <detours/detours.h>
@@ -2132,8 +2133,30 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
         if (!Config::Instance()->DisableReactiveMask.value_or(false) && vkReactive.Dx12Resource != nullptr)
             InParameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) vkReactive.Dx12Resource);
 
+        // Plugin upscale callbacks on the bridge's list, the before ones may replace the color
+        const bool pluginCallbacks = PluginApi::HasUpscaleCallbacks();
+        OptiUpscaleFrame pluginFrame {};
+        if (pluginCallbacks)
+        {
+            PluginApi::FillUpscaleFrame(pluginFrame, this, InParameters, _dx11on12Device, cmdList, Dx12CommandQueue);
+            pluginFrame.gameApi = OptiApi_Vulkan;
+            pluginFrame.flags |= OptiUpscale_Bridged;
+            PluginApi::RunUpscaleCallbacks(false, &pluginFrame);
+
+            if (pluginFrame.colorOverride != nullptr && pluginFrame.colorOverride != pluginFrame.color)
+                InParameters->Set(NVSDK_NGX_Parameter_Color, pluginFrame.colorOverride);
+        }
+
         LOG_DEBUG("Dispatch!!");
         dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
+
+        if (pluginCallbacks && dx12EvalResult)
+        {
+            if (pluginFrame.colorOverride != nullptr)
+                InParameters->Set(NVSDK_NGX_Parameter_Color, (void*) vkColor.Dx12Resource);
+            pluginFrame.colorOverride = nullptr;
+            PluginApi::RunUpscaleCallbacks(true, &pluginFrame);
+        }
 
     } while (false);
 

@@ -350,6 +350,8 @@ void DrawTab(void*)
     if (!st.error.empty())
         g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, st.error.c_str());
     Text("Source %ux%u -> network %ux%u", st.srcWidth, st.srcHeight, st.feedWidth, st.feedHeight);
+    if (st.gameApi != OptiApi_D3D12)
+        Text("Game API: %s, through OptiScaler's D3D12 bridge", st.gameApi == OptiApi_D3D11 ? "D3D11" : "Vulkan");
     Text("Network + handoff (GPU): %.2f ms", st.hipMs);
     if (rt.hasTimings)
         Text("Network only (runtime): %.2f ms", st.networkMs);
