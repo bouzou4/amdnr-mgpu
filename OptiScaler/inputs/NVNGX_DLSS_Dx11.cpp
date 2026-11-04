@@ -12,6 +12,7 @@
 
 #include <with_dx12/with_dx12.h>
 #include "FG/Upscaler_Inputs_Dx11wDx12.h"
+#include <hudfix/Hudfix_Dx11.h>
 
 #include <ankerl/unordered_dense.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -38,6 +39,47 @@ class ScopedInitDx11
 
     ~ScopedInitDx11() { _skipInit = previousState; }
 };
+
+// Games can run more than one upscaler at the same time (e.g. a separate one for the minimap).
+// FG has to be fed by the one producing the actual game image, prefer the one matching the swapchain
+// and then the biggest output. Features that are no longer evaluated are ignored.
+static bool IsFGSourceFeature(unsigned int handleId)
+{
+    auto& state = State::Instance();
+    const auto& scDesc = state.currentSwapchainDesc.BufferDesc;
+
+    unsigned int bestHandle = 0;
+    bool bestMatchesSwapchain = false;
+    UINT64 bestArea = 0;
+
+    for (const auto& [id, context] : Dx11Contexts)
+    {
+        auto feature = context.feature.get();
+
+        if (feature == nullptr || !feature->IsInited())
+            continue;
+
+        if (id != handleId && context.lastEvalFrame + 2 < state.frameCount)
+            continue;
+
+        const bool matchesSwapchain =
+            feature->DisplayWidth() == scDesc.Width && feature->DisplayHeight() == scDesc.Height;
+        const auto area = (UINT64) feature->DisplayWidth() * feature->DisplayHeight();
+
+        const bool better =
+            bestHandle == 0 || (matchesSwapchain && !bestMatchesSwapchain) ||
+            (matchesSwapchain == bestMatchesSwapchain && (area > bestArea || (area == bestArea && id < bestHandle)));
+
+        if (better)
+        {
+            bestHandle = id;
+            bestMatchesSwapchain = matchesSwapchain;
+            bestArea = area;
+        }
+    }
+
+    return bestHandle == handleId;
+}
 
 static void UpdateInitPaths(NVSDK_NGX_FeatureCommonInfo* InFeatureInfo)
 {
@@ -349,7 +391,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown()
     shutdown = false;
     State::Instance().nvngxDx11Inited = false;
 
-    Dx11WithDx12::ResetUpscalerResourceCache(true);
+    UpscalerInputsDx11wDx12::Shutdown();
 
     return NVSDK_NGX_Result_Success;
 }
@@ -497,7 +539,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_DestroyParameters(NVSDK_NGX_Param
     if (InParameters == nullptr)
         return NVSDK_NGX_Result_Fail;
 
+    const bool isUsingDlss = Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::NVNGXModule();
     const bool success = TryDestroyNGXParameters(InParameters, NVNGXProxy::D3D11_DestroyParameters());
+
+    if (isUsingDlss)
+        UpscalerInputsDx11wDx12::Reset();
 
     return success ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail;
 }
@@ -597,6 +643,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
     if (deviceContext->ModuleLoaded() && deviceContext->Init(D3D11Device, InDevCtx, InParameters))
     {
         State::Instance().currentFeature = deviceContext;
+        UpscalerInputsDx11wDx12::Reset();
         return NVSDK_NGX_Result_Success;
     }
 
@@ -629,6 +676,15 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* 
         {
             return NVSDK_NGX_Result_FAIL_FeatureNotFound;
         }
+    }
+
+    if (State::Instance().currentFG != nullptr && State::Instance().activeFgInput == FGInput::Upscaler &&
+        IsFGSourceFeature(handleId))
+    {
+        State::Instance().fgChanged = true;
+        State::Instance().currentFG->DestroyFGContext();
+        State::Instance().clearCapturedHudlesses = true;
+        UpscalerInputsDx11wDx12::Reset();
     }
 
     if (!shutdown)
@@ -745,6 +801,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
 
     if (state.changeBackend[handleId])
     {
+        UpscalerInputsDx11wDx12::Reset();
+
         auto successfulPhase = FeatureProvider_Dx11::ChangeFeature(state.newBackend, D3D11Device, InDevCtx, handleId,
                                                                    InParameters, activeContext);
 
@@ -763,7 +821,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
     else
     {
         deviceContext = activeContext->feature.get();
-        state.currentFeature = deviceContext;
+
+        // FG reads render size etc. from currentFeature, so it has to stay on the game image upscaler
+        if (state.currentFeature == nullptr || IsFGSourceFeature(handleId))
+            state.currentFeature = deviceContext;
     }
 
     const auto targetApiName =
@@ -780,9 +841,16 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
         return NVSDK_NGX_Result_Success;
     }
 
-    auto upscaleResult = deviceContext->Evaluate(InDevCtx, InParameters);
+    const bool suppressDx11HudfixTracking = state.activeFgInput == FGInput::Upscaler &&
+                                            Config::Instance()->FGHUDFix.value_or_default() &&
+                                            state.swapchainInteropApi == SwapchainInteropApi::Dx11wDx12;
+    if (suppressDx11HudfixTracking)
+        Hudfix_Dx11::SetSkipStatus(true);
 
-    if (State::Instance().activeFgInput == FGInput::Upscaler)
+    auto upscaleResult = deviceContext->Evaluate(InDevCtx, InParameters);
+    activeContext->lastEvalFrame = state.frameCount;
+
+    if (State::Instance().activeFgInput == FGInput::Upscaler && IsFGSourceFeature(handleId))
     {
         if (WithDx12::IsInited())
         {
@@ -796,10 +864,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
         }
     }
 
+    if (suppressDx11HudfixTracking)
+        Hudfix_Dx11::SetSkipStatus(false);
+
     auto upscaler = deviceContext->GetUpscalerType();
     if (!upscaleResult && !deviceContext->IsInited() &&
         (upscaler == Upscaler::XeSS || upscaler == Upscaler::XeSS_on12 || upscaler == Upscaler::DLSS ||
-         upscaler == Upscaler::FFX_on12))
+         upscaler == Upscaler::DLSS_on12 || upscaler == Upscaler::FFX_on12))
     {
         ImGui::InsertNotification({ ImGuiToastType::Error, 10000, "Upscaler failed to run!" });
         state.newBackend = Upscaler::FSR22;

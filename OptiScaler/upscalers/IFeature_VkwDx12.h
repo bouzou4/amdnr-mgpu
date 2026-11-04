@@ -11,7 +11,7 @@
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
-#include <vulkan/vulkan.hpp>
+#include <vulkan/vulkan.h>
 
 #ifdef VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan_win32.h>
@@ -57,7 +57,7 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     VkInstance VulkanInstance = VK_NULL_HANDLE;
     VkQueue VulkanGraphicsQueue = VK_NULL_HANDLE;
     std::map<uint32_t, QUERY_INDEX_BUFFERS> VulkanQueueCommandBuffers;
-    uint32_t ActiveQueueFamilyIndex = 9999;
+    uint32_t ActiveQueueFamilyIndex = UINT32_MAX;
 
     PFN_vkGetInstanceProcAddr VulkanGIPA = nullptr;
     PFN_vkGetDeviceProcAddr VulkanGDPA = nullptr;
@@ -84,6 +84,10 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     ID3D12Fence* dx12FenceTextureCopy[VKDX12_BUFFER_COUNT] {};
     HANDLE vkSHForTextureCopy[VKDX12_BUFFER_COUNT] {};
     ULONG _fenceValue = 0;
+    uint64_t pendingResourceCopyValue = 0;
+    std::mutex EvaluateMutex;
+
+    std::vector<DetailedGpuTime> detailedGpuTimes;
 
     // Copy shaders
     std::unique_ptr<ResourceCopy_Vk> ColorCopy = nullptr;
@@ -108,7 +112,8 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
                                  VK_TEXTURE2D_RESOURCE_C* OutResource, ResourceCopy_Vk* InCopyShader, bool InCopy,
                                  bool InDepth);
     bool ProcessVulkanTextures(VkCommandBuffer InCmdList, const NVSDK_NGX_Parameter* InParameters);
-    bool CopyBackOutput();
+    bool CopyBackOutput(VkCommandBuffer InCmdBuffer);
+    void AbortPendingInterop(VkCommandBuffer InCmdBuffer, uint32_t InFrame);
 
     void ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
                          D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState);
@@ -145,6 +150,53 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     API Api() const override { return API::DX12; }
     bool IsWithDx12() override { return true; }
 
+    std::optional<double> ReadUpscalerTime(void* unused) override
+    {
+        if (auto feature = dx12Feature.get(); feature && Dx12CommandQueue && UpscalerTime)
+        {
+            auto dx12UpscalerTime = feature->ReadUpscalerTime(Dx12CommandQueue);
+
+            feature->ReadDetailedGpuTimes(Dx12CommandQueue, detailedGpuTimes);
+
+            // Count up shader times that are included in upscalerWithInterop but not in dx12UpscalerTime
+            double deductedUpscalerTime = 0.0;
+            for (const auto& time : detailedGpuTimes)
+            {
+                if (!time.includedInUpscalerTime)
+                    deductedUpscalerTime += time.time;
+            }
+
+            auto upscalerWithInterop = UpscalerTime->ReadInteropGpuTime();
+
+            if (dx12UpscalerTime)
+            {
+                if (upscalerWithInterop)
+                {
+                    const double interopTime = *upscalerWithInterop - *dx12UpscalerTime - deductedUpscalerTime;
+
+                    if (std::isfinite(interopTime) && interopTime > 0.0)
+                    {
+                        detailedGpuTimes.push_back({ "Interop", interopTime, true });
+                        return *dx12UpscalerTime + interopTime;
+                    }
+                }
+
+                // Vulkan timing has issue use Dx12 timing.
+                return dx12UpscalerTime;
+            }
+
+            return upscalerWithInterop;
+        }
+
+        return std::nullopt;
+    };
+
+    void ReadDetailedGpuTimes(void* unused, std::vector<DetailedGpuTime>& detailedGpuTimes) override
+    {
+        // We already queried and prepared detailedGpuTimes in ReadUpscalerTime
+        detailedGpuTimes = this->detailedGpuTimes;
+    };
+
     feature_version Version() final
     {
         return CallFeature([](auto f) { return f->Version(); }, feature_version {});
@@ -155,10 +207,10 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
         return CallFeature([](auto f) { return f->JitterCount(); }, size_t {});
     }
 
-    void TickFrozenCheck() override
+    void TickFrozenCheck(uint32_t presentPerEval = 1) override
     {
         if (auto feature = dx12Feature.get(); feature)
-            return feature->TickFrozenCheck();
+            return feature->TickFrozenCheck(presentPerEval);
     };
 
     bool IsFrozen() override

@@ -5,7 +5,7 @@
 class Nvngx_DllProxy : public IFGNvngx
 {
   private:
-    ID3D12Resource* depthCopy[2];
+    ID3D12Resource* depthCopy[2] {};
 
   protected:
     HMODULE dll = nullptr;
@@ -35,6 +35,8 @@ class Nvngx_DllProxy : public IFGNvngx
     PFN_VULKAN_PopulateParameters_Impl _DLSSG_VULKAN_PopulateParameters_Impl = nullptr;
 
     virtual void LoadLibraries() = 0;
+
+    void LoadNgxExports();
 
   public:
     Nvngx_DllProxy() = default;
