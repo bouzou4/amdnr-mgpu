@@ -176,6 +176,16 @@ extern "C"
     // it alive), or NULL to keep the request. An overridden device counts as the game's device, on any GPU.
     typedef void* (*OptiAdapterOverrideFn)(void* requestedAdapter, void* caller, void* userData);
 
+    // Swapchains (RegisterSwapchainProvider) --------------------------------------------------------------------
+
+    // Called where OptiScaler creates the game's D3D12 swapchain (CreateSwapChainForHwnd), instead of its frame
+    // generation swapchain. Return S_OK with *swapChain set (an IDXGISwapChain1*, one reference for OptiScaler)
+    // to provide it: OptiScaler wraps it like a real one (menu, overlay, present callbacks). Return E_NOTIMPL to
+    // let OptiScaler create it as usual. factory, queue: IDXGIFactory2*, the game's ID3D12CommandQueue*.
+    typedef int32_t (*OptiSwapchainProviderFn)(void* factory, void* queue, void* hwnd, const void* desc1,
+                                               const void* fullscreenDesc, void* restrictToOutput, void** swapChain,
+                                               void* userData);
+
     typedef struct OptiPluginApi
     {
         uint32_t size;    // sizeof(OptiPluginApi) of the running OptiScaler
@@ -291,6 +301,15 @@ extern "C"
         int32_t (*CreateDxgiFactoryUnhooked)(const void* riid, void** factory);
         // Runs fn on this thread with OptiScaler's GPU spoofing off (real vendor ids and adapter names)
         void (*RunUnspoofed)(void (*fn)(void* userData), void* userData);
+
+        // Swapchains, added after version 1 (check with OPTI_API_HAS) -------------------------------------------
+
+        // One provider per process; register in OptiPluginInit.
+        bool (*RegisterSwapchainProvider)(OptiPlugin* plugin, OptiSwapchainProviderFn fn, void* userData);
+        // The factory's real CreateSwapChainForHwnd, without OptiScaler's wrapping (HRESULT). For providers.
+        int32_t (*CreateSwapChainForHwndUnhooked)(void* factory, void* device, void* hwnd, const void* desc1,
+                                                  const void* fullscreenDesc, void* restrictToOutput,
+                                                  void** swapChain);
 
     } OptiPluginApi;
 

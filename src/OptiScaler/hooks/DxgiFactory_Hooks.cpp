@@ -17,6 +17,7 @@
 #include <d3d11.h>
 #include <magic_enum.hpp>
 #include <detours/detours.h>
+#include <plugins/PluginApi.h>
 
 // #define DETAILED_SC_LOGS
 
@@ -924,8 +925,8 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
                                       D3D12_COMMAND_LIST_TYPE_DIRECT);
         }
 
-        // Create FG SwapChain
-        if (!_skipFGSwapChainCreation)
+        // Create FG SwapChain, not when a plugin provides the swapchain
+        if (!_skipFGSwapChainCreation && !PluginApi::HasSwapchainProvider())
         {
             ScopedSkipFGSCCreation skipFGSCCreation {};
             FGSCResult = FGHooks::CreateSwapChainForHwnd(realFactory, real, hWnd, &localDesc,
@@ -1085,9 +1086,18 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
 
         {
             ScopedSkipParentWrapping skipParentWrapping {};
-            result = o_CreateSwapChainForHwnd(realFactory, pDevice, hWnd, &localDesc,
-                                              pFullscreenDesc != nullptr ? &localFullscreenDesc : nullptr,
-                                              pRestrictToOutput, ppSwapChain);
+
+            // A plugin's swapchain (D3D12), wrapped below like a real one
+            result = E_NOTIMPL;
+            if (cq != nullptr && PluginApi::HasSwapchainProvider())
+                result = PluginApi::ProvideSwapchain(realFactory, real, hWnd, &localDesc,
+                                                     pFullscreenDesc != nullptr ? &localFullscreenDesc : nullptr,
+                                                     pRestrictToOutput, ppSwapChain);
+
+            if (result == E_NOTIMPL)
+                result = o_CreateSwapChainForHwnd(realFactory, pDevice, hWnd, &localDesc,
+                                                  pFullscreenDesc != nullptr ? &localFullscreenDesc : nullptr,
+                                                  pRestrictToOutput, ppSwapChain);
         }
 
         if (!_skipFGSwapChainCreation)
@@ -2121,4 +2131,17 @@ HRESULT DxgiFactoryHooks::EnumAdapterByGpuPreference(IDXGIFactory6* realFactory,
 #endif
 
     return result;
+}
+
+HRESULT DxgiFactoryHooks::CreateSwapChainForHwndOriginal(IDXGIFactory2* factory, IUnknown* device, HWND hwnd,
+                                                         const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreenDesc,
+                                                         IDXGIOutput* restrictToOutput, IDXGISwapChain1** swapChain)
+{
+    if (o_CreateSwapChainForHwnd == nullptr)
+        return factory->CreateSwapChainForHwnd(device, hwnd, desc, fullscreenDesc, restrictToOutput, swapChain);
+
+    ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
+    ScopedSkipParentWrapping skipParentWrapping {};
+    return o_CreateSwapChainForHwnd(factory, device, hwnd, desc, fullscreenDesc, restrictToOutput, swapChain);
 }

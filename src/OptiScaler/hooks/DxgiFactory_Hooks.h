@@ -11,6 +11,12 @@ class DxgiFactoryHooks
     static void HookToFactory(IDXGIFactory* pFactory);
     static void HookToDLSSGFactory(IDXGIFactory* pFactory);
 
+    // The real CreateSwapChainForHwnd, for plugin swapchain providers
+    static HRESULT CreateSwapChainForHwndOriginal(IDXGIFactory2* factory, IUnknown* device, HWND hwnd,
+                                                  const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreenDesc,
+                                                  IDXGIOutput* restrictToOutput, IDXGISwapChain1** swapChain);
+
   private:
     using PFN_EnumAdapterByGpuPreference =
         rewrite_signature<decltype(&IDXGIFactory6::EnumAdapterByGpuPreference)>::type;

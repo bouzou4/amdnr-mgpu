@@ -6,6 +6,8 @@
 
 #include <imgui/imgui.h>
 
+#include <dxgi1_2.h>
+
 // OptiScaler side of plugin_sdk/optiscaler_plugin.h
 class PluginApi
 {
@@ -50,4 +52,9 @@ class PluginApi
     static bool UnhookedDeviceCreate();
     static IUnknown* OverrideAdapter(IUnknown* requested, void* caller);
 
+    // Swapchain provider (CreateSwapChainForHwnd hook)
+    static bool HasSwapchainProvider();
+    static HRESULT ProvideSwapchain(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreenDesc, IDXGIOutput* restrictToOutput,
+                                    IDXGISwapChain1** swapChain);
 };

@@ -5,6 +5,7 @@
 #include "Config.h"
 #include "menu/menu_common.h"
 #include "hooks/D3D12_Hooks.h"
+#include "hooks/DxgiFactory_Hooks.h"
 #include "proxies/D3D12_Proxy.h"
 #include "proxies/Dxgi_Proxy.h"
 
@@ -618,7 +619,15 @@ struct AdapterOverride
     void* userData = nullptr;
 };
 
+struct SwapchainProvider
+{
+    OptiPlugin* plugin = nullptr;
+    OptiSwapchainProviderFn fn = nullptr;
+    void* userData = nullptr;
+};
+
 AdapterOverride _adapterOverride;
+SwapchainProvider _swapchainProvider;
 thread_local bool _unhookedDeviceCreate = false;
 
 bool Api_RegisterAdapterOverride(OptiPlugin* plugin, OptiAdapterOverrideFn fn, void* userData)
@@ -671,11 +680,52 @@ void Api_RunUnspoofed(void (*fn)(void* userData), void* userData)
     fn(userData);
 }
 
+bool Api_RegisterSwapchainProvider(OptiPlugin* plugin, OptiSwapchainProviderFn fn, void* userData)
+{
+    if (plugin == nullptr || fn == nullptr)
+        return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (plugin->initState == OptiPlugin::InitState::Declined ||
+        (_swapchainProvider.plugin != nullptr && _swapchainProvider.plugin != plugin))
+        return false;
+
+    _swapchainProvider = { plugin, fn, userData };
+    LOG_INFO("[{}] Registered the swapchain provider", plugin->name);
+    return true;
+}
+
+int32_t Api_CreateSwapChainForHwndUnhooked(void* factory, void* device, void* hwnd, const void* desc1,
+                                           const void* fullscreenDesc, void* restrictToOutput, void** swapChain)
+{
+    if (factory == nullptr || device == nullptr || desc1 == nullptr || swapChain == nullptr)
+        return E_INVALIDARG;
+
+    return DxgiFactoryHooks::CreateSwapChainForHwndOriginal(
+        (IDXGIFactory2*) factory, (IUnknown*) device, (HWND) hwnd, (const DXGI_SWAP_CHAIN_DESC1*) desc1,
+        (const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*) fullscreenDesc, (IDXGIOutput*) restrictToOutput,
+        (IDXGISwapChain1**) swapChain);
+}
+
 bool CallAdapterOverride(OptiAdapterOverrideFn fn, void* requested, void* caller, void* userData, void** result)
 {
     __try
     {
         *result = fn(requested, caller, userData);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool CallSwapchainProvider(OptiSwapchainProviderFn fn, void* factory, void* queue, void* hwnd, const void* desc,
+                           const void* fs, void* restrict, void** swapChain, void* userData, int32_t* result)
+{
+    __try
+    {
+        *result = fn(factory, queue, hwnd, desc, fs, restrict, swapChain, userData);
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -736,6 +786,9 @@ const OptiPluginApi _api = {
     .CreateD3D12DeviceUnhooked = Api_CreateD3D12DeviceUnhooked,
     .CreateDxgiFactoryUnhooked = Api_CreateDxgiFactoryUnhooked,
     .RunUnspoofed = Api_RunUnspoofed,
+
+    .RegisterSwapchainProvider = Api_RegisterSwapchainProvider,
+    .CreateSwapChainForHwndUnhooked = Api_CreateSwapChainForHwndUnhooked,
 };
 } // namespace
 
@@ -814,6 +867,8 @@ void PluginApi::InitPlugin(HMODULE module, PFN_OptiPluginInit init, const std::s
         UpdatePresentRequests();
         if (_adapterOverride.plugin == plugin)
             _adapterOverride = {};
+        if (_swapchainProvider.plugin == plugin)
+            _swapchainProvider = {};
     }
 }
 
@@ -1027,3 +1082,38 @@ IUnknown* PluginApi::OverrideAdapter(IUnknown* requested, void* caller)
     return static_cast<IUnknown*>(adapter);
 }
 
+bool PluginApi::HasSwapchainProvider()
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _swapchainProvider.fn != nullptr && _swapchainProvider.plugin->initState == OptiPlugin::InitState::Accepted;
+}
+
+HRESULT PluginApi::ProvideSwapchain(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreenDesc, IDXGIOutput* restrictToOutput,
+                                    IDXGISwapChain1** swapChain)
+{
+    SwapchainProvider p;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        p = _swapchainProvider;
+    }
+
+    if (p.fn == nullptr)
+        return E_NOTIMPL;
+
+    int32_t result = E_NOTIMPL;
+    if (!CallSwapchainProvider(p.fn, factory, queue, hwnd, desc, fullscreenDesc, restrictToOutput,
+                               (void**) swapChain, p.userData, &result))
+    {
+        LOG_ERROR("[{}] Crashed in its swapchain provider, removing it", p.plugin->name);
+        std::lock_guard<std::mutex> lock(_mutex);
+        _swapchainProvider = {};
+        return E_NOTIMPL;
+    }
+
+    if (result == S_OK && (swapChain == nullptr || *swapChain == nullptr))
+        return E_NOTIMPL;
+
+    LOG_INFO("[{}] Swapchain provider: {:X}", p.plugin->name, (uint32_t) result);
+    return (HRESULT) result;
+}

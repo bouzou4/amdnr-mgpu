@@ -10,7 +10,7 @@ Versioning for all of them: the new functions are appended to the end of `OptiPl
 | 3 | Overlay text lines | `RegisterOverlayText` | built, used by the plugin |
 | 2 | Present callback + HUD-less colour without frame generation | `RegisterPresentCallback` | built, used by the plugin |
 | 5 | Adapter override + unhooked device creation | `RegisterAdapterOverride`, `CreateD3D12DeviceUnhooked`, `CreateDxgiFactoryUnhooked`, `RunUnspoofed` | built, used by the plugin's multi-GPU mode |
-| 6 | Swapchain provider | see 6 | see 6 |
+| 6 | Swapchain provider | `RegisterSwapchainProvider`, `CreateSwapChainForHwndUnhooked` | built, used by the plugin's multi-GPU mode |
 
 ## 1. Upscale callbacks and command list state restore
 
@@ -130,3 +130,29 @@ void    (*RunUnspoofed)(void (*fn)(void* userData), void* userData);
 - SEH guarded; a crashing override is removed.
 
 **What the plugin taught.** The caller filter (DXGI, D3D12, D3D12Core, D3D11, DXCore, OptiScaler, the plugin) is necessary: redirecting DXGI's own internal device hung the cross-adapter present in the multi-GPU prototype. It is passed to the plugin rather than applied by the host, because which callers matter is the plugin's policy.
+
+## 6. Swapchain provider
+
+**Why.** A plugin that presents on another GPU must create the real swapchain on that GPU's queue and give the game a proxy whose buffers live on the game's GPU, while OptiScaler's wrapper (menu, overlay, present callbacks) stays on top of what the game sees. That point is inside OptiScaler's `CreateSwapChainForHwnd` hook, between deciding whether to build the FG swapchain and calling the real factory; a plugin cannot place itself there from outside.
+
+**ABI.**
+
+```c
+typedef int32_t (*OptiSwapchainProviderFn)(void* factory, void* queue, void* hwnd, const void* desc1,
+                                           const void* fullscreenDesc, void* restrictToOutput, void** swapChain,
+                                           void* userData);
+bool    (*RegisterSwapchainProvider)(OptiPlugin* plugin, OptiSwapchainProviderFn fn, void* userData);
+int32_t (*CreateSwapChainForHwndUnhooked)(void* factory, void* device, void* hwnd, const void* desc1,
+                                          const void* fullscreenDesc, void* restrictToOutput, void** swapChain);
+```
+
+**Behaviour.**
+
+- One provider per process, registered in `OptiPluginInit`. In `DxgiFactoryHooks::CreateSwapChainForHwnd`, for a D3D12 queue: with a provider registered OptiScaler skips its FG swapchain and calls the provider where it would call the real factory, with its adjusted descriptions (V-sync override, tearing flag). `S_OK` + a swapchain: OptiScaler wraps it as `WrappedIDXGISwapChain4` exactly like a real one; `E_NOTIMPL`: it creates the swapchain itself, as before.
+- `CreateSwapChainForHwndUnhooked` is the factory's real `CreateSwapChainForHwnd` (OptiScaler's saved original, no parent wrapping), for the provider's own real swapchain on another device.
+- SEH guarded; a crashing provider is removed and OptiScaler creates the swapchain.
+
+**What the plugin taught.**
+
+- Registering a provider turns OptiScaler's FG swapchain off for that process even when the provider then declines; FG output and a plugin presenter are exclusive anyway (the multi-GPU design suppresses FG output), and deciding later would mean building the FG swapchain first and discarding it.
+- `CreateSwapChainForHwnd` (D3D12) is the only path covered; `CreateSwapChain` and `CreateSwapChainForCoreWindow` would take the same call when a game needs them.
