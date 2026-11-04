@@ -2334,6 +2334,20 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
         if (inputFpsCycle && config->ShowFps.value_or_default())
             config->FpsOverlayType = (FpsOverlay) ((config->FpsOverlayType.value_or_default() + 1) % FpsOverlay_COUNT);
 
+        // Fork test hook for input-free runs: [Plugins] TestOpenTab=<tab label> opens the menu on that tab once
+        static bool testTabChecked = false;
+        if (!testTabChecked && !_isVisible)
+        {
+            testTabChecked = true;
+            static std::string testTab;
+            testTab = config->GetRawValue("Plugins", "TestOpenTab").value_or("");
+            if (!testTab.empty())
+            {
+                inputMenu = true;
+                requestedMenuTab = testTab.c_str();
+            }
+        }
+
         if (inputMenu)
         {
             inputMenu = false;
@@ -9744,6 +9758,12 @@ void MenuCommon::RenderMainMenuTabs(RenderMenuContext& ctx)
         {
             if (strcmp(tabs[i].label, requestedMenuTab) == 0)
                 selectedMenuTab = i;
+        }
+
+        for (int i = 0; i < (int) pluginTabs.size(); i++)
+        {
+            if (pluginTabs[i].name == requestedMenuTab)
+                selectedMenuTab = builtinTabCount + i;
         }
 
         requestedMenuTab = nullptr;
