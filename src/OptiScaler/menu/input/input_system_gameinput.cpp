@@ -1,3 +1,5 @@
+// Copyright (c) 2026 3zwr1 (AMDNR)
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -73,6 +75,9 @@ bool InstallGameInputCreateHookLocked()
 
 void UpdateGameInputIntegrationLocked()
 {
+    if (DiagSkipHookGroup(DiagHookGroup::GameInput))
+        return;
+
     RefreshGameInputModuleStateLocked();
 
     if (_state.GameInputModuleLoaded && _state.GameInputCreateExportFound)

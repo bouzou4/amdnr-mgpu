@@ -64,25 +64,32 @@ bool XeSSFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     ID3D12Resource* paramColor;
     if (InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor) != NVSDK_NGX_Result_Success)
         InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &paramColor);
+    // AMDNR (C3-A): the NR replacement arrives in NON_PIXEL_SHADER_RESOURCE and leaves in it. The title's colour
+    // barriers below describe the title's own texture, so neither is applied to it; the Unreal auto-detect still
+    // runs, because the bridge reads that value as the title colour's state (IFeature_Dx12::IsNrColour).
+    const bool nrColour = IsNrColour(InParameters, paramColor);
 
     if (paramColor)
     {
         LOG_DEBUG("Color exist..");
-        paramColor->SetName(L"paramColor");
+        if (!nrColour)
+            paramColor->SetName(L"paramColor");
 
         if (Config::Instance()->ColorResourceBarrier.has_value())
         {
-            ResourceBarrier(InCommandList, paramColor,
-                            (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value(),
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (!nrColour)
+                ResourceBarrier(InCommandList, paramColor,
+                                (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value(),
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
                  State::Instance().gameEngine == GameEngineType::Unreal ||
                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
         {
             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
-            ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (!nrColour)
+                ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
 
         params.pColorTexture = paramColor;
@@ -309,7 +316,7 @@ bool XeSSFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     }
 
     // restore resource states
-    if (params.pColorTexture && Config::Instance()->ColorResourceBarrier.has_value())
+    if (!nrColour && params.pColorTexture && Config::Instance()->ColorResourceBarrier.has_value())
         ResourceBarrier(InCommandList, params.pColorTexture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value());
 

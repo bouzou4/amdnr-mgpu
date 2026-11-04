@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "FSR4Upgrade.h"
 
@@ -170,8 +171,17 @@ HRESULT STDMETHODCALLTYPE AmdExtFfxApi::UpdateFfxApiProvider(void* pData, uint32
 
         auto result = o_UpdateFfxApiProvider(pData, dataSizeInBytes);
 
-        auto level = SUCCEEDED(result) ? spdlog::level::info : spdlog::level::err;
-        spdlog::log(level, "UpdateFfxApiProvider for: {}, result: 0x{:X}", effect, (UINT) result);
+        // P25 (AMDNR 0.3.4): the driver has no override provider for the Ray Regeneration denoiser (0x80070057 on RDNA 4
+        // too, where RR then runs), so amd_fidelityfx_denoiser_dx12.dll goes on with its own providers. An ERROR here
+        // was read as the cause of RR problems; when that DLL finds no provider either, FSRDFeatureDx12 logs
+        // "No FSR-RR denoisers were found", which is the real failure line.
+        if (FAILED(result) && effectType == FFXStructType::Denoiser)
+            LOG_INFO("UpdateFfxApiProvider for: {}, result: 0x{:X} (no driver override for the denoiser; "
+                     "amd_fidelityfx_denoiser_dx12.dll uses its own providers)",
+                     effect, (UINT) result);
+        else
+            spdlog::log(SUCCEEDED(result) ? spdlog::level::info : spdlog::level::err,
+                        "UpdateFfxApiProvider for: {}, result: 0x{:X}", effect, (UINT) result);
 
         State::EnableChecks(owner);
         return result;

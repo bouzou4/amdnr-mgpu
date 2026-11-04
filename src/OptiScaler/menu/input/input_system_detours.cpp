@@ -1,3 +1,5 @@
+// Copyright (c) 2026 3zwr1 (AMDNR)
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -266,7 +268,7 @@ bool InstallHooks()
 
     ResolveOptionalUser32Exports();
 
-    if (!messageHooks)
+    if (!messageHooks && !DiagSkipHookGroup(DiagHookGroup::Message))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -285,7 +287,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 message hook installation failed result:{}", result);
     }
 
-    if (!keyStateHooks)
+    if (!keyStateHooks && !DiagSkipHookGroup(DiagHookGroup::KeyState))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -303,7 +305,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 key state hook installation failed result:{}", result);
     }
 
-    if (!getPosHooks)
+    if (!getPosHooks && !DiagSkipHookGroup(DiagHookGroup::MsgPos))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -320,7 +322,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 GetMessagePos hook installation failed result:{}", result);
     }
 
-    if (!clipCursorHooks)
+    if (!clipCursorHooks && !DiagSkipHookGroup(DiagHookGroup::Clip))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -337,7 +339,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 clip cursor hook installation failed result:{}", result);
     }
 
-    if (!message2Hooks)
+    if (!message2Hooks && !DiagSkipHookGroup(DiagHookGroup::SendPost))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -358,7 +360,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 message hook installation failed result:{}", result);
     }
 
-    if (!State::Instance().isRunningOnLinux && !hidHooks)
+    if (!State::Instance().isRunningOnLinux && !hidHooks && !DiagSkipHookGroup(DiagHookGroup::Hid))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -378,7 +380,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 HID hook installation failed result:{}", result);
     }
 
-    if (!rawHooks)
+    if (!rawHooks && !DiagSkipHookGroup(DiagHookGroup::Raw))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -396,7 +398,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 raw input installation failed result:{}", result);
     }
 
-    if (!windowsHooks)
+    if (!windowsHooks && !DiagSkipHookGroup(DiagHookGroup::WinHook))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -414,7 +416,7 @@ bool InstallHooks()
             LOG_ERROR("Win32 windows input installation failed result:{}", result);
     }
 
-    if (!positionHooks)
+    if (!positionHooks && !DiagSkipHookGroup(DiagHookGroup::Cursor))
     {
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -439,11 +441,17 @@ bool InstallHooks()
 
     // If CursorPos hooks are not installed, try to install
     // IAT (Import Address Table) hooks for CursorPos
-    if (!positionHooks && !positionIATHooks)
+    if (!positionHooks && !positionIATHooks && !DiagSkipHookGroup(DiagHookGroup::Cursor))
         positionIATHooks = InstallCursorIatHooks();
 
-    _state.HooksInstalled = messageHooks && keyStateHooks && getPosHooks && clipCursorHooks && message2Hooks &&
-                            hidHooks && rawHooks && windowsHooks && (positionHooks || positionIATHooks);
+    // A group left out by [Hotfix] DiagInputHooksSkip counts as done so it is not retried.
+    namespace G = DiagHookGroup;
+    _state.HooksInstalled =
+        (messageHooks || DiagSkipHookGroup(G::Message)) && (keyStateHooks || DiagSkipHookGroup(G::KeyState)) &&
+        (getPosHooks || DiagSkipHookGroup(G::MsgPos)) && (clipCursorHooks || DiagSkipHookGroup(G::Clip)) &&
+        (message2Hooks || DiagSkipHookGroup(G::SendPost)) && (hidHooks || DiagSkipHookGroup(G::Hid)) &&
+        (rawHooks || DiagSkipHookGroup(G::Raw)) && (windowsHooks || DiagSkipHookGroup(G::WinHook)) &&
+        (positionHooks || positionIATHooks || DiagSkipHookGroup(G::Cursor));
 
     return _state.HooksInstalled;
 }

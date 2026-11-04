@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "FrameLimit.h"
 
@@ -61,14 +62,35 @@ inline int FrameLimit::combined_sleep(int64_t ns)
     return status;
 }
 
-void FrameLimit::sleep(bool fgActive)
+int FrameLimit::sleep_ns(int64_t ns) { return ns > 0 ? combined_sleep(ns) : 0; }
+
+uint64_t FrameLimit::now_ns() { return get_timestamp(); }
+
+void FrameLimit::sleep(bool fgActive, uint32_t outputPerBase)
 {
     if (auto fpsCap = Config::Instance()->FramerateLimit.value_or_default(); fpsCap != 0.0f)
     {
         uint64_t min_interval_us = std::clamp((uint64_t) (1'000'000 / fpsCap), 0ULL, 100'000'000ULL);
 
-        if (fgActive)
-            min_interval_us *= 2;
+        // The limit is the displayed frame rate. With frame generation this Present runs once per game frame and FG
+        // shows outputPerBase frames for each (2 for FSR FG, N+1 for XeFG/DLSSG at N interpolated), so the game-frame
+        // interval is the output interval times that. (AMDNR 0.3.3.2; it was a fixed x2, so XeFG 4X ran at twice the
+        // limit.)
+        const uint32_t mul = fgActive ? std::clamp<uint32_t>(outputPerBase, 2u, 16u) : 1u;
+        min_interval_us *= mul;
+
+        static uint32_t loggedMul = 0;
+        static float loggedCap = 0.0f;
+        if (mul != loggedMul || fpsCap != loggedCap)
+        {
+            loggedMul = mul;
+            loggedCap = fpsCap;
+            if (mul > 1)
+                LOG_INFO("FPS limit {:.1f} fps (displayed) with FG {}X: game frames capped at {:.1f} fps", fpsCap, mul,
+                         fpsCap / mul);
+            else
+                LOG_INFO("FPS limit {:.1f} fps", fpsCap);
+        }
 
         static uint64_t previous_frame_time = 0;
         uint64_t current_time = get_timestamp();

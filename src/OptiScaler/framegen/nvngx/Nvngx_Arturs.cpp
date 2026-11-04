@@ -68,7 +68,11 @@ void Nvngx_Arturs::LoadLibraries()
     }
     else
     {
-        LOG_WARN("Artur's enabled but cannot be loaded");
+        // AMDNR does not ship it: say where it comes from.
+        LOG_WARN("Artur's enabled but cannot be loaded: no loadable dlss-enabler-headless.dll in {} (not "
+                 "included with AMDNR - DLSS Enabler 4.9.0 or newer by Artur Graniszewski, "
+                 "https://www.nexusmods.com/site/mods/757, its version.dll renamed to dlss-enabler-headless.dll)",
+                 wstring_to_string(optiPath));
     }
 }
 

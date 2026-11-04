@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 #include "ffx_upscale.h"
@@ -16,19 +17,27 @@ class FSR31Feature : public virtual IFeature
     double _lastFrameTime;
     unsigned int _lastWidth = 0;
     unsigned int _lastHeight = 0;
-    static inline feature_version _version { 3, 1, 2 };
+    // Per instance on purpose, and this is a correctness fix rather than tidying.
+    // The Super Resolution feature and the Ray Regeneration feature share this base,
+    // and each parses a DIFFERENT provider's version string into it - the SR upscaler
+    // for one, the RR denoiser for the other. While this was static, whichever ran
+    // last decided the answer for both, so every Version()-gated behaviour in the SR
+    // path could be switched by the denoiser's version number. Same for parse_version.
+    feature_version _version { 3, 1, 2 };
 
   protected:
     std::string _name = "FSR";
 
-    ffxContext _context = nullptr;
-    ffxCreateContextDescUpscale _contextDesc = {};
+    // Named for what they are now that a second context exists beside them. RR owns
+    // its own denoiser context; this pair is the upscaler's.
+    ffxContext _upscaleCtx = nullptr;
+    ffxCreateContextDescUpscale _upscaleCtxDesc = {};
 
     virtual bool InitFSR3(const NVSDK_NGX_Parameter* InParameters) = 0;
 
     double GetDeltaTime();
 
-    static inline void parse_version(const char* version_str) { _version.parse_version(version_str); }
+    void parse_version(const char* version_str) { _version.parse_version(version_str); }
 
     static inline void ffxResolveTypelessFormat(uint32_t& format)
     {

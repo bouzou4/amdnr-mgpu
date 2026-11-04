@@ -1,6 +1,8 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include <pch.h>
 #include <Config.h>
 #include <Util.h>
+#include <dlssnr/amd/AmdBridge.h>
 #include <proxies/FfxApi_Proxy.h>
 #include "FFXFeature_Dx12.h"
 #include "MathUtils.h"
@@ -137,23 +139,29 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
 
     params.commandList = InCommandList;
 
-    ID3D12Resource* paramColor;
+    // The AMD replacement arrives in COMPUTE_READ and must remain there.
+    // Game-specific barriers describe the original texture, not this scratch UAV.
+    const bool amdReplacement = DlssNr::AmdBridge::HasReplacement(InParameters);
+    ID3D12Resource* paramColor = nullptr;
     if (InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor) != NVSDK_NGX_Result_Success)
         InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &paramColor);
+    // The colour as the caller handed it (AMDNR C3-C, 0.3.3.2 rebuild). The padding workaround below retargets
+    // paramColor at its scratch copy; the source's own state is what the copy and the restore act on.
+    ID3D12Resource* const sourceColor = paramColor;
 
     if (paramColor)
     {
         LOG_DEBUG("Color exist..");
 
-        if (Config::Instance()->ColorResourceBarrier.has_value())
+        if (!amdReplacement && Config::Instance()->ColorResourceBarrier.has_value())
         {
             ResourceBarrier(InCommandList, paramColor,
                             (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value(),
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
-        else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
+        else if (!amdReplacement && (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
                  State::Instance().gameEngine == GameEngineType::Unreal ||
-                 State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+                 State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine))
         {
             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
             ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -214,6 +222,11 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
 
                     InCommandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, &srcBox);
 
+                    // The source goes back to where it came from (it used to stay in COPY_SOURCE, and the restore
+                    // below then transitioned the scratch copy instead). The copy stays in NPSR, which its next use
+                    // (NPSR -> COPY_DEST above) assumes.
+                    ResourceBarrier(InCommandList, sourceColor, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                     ResourceBarrier(InCommandList, smallerColor[index], D3D12_RESOURCE_STATE_COPY_DEST,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -595,8 +608,9 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
     }
 
     // restore resource states
-    if (paramColor && Config::Instance()->ColorResourceBarrier.has_value())
-        ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    // The title's colour (sourceColor), not the padding workaround's scratch copy that paramColor may point at now.
+    if (!amdReplacement && sourceColor && Config::Instance()->ColorResourceBarrier.has_value())
+        ResourceBarrier(InCommandList, sourceColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value());
 
     if (paramVelocity && Config::Instance()->MVResourceBarrier.has_value())
@@ -643,7 +657,9 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
     {
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 
+        LOG_INFO("[CREATE] FFX QueryVersions, device {:X}", (size_t) Device);
         QueryVersionsDx12(Device);
+        LOG_INFO("[CREATE] FFX QueryVersions done: {} versions", State::Instance().ffxUpscalerVersionIds.size());
 
         InitFlags();
 
@@ -668,7 +684,10 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
         {
             ScopedSkipHeapCapture skipHeapCapture {};
 
+            LOG_INFO("[CREATE] FFX CreateContext, version index {}",
+                     Config::Instance()->FfxUpscalerIndex.value_or_default());
             auto ret = FfxApiProxy::D3D12_CreateContext(&_context, &_contextDesc.header, NULL);
+            LOG_INFO("[CREATE] FFX CreateContext returned {}", FfxApiProxy::ReturnCodeToString(ret));
 
             if (ret != FFX_API_RETURN_OK)
             {

@@ -1,7 +1,10 @@
+// Copyright (c) 2026 3zwr1 (AMDNR)
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
 #include <array>
+#include <atomic>
 
 namespace OptiInput
 {
@@ -294,9 +297,20 @@ int WindowsHookMouseMessageToButton(int hookType, WPARAM wParam, LPARAM lParam)
     }
 }
 
+// Defined below (the [Hotfix] MenuLowLevelHookPassThrough kill switch, read once).
+static bool LowLevelHookPassThroughEnabled();
+
 bool ShouldBlockWindowsKeyboardHookCallbackLocked(WindowsHookSlot& slot, int code, WPARAM wParam, LPARAM lParam)
 {
-    if (code < 0 || !ShouldBlockKeyboardInputLocked())
+    if (code < 0)
+        return false;
+
+    // AMDNR 0.3.4.2: the menu key that closed the menu stays away from the game's keyboard hook until it is released
+    // (HoldKeyUntilReleased), whether or not the menu blocks: the event's key is read first.
+    const bool blockAll = ShouldBlockKeyboardInputLocked();
+    const bool heldKeyActive = _state.HeldKeyVk > 0;
+
+    if (!blockAll && !heldKeyActive)
         return false;
 
     int vk = 0;
@@ -307,7 +321,7 @@ bool ShouldBlockWindowsKeyboardHookCallbackLocked(WindowsHookSlot& slot, int cod
         const KBDLLHOOKSTRUCT* keyboard = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
 
         if (keyboard == nullptr)
-            return true;
+            return blockAll;
 
         vk = static_cast<int>(keyboard->vkCode);
         released = (keyboard->flags & LLKHF_UP) != 0;
@@ -317,6 +331,29 @@ bool ShouldBlockWindowsKeyboardHookCallbackLocked(WindowsHookSlot& slot, int cod
         vk = static_cast<int>(wParam);
         released = (static_cast<ULONG_PTR>(lParam) & 0x80000000UL) != 0;
     }
+
+    if (heldKeyActive && vk > 0 && vk < 256 && IsHeldKeyLocked(vk))
+    {
+        // A classic WH_KEYBOARD hook runs as the game pumps that very message, and a nonzero return drops it before
+        // any window procedure sees it: this key-up is the one that ends the hold. A low-level hook sees the event
+        // before it is queued, and the queued key-up (or the raw break) ends the hold afterwards, unless the
+        // low-level event is swallowed for the desktop ([Hotfix] MenuLowLevelHookPassThrough=false): then nothing
+        // else follows. The game never saw the key-down, so its hook is owed no key-up either.
+        if (released)
+        {
+            _state.WindowsHookKeyboardBlockedDown[vk] = false;
+
+            if (slot.HookType != WH_KEYBOARD_LL)
+                EndKeyHoldLocked("its key-up at the game's keyboard hook");
+            else if (!LowLevelHookPassThroughEnabled())
+                EndKeyHoldLocked("its key-up at the game's low-level keyboard hook (swallowed)");
+        }
+
+        return true;
+    }
+
+    if (!blockAll)
+        return false;
 
     if (vk <= 0 || vk >= 256)
         return true;
@@ -385,6 +422,39 @@ bool ShouldBlockWindowsHookCallbackLocked(WindowsHookSlot& slot, int code, WPARA
     return false;
 }
 
+// AMDNR 0.3.4 (AC-MENU fix 1). A low-level hook (WH_KEYBOARD_LL / WH_MOUSE_LL) sees input before Windows applies it,
+// so returning 1 from it drops the event for the whole desktop: the async key state, the cursor and every WM_* stay
+// unchanged, and the menu's own poll, message path and WndProc get nothing (Assetto Corsa: Insert could not close the
+// menu, clicks did nothing, Alt+Tab was swallowed). While the menu blocks, skip only the game's hook proc and pass the
+// event on with CallNextHookEx; the game's message and raw paths are still filtered by the other OptiInput hooks.
+// [Hotfix] MenuLowLevelHookPassThrough=false restores the 0.3.3.2 swallow. Read once (kill switch, not saved).
+static bool LowLevelHookPassThroughEnabled()
+{
+    static const bool enabled = Config::Instance()->MenuLowLevelHookPassThrough.value_or_default();
+    return enabled;
+}
+
+// One line per hook kind per session (never per event) so a tester log shows which way the first blocked low-level
+// event went; the per-event line stays at verbose level. AMDNR 0.3.4.2: the first blocked event of a session can
+// also be the menu key that closed the menu, held back from the game with the menu already closed
+// (HoldKeyUntilReleased), so the line says which of the two it was instead of always claiming the menu is open.
+static void LogFirstBlockedLowLevelHookEvent(bool keyboardHook, bool passThrough, bool heldMenuKey)
+{
+    static std::atomic<bool> keyboardLogged { false };
+    static std::atomic<bool> mouseLogged { false };
+
+    std::atomic<bool>& logged = keyboardHook ? keyboardLogged : mouseLogged;
+
+    if (logged.exchange(true, std::memory_order_relaxed))
+        return;
+
+    LOG_INFO("{}: the game's low-level {} hook is skipped and the event is {}",
+             heldMenuKey ? "the menu key that closed the menu is still held back" : "menu open",
+             keyboardHook ? "keyboard" : "mouse",
+             passThrough ? "passed on to Windows ([Hotfix] MenuLowLevelHookPassThrough=true)"
+                         : "swallowed ([Hotfix] MenuLowLevelHookPassThrough=false)");
+}
+
 LRESULT CALLBACK InvokeWindowsHookProxy(std::size_t slotIndex, int code, WPARAM wParam, LPARAM lParam)
 {
     HHOOK hook = nullptr;
@@ -392,6 +462,8 @@ LRESULT CALLBACK InvokeWindowsHookProxy(std::size_t slotIndex, int code, WPARAM 
     bool shouldBlock = false;
     bool keyboardHook = false;
     bool mouseHook = false;
+    bool lowLevel = false;
+    bool heldMenuKey = false;
 
     {
         std::unique_lock lock(_state.Mutex);
@@ -408,7 +480,11 @@ LRESULT CALLBACK InvokeWindowsHookProxy(std::size_t slotIndex, int code, WPARAM 
         originalProc = slot.OriginalProc;
         keyboardHook = IsKeyboardWindowsHookType(slot.HookType);
         mouseHook = IsMouseWindowsHookType(slot.HookType);
+        lowLevel = slot.HookType == WH_KEYBOARD_LL || slot.HookType == WH_MOUSE_LL;
         shouldBlock = ShouldBlockWindowsHookCallbackLocked(slot, code, wParam, lParam);
+        // AMDNR 0.3.4.2: with the menu not blocking the keyboard, a blocked keyboard event can only be the menu key
+        // that closed the menu, still held back from the game (HoldKeyUntilReleased): the reason for the line below.
+        heldMenuKey = shouldBlock && keyboardHook && !ShouldBlockKeyboardInputLocked();
 
         if (code >= 0)
         {
@@ -433,7 +509,16 @@ LRESULT CALLBACK InvokeWindowsHookProxy(std::size_t slotIndex, int code, WPARAM 
     }
 
     if (shouldBlock)
-        return 1;
+    {
+        // Classic (non low-level) hooks keep returning 1, as in 0.3.3.2.
+        if (!lowLevel)
+            return 1;
+
+        const bool passThrough = LowLevelHookPassThroughEnabled();
+        LogFirstBlockedLowLevelHookEvent(keyboardHook, passThrough, heldMenuKey);
+
+        return passThrough ? CallNextHookEx(hook, code, wParam, lParam) : 1;
+    }
 
     if (originalProc == nullptr)
         return CallNextHookEx(hook, code, wParam, lParam);

@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 
 #include "FSRFG_Dx12.h"
@@ -909,7 +910,7 @@ bool FSRFG_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmd
     {
         if (Config::Instance()->FGPreserveSwapChain.value_or_default())
         {
-            LOG_WARN("XeFG swapchain already created for the same output window!");
+            LOG_WARN("FSR FG swapchain already created for the same output window!");
             auto result = State::Instance().currentFGSwapchain->ResizeBuffers(
                               desc->BufferCount, desc->Width, desc->Height, desc->Format, desc->Flags) == S_OK;
 

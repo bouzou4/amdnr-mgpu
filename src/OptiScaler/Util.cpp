@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 
 #include "Util.h"
@@ -486,9 +487,38 @@ bool Util::GetFileVersion(std::wstring dllPath, version_t* fileVersionOut, versi
 
 bool Util::IsSubpath(const std::filesystem::path& path, const std::filesystem::path& base)
 {
-    auto rel = std::filesystem::relative(path, base);
-    auto first = *rel.begin();
-    return first != "." && first != "..";
+    // NEVER THROWS (0.3.3). This runs for every DLL load (LibraryLoadHooks::LoadLibraryCheckW),
+    // including each Streamline plugin load inside the game's slInit, where an exception escaping
+    // the loader hook can end as slInit error 0x18. The throwing overload of relative() raised
+    // filesystem_error for a path it could not resolve; the error_code overload reports it, and
+    // an error answers "not inside".
+    //
+    // Otherwise the answer is exactly what it was, on purpose: an empty result - relative() found
+    // no relation, e.g. the two paths are on different drives - still counts as inside, as the old
+    // `*rel.begin()` of an empty path did (it read neither "." nor ".."). Changing that, and the
+    // case question, reverses the answer at the callers (LibraryLoad_Hooks.cpp: LoadLibraryCheckW's
+    // local-Streamline test, the LoadCustomAmdxc64OnRdna2 driver-store match, CheckModulesInMemory's
+    // isLocalStreamlineModule; Util::FindFilePath) and waits for an audit of all four (0.3.4). The
+    // empty case is tested explicitly here rather than by dereferencing begin() == end().
+    try
+    {
+        std::error_code ec;
+        const auto rel = std::filesystem::relative(path, base, ec);
+        if (ec)
+            return false;
+
+        if (rel.empty())
+            return true;
+
+        // A copy: the element lives in the iterator, which is a temporary here.
+        const auto first = *rel.begin();
+        return first != "." && first != "..";
+    }
+    catch (const std::exception&)
+    {
+        // Allocation failure while building the paths: same answer as an error.
+        return false;
+    }
 }
 
 std::optional<std::filesystem::path> Util::FindFilePath(const std::filesystem::path& startDir,

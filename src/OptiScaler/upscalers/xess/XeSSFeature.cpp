@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include <pch.h>
 #include "XeSSFeature.h"
@@ -40,7 +41,9 @@ bool XeSSFeature::InitXeSS(ID3D12Device* device, const NVSDK_NGX_Parameter* InPa
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 #endif // !DONT_USE_XMX
 
+        LOG_INFO("[CREATE] XeSS CreateContext, device {:X}", (size_t) device);
         auto ret = XeSSProxy::D3D12CreateContext()(device, &_xessContext);
+        LOG_INFO("[CREATE] XeSS CreateContext returned {}", ResultToString(ret));
 
         if (ret != XESS_RESULT_SUCCESS)
         {

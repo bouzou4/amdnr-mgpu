@@ -1,5 +1,7 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "wrapped_swapchain.h"
+#include <hooks/DxgiSwapchainSizing.h>
 
 #include <Util.h>
 #include <Config.h>
@@ -11,6 +13,8 @@
 #include <menu/menu_overlay_dx.h>
 
 #include <misc/FrameLimit.h>
+#include <dlssnr/amd/InterleavePacing.h>
+#include <proxies/XeFGPacing.h>
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -419,8 +423,8 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 }
 
 WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* pDevice, HWND hWnd, UINT flags,
-                                               bool isUWP)
-    : _real(real), _device(pDevice), _handle(hWnd), _refcount(1), _uwp(isUWP)
+                                               bool isUWP, bool isComposition)
+    : _real(real), _device(pDevice), _handle(hWnd), _refcount(1), _uwp(isUWP), _composition(isComposition)
 {
     _id = ++scCount;
     _lastFlags = flags;
@@ -647,6 +651,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
     OwnedLockGuard lock(_localMutex, 4);
 #endif
 
+    if (_composition && !IsCompositionWindow(_handle))
+        _handle = FindCompositionWindow();
+    if (_composition && _handle == nullptr)
+        return _real->Present(SyncInterval, Flags);
+
     HRESULT result;
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
@@ -657,6 +666,30 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
         if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
             !IdentifyGpu::getPrimaryGpu().usesDxvk && !XellHooks::canLimit())
             FrameLimit::sleep(false);
+
+        // Paced whether or not Reflex is capping, unlike the limiter above: a cap on the
+        // average frame rate does nothing to an alternating frame TIME, which is what
+        // interleave produces. Runs after the limiter so a deadline another limiter
+        // already met costs nothing - Pace() only sleeps for time the frame did not spend.
+        //
+        // This used to be gated off whenever frame generation was active, on the theory
+        // that FG paces its own presents and two pacers would fight. That was wrong twice
+        // over. It is wrong in practice because it meant the pacer never ran at all for
+        // anyone using FG, which is most people - the first report back was "I could not
+        // feel it doing anything", and it wasn't. And it is wrong in principle: FG
+        // interpolates BETWEEN rendered frames, so an uneven pair of real frames puts the
+        // generated frame at the midpoint of an uneven interval and carries the judder
+        // through rather than hiding it. Evening the real frames out is what FG wants.
+        //
+        // Pace() is safe to call on every present because it only acts on one that carries
+        // a fresh note from the NR pass, and there is exactly one of those per RENDERED
+        // frame however many presents FG makes from it.
+        //
+        // AMDNR 0.3.3 (MFG stutter): except while XeFG runs at 3X or above. Its presents
+        // are then the frames of one burst, the XeFG pacing engine spaces them, and a sleep
+        // here would land in the middle of the burst.
+        if (!XeFGPacing::HoldInterleavePacing())
+            DlssNr::Pacing::Pace();
     }
     else
     {
@@ -769,7 +802,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
 
     State::Instance().scChanged = true;
 
-    if (Config::Instance()->OverrideVsync.value_or_default() && !State::Instance().SCExclusiveFullscreen &&
+    if (!_composition && Config::Instance()->OverrideVsync.value_or_default() && !State::Instance().SCExclusiveFullscreen &&
         State::Instance().currentFG == nullptr)
     {
         LOG_DEBUG("Overriding flags");
@@ -1003,6 +1036,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
     OwnedLockGuard lock(_localMutex, 5);
 #endif
 
+    if (_composition && !IsCompositionWindow(_handle))
+        _handle = FindCompositionWindow();
+    if (_composition && _handle == nullptr)
+        return _real1->Present1(SyncInterval, Flags, pPresentParameters);
+
     HRESULT result;
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
@@ -1013,6 +1051,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
         if (!State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
             !IdentifyGpu::getPrimaryGpu().usesDxvk && !XellHooks::canLimit())
             FrameLimit::sleep(false);
+
+        // See Present(): paced regardless of the limiter above, and regardless of FG -
+        // except while XeFG runs at 3X or above (AMDNR 0.3.3).
+        if (!XeFGPacing::HoldInterleavePacing())
+            DlssNr::Pacing::Pace();
     }
     else
     {
@@ -1108,6 +1151,43 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetColorSpace1(DXGI_COLOR_SPAC
                                     ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020 ||
                                     ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
 
+    // What one unit of the buffer means, which is the question the white point is really asking.
+    //
+    // Two of these encodings are absolute. PQ (ST.2084) puts 1.0 at 10,000 nits by definition, and
+    // scRGB -- linear, Rec.709 primaries -- puts 1.0 at 80 nits. In either the divisor this pass
+    // wants is arithmetic rather than a guess or a reading: paper white in nits over the unit. The
+    // rest are relative and say nothing about scale.
+    //
+    // Logged rather than used, for now. Whether a game that reports one of these actually honours it
+    // is the thing worth knowing before anything is built on it.
+    const char* meaning = "relative -- no scale to be had";
+    const char* name = "other";
+
+    switch (ColorSpace)
+    {
+    case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+        name = "PQ / ST.2084 (HDR10)";
+        meaning = "absolute: 1.0 = 10000 nits, so 203-nit paper white = 0.0203";
+        break;
+    case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+        name = "scRGB (linear, Rec.709)";
+        meaning = "absolute: 1.0 = 80 nits, so 203-nit paper white = 2.5375";
+        break;
+    case DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020:
+        name = "HLG";
+        break;
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020:
+        name = "Rec.2020, gamma 2.2";
+        break;
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+        name = "sRGB (SDR)";
+        break;
+    default:
+        break;
+    }
+
+    LOG_INFO("DLSS-NR: swapchain colour space {} -- {} ({})", (int) ColorSpace, name, meaning);
+
     return _real3->SetColorSpace1(ColorSpace);
 }
 
@@ -1157,7 +1237,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
 
     State::Instance().scChanged = true;
 
-    if (Config::Instance()->OverrideVsync.value_or_default() && !State::Instance().SCExclusiveFullscreen &&
+    if (!_composition && Config::Instance()->OverrideVsync.value_or_default() && !State::Instance().SCExclusiveFullscreen &&
         State::Instance().currentFG == nullptr)
     {
         LOG_DEBUG("Overriding flags");

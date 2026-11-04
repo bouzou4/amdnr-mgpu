@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "IFeature_Vk.h"
 
@@ -84,6 +85,23 @@ class IFeature_VkwDx12 : public virtual IFeature_Vk
     ID3D12Fence* dx12FenceTextureCopy[VKDX12_BUFFER_COUNT] {};
     HANDLE vkSHForTextureCopy[VKDX12_BUFFER_COUNT] {};
     ULONG _fenceValue = 0;
+
+    // [DlssNr] AmdVkLateCopyWait (opt-in, off by default): the D3D12 queue Wait on the game's texture
+    // copies, held from ProcessVulkanTextures and queued by FlushCopyWait in CopyBackOutput, between
+    // Close and ExecuteCommandLists. It lives for one Evaluate: cleared when Evaluate starts, dropped
+    // by the guard in Evaluate when the call ends without reaching the Execute; ReleaseSyncResources
+    // clears its fence pointer. With the key off it is never set. Not owned: it points at
+    // dx12FenceTextureCopy[frame], which ReleaseSyncResources releases (and clears this first).
+    // "Held" is _copyWaitHeld, never the fence pointer: a hold whose fence is null (a partial
+    // CreateSharedFenceSemaphore failure) still counts as held, so it can never be skipped as
+    // "nothing held" and let the bridge list run without its Wait (FlushCopyWait fails it instead).
+    bool _copyWaitHeld = false;
+    ID3D12Fence* _copyWaitFence = nullptr;
+    UINT64 _copyWaitValue = 0;
+    uint32_t _copyWaitDrops = 0;
+
+    bool FlushCopyWait();
+    void DropCopyWait(bool frameEnded);
 
     // Copy shaders
     std::unique_ptr<ResourceCopy_Vk> ColorCopy = nullptr;

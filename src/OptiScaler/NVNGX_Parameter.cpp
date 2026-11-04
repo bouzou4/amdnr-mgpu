@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 
 #include "NVNGX_Parameter.h"
@@ -7,6 +8,8 @@
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
 #include <framegen/nvngx/Nvngx_FG.h>
+#include <proxies/FfxApi_Proxy.h>
+#include <hooks/Streamline_Hooks.h>
 
 /// @brief Calculates the resolution scaling ratio override based on the provided quality level and current
 /// configuration.
@@ -363,6 +366,32 @@ std::vector<std::string> NVNGX_Parameters::enumerate() const
         keys.push_back(value.first);
     }
     return keys;
+}
+
+std::vector<NGXPointerParameter> NVNGX_Parameters::enumeratePointerParameters() const
+{
+    const std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<NGXPointerParameter> parameters;
+
+    for (const auto& [name, parameter] : m_values)
+    {
+        // Parameter::operator= folds all three pointer types onto the void* key (see
+        // NVNGX_Parameter.h), so the stored key cannot tell a D3D12 resource from a D3D11
+        // one or from an opaque pointer. Reporting them all as OpaquePointer is the honest
+        // answer; the caller identifies the resource by querying it, not by trusting this.
+        if (parameter.key != typeid(void*).hash_code())
+            continue;
+
+        NGXPointerParameter entry {};
+        entry.name = name;
+        entry.kind = NGXPointerParameterKind::OpaquePointer;
+        entry.address = parameter.values.vp;
+
+        if (entry.address != nullptr)
+            parameters.push_back(std::move(entry));
+    }
+
+    return parameters;
 }
 
 template <typename T> void NVNGX_Parameters::setT(const char* key, T& value)
@@ -795,8 +824,29 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
             InParams->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
         }
 
-        InParams->Set("SuperSamplingDenoising.Available", 0);
-        InParams->Set("SuperSamplingDenoising.FeatureInitResult", 0);
+        // RAY RECONSTRUCTION IS AVAILABLE WHERE FSR RAY REGENERATION CAN SERVE IT.
+        //
+        // This table is what a title (or Streamline's sl.dlss_d on its behalf) reads to
+        // decide whether to offer Ray Reconstruction at all. On a non-NVIDIA card it said
+        // "not available", so the RR feature was never created and FSR-RR had nothing to
+        // work from - the Streamline spoofing alone could not fix that, because a game
+        // that checks NGX capabilities after Streamline says "supported" still saw a 0 here.
+        // The gate is the same one the menu, the provider and the Streamline hooks use
+        // (StreamlineHooks::rrCanServe): RDNA 4, RDNA 3 / 3.5 by default (AMDNR 0.3.4, owner decision;
+        // [FSR-RR] FfxDenoiserAllowPreRdna4 in the ini wins: true = any non-NVIDIA card, false = RDNA 4
+        // only) and a denoiser DLL, and D3D12, which is the only API the feature has.
+        const bool rrCanServe = api == API::DX12 && StreamlineHooks::rrCanServe();
+        InParams->Set("SuperSamplingDenoising.Available", rrCanServe ? 1 : 0);
+        InParams->Set("SuperSamplingDenoising.FeatureInitResult", rrCanServe ? (int) NVSDK_NGX_Result_Success : 0);
+        if (rrCanServe)
+        {
+            static bool logged = false;
+            if (!logged)
+            {
+                logged = true;
+                LOG_INFO("NGX capability: SuperSamplingDenoising.Available = 1 (FSR Ray Regeneration can serve DLSS-RR)");
+            }
+        }
     }
 
     if ((api == API::DX12 || api == API::Vulkan) && (State::Instance().activeFgInput == FGInput::DLSSG ||

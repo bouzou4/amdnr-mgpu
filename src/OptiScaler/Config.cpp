@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 
 #include "Config.h"
@@ -68,6 +69,7 @@ bool Config::Reload(std::filesystem::path iniPath)
         // Frame Generation
         {
             FGEnabled.set_from_config(readBool("FrameGen", "Enabled"));
+            ExternalFrameGeneration.set_from_config(readBool("FrameGen", "External"));
             FGDebugView.set_from_config(readBool("FrameGen", "DebugView"));
 
             if (auto FGInputString = readString("FrameGen", "FGInput"); FGInputString.has_value())
@@ -137,6 +139,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             }
 
             FGDrawUIOverFG.set_from_config(readBool("FrameGen", "DrawUIOverFG"));
+            FGAllowXeFGWithNativeXeFG.set_from_config(readBool("FrameGen", "AllowXeFGWithNativeXeFG"));
             FGUIPremultipliedAlpha.set_from_config(readBool("FrameGen", "UIPremultipliedAlpha"));
             FGDisableHudless.set_from_config(readBool("FrameGen", "DisableHudless"));
             FGDisableUI.set_from_config(readBool("FrameGen", "DisableUI"));
@@ -214,10 +217,20 @@ bool Config::Reload(std::filesystem::path iniPath)
         {
             FGXeFGInterpolationCount.set_from_config(readInt("XeFG", "InterpolationCount"));
             if (FGXeFGInterpolationCount.has_value() &&
-                (FGXeFGInterpolationCount.value() < 1 || FGXeFGInterpolationCount.value() > 3))
+                (FGXeFGInterpolationCount.value() < 1 || FGXeFGInterpolationCount.value() > XeFGMaxInterpolations))
                 FGXeFGInterpolationCount.reset();
 
+            FGXeFGUnlockEnabled.set_from_config(readBool("XeFG", "UnlockMFG"));
+            FGXeFGUnlockUnverified.set_from_config(readBool("XeFG", "UnlockUnverifiedBuilds"));
+            FGXeFGExtraPacing.set_from_config(readBool("XeFG", "ExtraPacing"));
+            FGXeFGPaceOnSwapchain.set_from_config(readBool("XeFG", "PaceOnSwapchain"));
+            FGXeFGMaxInterpolatedFrames.set_from_config(readInt("XeFG", "MaxInterpolatedFrames"));
+            if (FGXeFGMaxInterpolatedFrames.has_value() &&
+                (FGXeFGMaxInterpolatedFrames.value() < 1 || FGXeFGMaxInterpolatedFrames.value() > XeFGMaxInterpolations))
+                FGXeFGMaxInterpolatedFrames.reset();
+
             FGXeFGIgnoreInitChecks.set_from_config(readBool("XeFG", "IgnoreInitChecks"));
+            FGXeFGAllowDilatedMV.set_from_config(readBool("XeFG", "AllowDilatedMV"));
             FGXeFGUIComposition.set_from_config(readBool("XeFG", "UIComposition"));
             FGXeFGDepthInverted.set_from_config(readBool("XeFG", "DepthInverted"));
             FGXeFGJitteredMV.set_from_config(readBool("XeFG", "JitteredMV"));
@@ -314,6 +327,307 @@ bool Config::Reload(std::filesystem::path iniPath)
         {
             // Don't enable again if set false because of no nvngx found
             DLSSEnabled.set_from_config(readBool("DLSS", "Enabled"));
+
+            // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
+            DlssNrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
+            DlssNrRunBeforeSr.set_from_config(readBool("DlssNr", "RunBeforeSR"));
+            DlssNrApplyAfterRR.set_from_config(readBool("DlssNr", "ApplyAfterRR"));
+            DlssNrRRPasses.set_from_config(readUInt("DlssNr", "RRPasses"));
+            DlssNrRRWorkingScale.set_from_config(readFloat("DlssNr", "RRWorkingScale"));
+            DlssNrToggleKey.set_from_config(readInt("DlssNr", "ToggleKey"));
+            DlssNrCaptureKey.set_from_config(readInt("DlssNr", "CaptureKey"));
+            DlssNrTransferStrength.set_from_config(readFloat("DlssNr", "TransferStrength"));
+            DlssNrColourStrength.set_from_config(readFloat("DlssNr", "ColourStrength"));
+            DlssNrMaxRatio.set_from_config(readFloat("DlssNr", "MaxRatio"));
+            DlssNrTransfer.set_from_config(readUInt("DlssNr", "Transfer"));
+
+            DlssNrWhitePointFromExposure.set_from_config(readBool("DlssNr", "WhitePointFromExposure"));
+            DlssNrProbeD3D11.set_from_config(readBool("DlssNr", "ProbeD3D11"));
+            DlssNrDebugView.set_from_config(readUInt("DlssNr", "DebugView"));
+            DlssNrCompare.set_from_config(readUInt("DlssNr", "Compare"));
+            DlssNrCompareSplit.set_from_config(readFloat("DlssNr", "CompareSplit"));
+            DlssNrCompareZoom.set_from_config(readFloat("DlssNr", "CompareZoom"));
+            DlssNrCompareSwap.set_from_config(readBool("DlssNr", "CompareSwap"));
+            DlssNrCompareTags.set_from_config(readBool("DlssNr", "CompareTags"));
+            DlssNrTagScale.set_from_config(readFloat("DlssNr", "TagScale"));
+            DlssNrWorkingScale.set_from_config(readFloat("DlssNr", "WorkingScale"));
+
+            if (auto v = readEnum<Scaler>("DlssNr", "ScalingDownscaler"))
+                DlssNrScalingDownscaler.set_from_config(*v);
+            else
+                DlssNrScalingDownscaler.reset();
+            DlssNrProxyProbe.set_from_config(readBool("DlssNr", "ProxyProbe"));
+            DlssNrUseProxy.set_from_config(readBool("DlssNr", "UseProxy"));
+            DlssNrScanExposure.set_from_config(readBool("DlssNr", "ScanExposure"));
+            DlssNrWhitePointSource.set_from_config(readUInt("DlssNr", "WhitePointSource"));
+
+            // Migrate the retired flag only when the new key was genuinely absent, which is why this
+            // has to run AFTER the read above -- set_from_config assigns only into an empty optional,
+            // so an ini that carries both keys keeps its explicit WhitePointSource.
+            if (!DlssNrWhitePointSource.has_value() && DlssNrWhitePointFromExposure.has_value())
+                DlssNrWhitePointSource = DlssNrWhitePointFromExposure.value() ? 1u : 0u;
+            DlssNrScanMeter.set_from_config(readBool("DlssNr", "ScanMeter"));
+            DlssNrScanTrim.set_from_config(readFloat("DlssNr", "ScanTrim"));
+            DlssNrPasses.set_from_config(readUInt("DlssNr", "Passes"));
+            DlssNrScanAnchorValue.set_from_config(readFloat("DlssNr", "ScanAnchorValue"));
+            DlssNrScanAnchorWhitePoint.set_from_config(readFloat("DlssNr", "ScanAnchorWhitePoint"));
+            DlssNrScanAnchors.set_from_config(readString("DlssNr", "ScanAnchors"));
+            DlssNrBackend.set_from_config(readString("DlssNr", "NrBackend", true));
+            AmdStyleSlot1.set_from_config(readString("DlssNr", "StyleSlot1", true));
+            AmdStyleSlot2.set_from_config(readString("DlssNr", "StyleSlot2", true));
+            AmdStyleSlot3.set_from_config(readString("DlssNr", "StyleSlot3", true));
+            DlssNrScanInverted.set_from_config(readBool("DlssNr", "ScanInverted"));
+            DlssNrWhitePointTrim.set_from_config(readFloat("DlssNr", "WhitePointTrim"));
+            DlssNrAutoCapture.set_from_config(readBool("DlssNr", "AutoCapture"));
+            DlssNrWhitePointScale.set_from_config(readFloat("DlssNr", "WhitePointScale"));
+            DlssNrPreset.set_from_config(readUInt("DlssNr", "Preset"));
+            DlssNrIntensity.set_from_config(readFloat("DlssNr", "Intensity"));
+            DlssNrStyle.set_from_config(readUInt("DlssNr", "Style"));
+            DlssNrPass2Preset.set_from_config(readUInt("DlssNr", "Pass2Preset"));
+            DlssNrPass2Style.set_from_config(readUInt("DlssNr", "Pass2Style"));
+            DlssNrPass3Preset.set_from_config(readUInt("DlssNr", "Pass3Preset"));
+            DlssNrPass3Style.set_from_config(readUInt("DlssNr", "Pass3Style"));
+            DlssNrLocalStructure.set_from_config(readFloat("DlssNr", "LocalStructure"));
+            DlssNrLocalTone.set_from_config(readFloat("DlssNr", "LocalTone"));
+            AmdNeuralLighting.set_from_config(readBool("DlssNr", "AmdNeuralLighting"));
+            AmdNeuralLightingStrength.set_from_config(readFloat("DlssNr", "AmdNeuralLightingStrength"));
+            AmdEncoding.set_from_config(readInt("DlssNr", "AmdEncoding"));
+            AmdHighlightProxy.set_from_config(readInt("DlssNr", "AmdHighlightProxy"));
+            AmdHighlightProxyKnee.set_from_config(readFloat("DlssNr", "AmdHighlightProxyKnee"));
+            AmdHighlightProxyRange.set_from_config(readFloat("DlssNr", "AmdHighlightProxyRange"));
+            AmdSlots.set_from_config(readInt("DlssNr", "AmdSlots"));
+            AmdNrScale.set_from_config(readFloat("DlssNr", "AmdModelScale"));
+            AmdNrSizeStep.set_from_config(readInt("DlssNr", "AmdNrSizeStep"));
+            AmdTemporalStability.set_from_config(readFloat("DlssNr", "AmdTemporalStability"));
+            AmdStabilityMode.set_from_config(readInt("DlssNr", "AmdStabilityMode"));
+            AmdInterleaveFill.set_from_config(readInt("DlssNr", "AmdInterleaveFill"));
+            AmdInterleaveSharp.set_from_config(readBool("DlssNr", "AmdInterleaveSharp"));
+            AmdInterleaveDebug.set_from_config(readInt("DlssNr", "AmdInterleaveDebug"));
+            AmdInterleavePreset.set_from_config(readInt("DlssNr", "AmdInterleavePreset"));
+            AmdInterleavePacing.set_from_config(readFloat("DlssNr", "AmdInterleavePacing"));
+            AmdInterleaveGhostBound.set_from_config(readFloat("DlssNr", "AmdInterleaveGhostBound"));
+
+            // FSR Ray Regeneration. Declared in Config.h since the port; without these
+            // two blocks none of it persisted, so every tuning change was lost on exit
+            // and the RR path ran on compile-time defaults only.
+            FfxDenoiserIndex.set_from_config(readInt("FSR-RR", "FfxDenoiserIndex"));
+            // 64-bit on purpose: the composition debug views sit above bit 32 (SkipSignal is
+            // 0x500000000), which the 32-bit readInt refused as out of range, so none of them could
+            // be chosen from the ini. Decimal or 0x hex; anything else leaves the key on auto.
+            if (auto s = readString("FSR-RR", "FfxDenoiserDebugMode"); s.has_value() && !s->empty() && s->front() != '-')
+            {
+                try
+                {
+                    const bool hex = s->size() > 2 && (*s)[0] == '0' && ((*s)[1] == 'x' || (*s)[1] == 'X');
+                    size_t idx = 0;
+                    const uint64_t mode = std::stoull(*s, &idx, hex ? 16 : 10);
+                    if (idx == s->size())
+                        FfxDenoiserDebugMode.set_from_config(mode);
+                }
+                catch (const std::exception&) // not a number, or out of range for 64 bits
+                {
+                }
+            }
+            FfxDenoiserDebugViewport.set_from_config(readInt("FSR-RR", "FfxDenoiserDebugViewport"));
+            FfxDenoiserInternalDebugViews.set_from_config(readBool("FSR-RR", "FfxDenoiserInternalDebugViews"));
+            FfxDenoiserDiffuseSignalType.set_from_config(readInt("FSR-RR", "FfxDenoiserDiffuseSignalType"));
+            FfxDenoiserSpecularSignalType.set_from_config(readInt("FSR-RR", "FfxDenoiserSpecularSignalType"));
+            FfxDenoiserDenoiseDiffuse.set_from_config(readBool("FSR-RR", "FfxDenoiserDenoiseDiffuse"));
+            FfxDenoiserDenoiseSpecular.set_from_config(readBool("FSR-RR", "FfxDenoiserDenoiseSpecular"));
+            FfxDenoiserTaggedAmbientOcclusion.set_from_config(readBool("FSR-RR", "FfxDenoiserTaggedAmbientOcclusion"));
+            FfxDenoiserNormalsInViewSpace.set_from_config(readBool("FSR-RR", "FfxDenoiserNormalsInViewSpace"));
+            FfxDenoiserUseTitleLinearDepth.set_from_config(readBool("FSR-RR", "FfxDenoiserUseTitleLinearDepth"));
+            FfxDenoiserResponsivityThreshold.set_from_config(readFloat("FSR-RR", "FfxDenoiserResponsivityThreshold"));
+            FfxDenoiserResponsivityInvert.set_from_config(readBool("FSR-RR", "FfxDenoiserResponsivityInvert"));
+            FfxDenoiserBiasMaskStrength.set_from_config(readFloat("FSR-RR", "FfxDenoiserBiasMaskStrength"));
+            FfxDenoiserFloorDetailBoost.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorDetailBoost"));
+            FfxDenoiserFloorNormalSharpness.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorNormalSharpness"));
+            FfxDenoiserFloorAlbedoGuide.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorAlbedoGuide"));
+            FfxDenoiserFloorLumSymmetry.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorLumSymmetry"));
+            FfxDenoiserFloorGrazingSharpness.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorGrazingSharpness"));
+            FfxDenoiserFloorEnvelopeBias.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorEnvelopeBias"));
+            FfxDenoiserFloorSoftMin.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorSoftMin"));
+            FfxDenoiserHardwareDepth.set_from_config(readBool("FSR-RR", "FfxDenoiserHardwareDepth"));
+            FfxDenoiserUseAmdDefaults.set_from_config(readBool("FSR-RR", "FfxDenoiserUseAmdDefaults"));
+            FfxDenoiserAllowPreRdna4.set_from_config(readBool("FSR-RR", "FfxDenoiserAllowPreRdna4"));
+            FfxDenoiserPathTracedProfile.set_from_config(readBool("FSR-RR", "FfxDenoiserPathTracedProfile"));
+            FfxDenoiserProfileTextureRoute.set_from_config(readFloat("FSR-RR", "FfxDenoiserProfileTextureRoute"));
+            // AMDNR 0.3.4 (Config.h): the profile's temporal half, saved; the two experimental switches, never saved.
+            FfxDenoiserPathTracedTemporal.set_from_config(readBool("FSR-RR", "FfxDenoiserPathTracedTemporal"));
+            FfxDenoiserAlbedoFp16.set_from_config(readBool("FSR-RR", "FfxDenoiserAlbedoFp16"));
+            FfxDenoiserNgxDirectSLConstants.set_from_config(readBool("FSR-RR", "FfxDenoiserNgxDirectSLConstants"));
+            FfxDenoiserSkinSmoothing.set_from_config(readBool("FSR-RR", "FfxDenoiserSkinSmoothing"));
+            FfxDenoiserSkinSmoothingStrength.set_from_config(readFloat("FSR-RR", "FfxDenoiserSkinSmoothingStrength"));
+            FfxDenoiserSkinSmoothingRadius.set_from_config(readInt("FSR-RR", "FfxDenoiserSkinSmoothingRadius"));
+            FfxDenoiserSkinSmoothingShowMask.set_from_config(readBool("FSR-RR", "FfxDenoiserSkinSmoothingShowMask"));
+            FfxDenoiserSkinSmoothingGuideLow.set_from_config(readFloat("FSR-RR", "FfxDenoiserSkinSmoothingGuideLow"));
+            FfxDenoiserSkinSmoothingGuideHigh.set_from_config(readFloat("FSR-RR", "FfxDenoiserSkinSmoothingGuideHigh"));
+            FfxDenoiserSkinSmoothingClassifier.set_from_config(readInt("FSR-RR", "FfxDenoiserSkinSmoothingClassifier"));
+            FfxDenoiserSkinSmoothingMovedLow.set_from_config(readFloat("FSR-RR", "FfxDenoiserSkinSmoothingMovedLow"));
+            FfxDenoiserSkinSmoothingMovedHigh.set_from_config(readFloat("FSR-RR", "FfxDenoiserSkinSmoothingMovedHigh"));
+            FfxDenoiserSkinSmoothingShowCues.set_from_config(readBool("FSR-RR", "FfxDenoiserSkinSmoothingShowCues"));
+            FfxDenoiserDisocThreshold.set_from_config(readFloat("FSR-RR", "FfxDenoiserDisocThreshold"));
+            FfxDenoiserCrossBlNormStr.set_from_config(readFloat("FSR-RR", "FfxDenoiserCrossBlNormStr"));
+            FfxDenoiserStabilityBias.set_from_config(readFloat("FSR-RR", "FfxDenoiserStabilityBias"));
+            FfxDenoiserMaxRadiance.set_from_config(readFloat("FSR-RR", "FfxDenoiserMaxRadiance"));
+            FfxDenoiserRadianceClip.set_from_config(readFloat("FSR-RR", "FfxDenoiserRadianceClip"));
+            FfxDenoiserGaussKernRelax.set_from_config(readFloat("FSR-RR", "FfxDenoiserGaussKernRelax"));
+            FfxDenoiserDebugDepthMax.set_from_config(readFloat("FSR-RR", "FfxDenoiserDebugDepthMax"));
+            FfxDenoiserDiagnostics.set_from_config(readBool("FSR-RR", "FfxDenoiserDiagnostics"));
+            FfxDenoiserCorrelationBias.set_from_config(readFloat("FSR-RR", "FfxDenoiserCorrelationBias"));
+            FfxDenoiserDiffuseHitDistance.set_from_config(readBool("FSR-RR", "FfxDenoiserDiffuseHitDistance"));
+            FfxDenoiserFloorIsolation.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorIsolation"));
+            FfxDenoiserRoughnessFloor.set_from_config(readFloat("FSR-RR", "FfxDenoiserRoughnessFloor"));
+            FfxDenoiserFloorHandover.set_from_config(readInt("FSR-RR", "FfxDenoiserFloorHandover"));
+            FfxDenoiserFloorHandoverStrength.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorHandoverStrength"));
+            FfxDenoiserFloorRawBlend.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorRawBlend"));
+            FfxDenoiserDemodDivisorFloor.set_from_config(readFloat("FSR-RR", "FfxDenoiserDemodDivisorFloor"));
+            FfxDenoiserFloorClampSmoothing.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorClampSmoothing"));
+            FfxDenoiserFloorStructureGate.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorStructureGate"));
+            FfxDenoiserFloorHandoverDetail.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorHandoverDetail"));
+            FfxDenoiserFloorHandoverAnchorClamp.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorHandoverAnchorClamp"));
+            FfxDenoiserFloorHandoverCorrelationMix.set_from_config(readFloat("FSR-RR", "FfxDenoiserFloorHandoverCorrelationMix"));
+            AmdInterleaveFreshHistory.set_from_config(readBool("DlssNr", "AmdInterleaveFreshHistory"));
+            AmdInterleaveModelHistory.set_from_config(readBool("DlssNr", "AmdInterleaveModelHistory"));
+            AmdLmxxfHistory.set_from_config(readBool("DlssNr", "AmdLmxxfHistory"));
+            LmxxfFullNetwork.set_from_config(readBool("DlssNr", "LmxxfFullNetwork"));
+            AmdLmxxfEditDetail.set_from_config(readFloat("DlssNr", "AmdLmxxfEditDetail"));
+            AmdLmxxfEditSaturation.set_from_config(readFloat("DlssNr", "AmdLmxxfEditSaturation"));
+            AmdLmxxfAutoExposure.set_from_config(readBool("DlssNr", "AmdLmxxfAutoExposure"));
+            AmdLmxxfHighlightChromaGuard.set_from_config(readBool("DlssNr", "AmdLmxxfHighlightChromaGuard"));
+            AmdLmxxfAutoExposureHighlightCap.set_from_config(readBool("DlssNr", "AmdLmxxfAutoExposureHighlightCap"));
+            AmdLmxxfEdgeGuard.set_from_config(readFloat("DlssNr", "AmdLmxxfEdgeGuard"));
+            AmdLmxxfOutputSmooth.set_from_config(readFloat("DlssNr", "AmdLmxxfOutputSmooth"));
+            AmdInterleaveAdaptive.set_from_config(readBool("DlssNr", "AmdInterleaveAdaptive"));
+            AmdInterleaveAdaptiveSensitivity.set_from_config(readInt("DlssNr", "AmdInterleaveAdaptiveSensitivity"));
+            AmdJitterSign.set_from_config(readInt("DlssNr", "AmdJitterSign"));
+            AmdNetworkOutput.set_from_config(readBool("DlssNr", "AmdNetworkOutput"));
+            AmdResidualIntensity.set_from_config(readFloat("DlssNr", "AmdResidualIntensity"));
+            AmdResidualLimit.set_from_config(readFloat("DlssNr", "AmdResidualLimit"));
+            AmdResidualFade.set_from_config(readFloat("DlssNr", "AmdResidualFade"));
+            AmdEditShaper.set_from_config(readBool("DlssNr", "AmdEditShaper")); // kill switch, never saved
+            // AMDNR 0.3.4 (Config.h): shaper modes, never saved; highlight guard and runtime knobs, saved; tier snap and
+            // tier cap, never saved.
+            AmdEditShaperLimit.set_from_config(readInt("DlssNr", "AmdEditShaperLimit"));
+            AmdEditShaperScope.set_from_config(readInt("DlssNr", "AmdEditShaperScope"));
+            AmdEditShaperCarryCap.set_from_config(readBool("DlssNr", "AmdEditShaperCarryCap"));
+            AmdDanielHighlightGuard.set_from_config(readBool("DlssNr", "AmdDanielHighlightGuard"));
+            AmdRuntimeStyle.set_from_config(readInt("DlssNr", "AmdRuntimeStyle"));
+            AmdToneCurve.set_from_config(readInt("DlssNr", "AmdToneCurve"));
+            AmdToneLift.set_from_config(readFloat("DlssNr", "AmdToneLift"));
+            AmdUseGameExposure.set_from_config(readInt("DlssNr", "AmdUseGameExposure"));
+            AmdDanielFastMode.set_from_config(readBool("DlssNr", "AmdDanielFastMode")); // (0.3.4, danielblnc support) saved
+            AmdLmxxfTierSnap.set_from_config(readBool("DlssNr", "AmdLmxxfTierSnap"));
+            AmdLmxxfTierCap.set_from_config(readInt("DlssNr", "AmdLmxxfTierCap"));
+            AmdLmxxfFastMode.set_from_config(readBool("DlssNr", "AmdLmxxfFastMode")); // (0.3.4, lmxxf Fast mode) saved
+            AmdResidualTemporal.set_from_config(readBool("DlssNr", "AmdResidualTemporal"));
+            AmdStabilityThreshold.set_from_config(readFloat("DlssNr", "AmdStabilityThreshold"));
+            AmdStabilityStaticRelax.set_from_config(readFloat("DlssNr", "AmdStabilityStaticRelax"));
+            AmdStabilityStaticDebug.set_from_config(readBool("DlssNr", "AmdStabilityStaticDebug"));
+            AmdDetailStrength.set_from_config(readFloat("DlssNr", "AmdDetailStrength"));
+            AmdColourStrength.set_from_config(readFloat("DlssNr", "AmdColourStrength"));
+            AmdComposition.set_from_config(readUInt("DlssNr", "AmdComposition"));
+            AmdComposeDetail.set_from_config(readFloat("DlssNr", "AmdComposeDetail"));
+            AmdComposeColour.set_from_config(readFloat("DlssNr", "AmdComposeColour"));
+            AmdSharpness.set_from_config(readFloat("DlssNr", "AmdSharpness"));
+            AmdDynamicRes.set_from_config(readBool("DlssNr", "AmdDynamicRes"));
+            AmdDynamicTargetFps.set_from_config(readInt("DlssNr", "AmdDynamicTargetFps"));
+            AmdInterleave.set_from_config(readFloat("DlssNr", "AmdInterleave"));
+            AmdGraphicsWaitExperimental.set_from_config(readBool("DlssNr", "AmdGraphicsWaitExperimental"));
+            AmdEveryFrame.set_from_config(readBool("DlssNr", "AmdEveryFrame"));
+            AmdFinalImage.set_from_config(readBool("DlssNr", "AmdFinalImage"));
+            AmdSpinDraw.set_from_config(readInt("DlssNr", "AmdSpinDraw"));
+            AmdVkLateCopyWait.set_from_config(readBool("DlssNr", "AmdVkLateCopyWait"));
+            // Competitor-audit fixes (0.3.3.2 rebuild): kill switches, never saved
+            AmdNrColourGuard.set_from_config(readBool("DlssNr", "AmdNrColourGuard"));
+            AmdSkipUnwrittenFrames.set_from_config(readBool("DlssNr", "AmdSkipUnwrittenFrames"));
+            AmdNeuralListRecovery.set_from_config(readBool("DlssNr", "AmdNeuralListRecovery"));
+            AmdDeviceGate.set_from_config(readBool("DlssNr", "AmdDeviceGate"));
+            AmdOneStreamPerFrame.set_from_config(readBool("DlssNr", "AmdOneStreamPerFrame"));
+            AmdLateSubmitGrace.set_from_config(readBool("DlssNr", "AmdLateSubmitGrace")); // (0.3.4, P3) kill switch, never saved
+            AmdStreamlineDeviceFix.set_from_config(readBool("DlssNr", "AmdStreamlineDeviceFix")); // (0.3.4, P1) kill switch, never saved
+            AmdRtgiEnabled.set_from_config(readBool("AmdRtgi", "Enabled"));
+            AmdRtgiQuality.set_from_config(readUInt("AmdRtgi", "Quality"));
+            AmdRtgiDenoiser.set_from_config(readUInt("AmdRtgi", "Denoiser"));
+            AmdRtgiInspect.set_from_config(readUInt("AmdRtgi", "Inspect"));
+            AmdRtgiContact.set_from_config(readFloat("AmdRtgi", "Contact"));
+            AmdRtgiSaturation.set_from_config(readFloat("AmdRtgi", "Saturation"));
+            AmdRtgiRadius.set_from_config(readFloat("AmdRtgi", "Radius"));
+            AmdRtgiMix.set_from_config(readFloat("AmdRtgi", "Mix"));
+            AmdRtgiLighting.set_from_config(readFloat("AmdRtgi", "Lighting"));
+            AmdRtgiOcclusion.set_from_config(readFloat("AmdRtgi", "Occlusion"));
+            AmdRtgiAmbient.set_from_config(readFloat("AmdRtgi", "Ambient"));
+            AmdRtgiThickness.set_from_config(readFloat("AmdRtgi", "Thickness"));
+            AmdRtgiSmoothness.set_from_config(readFloat("AmdRtgi", "Smoothness"));
+            AmdRtgiFade.set_from_config(readFloat("AmdRtgi", "Fade"));
+            AmdRtgiFov.set_from_config(readFloat("AmdRtgi", "Fov"));
+            AmdRtgiFarPlane.set_from_config(readFloat("AmdRtgi", "FarPlane"));
+            // (0.3.4 preview) AMDNR Screen GI
+            AmdGiEnabled.set_from_config(readBool("AmdGi", "Enabled"));
+            AmdGiQuality.set_from_config(readInt("AmdGi", "Quality"));
+            AmdGiIntensity.set_from_config(readFloat("AmdGi", "Intensity"));
+            AmdGiOcclusion.set_from_config(readFloat("AmdGi", "Occlusion"));
+            AmdGiRadius.set_from_config(readFloat("AmdGi", "Radius"));
+            AmdGiThickness.set_from_config(readFloat("AmdGi", "Thickness"));
+            AmdGiSaturation.set_from_config(readFloat("AmdGi", "Saturation"));
+            AmdGiSky.set_from_config(readFloat("AmdGi", "Sky"));
+            AmdGiFeedback.set_from_config(readFloat("AmdGi", "Feedback"));
+            AmdGiPlacement.set_from_config(readInt("AmdGi", "Placement"));
+            AmdGiFov.set_from_config(readFloat("AmdGi", "Fov"));
+            AmdGiFovAxis.set_from_config(readInt("AmdGi", "FovAxis"));
+            AmdGiNearFade.set_from_config(readFloat("AmdGi", "NearFade"));
+            AmdGiDistanceFade.set_from_config(readFloat("AmdGi", "DistanceFade"));
+            AmdGiEncoding.set_from_config(readInt("AmdGi", "Encoding"));
+            // not saved: debug view and the hidden experiment keys
+            AmdGiDebugView.set_from_config(readInt("AmdGi", "DebugView"));
+            AmdGiDepthConvention.set_from_config(readInt("AmdGi", "DepthConvention"));
+            AmdGiTraceCap.set_from_config(readFloat("AmdGi", "TraceCap"));
+            AmdGiAlbedoMode.set_from_config(readInt("AmdGi", "AlbedoMode"));
+            AmdGiAoLitProtect.set_from_config(readFloat("AmdGi", "AoLitProtect"));
+            AmdGiTranslucency.set_from_config(readInt("AmdGi", "Translucency"));
+            AmdLookEnabled.set_from_config(readBool("AmdLook", "Enabled"));
+            AmdLookAppearance.set_from_config(readUInt("AmdLook", "Appearance"));
+            AmdLookMix.set_from_config(readFloat("AmdLook", "Mix"));
+            AmdLookMaterialDetail.set_from_config(readFloat("AmdLook", "MaterialDetail"));
+            AmdLookShapeDefinition.set_from_config(readFloat("AmdLook", "ShapeDefinition"));
+            AmdLookLocalLighting.set_from_config(readFloat("AmdLook", "LocalLighting"));
+            AmdLookSkinDetail.set_from_config(readFloat("AmdLook", "SkinDetail"));
+            AmdLookSkinSoftness.set_from_config(readFloat("AmdLook", "SkinSoftness"));
+            AmdLookDetectSkin.set_from_config(readBool("AmdLook", "DetectSkin"));
+            AmdLookSpecularControl.set_from_config(readFloat("AmdLook", "SpecularControl"));
+            AmdLookHighlightRollOff.set_from_config(readFloat("AmdLook", "HighlightRollOff"));
+            AmdLookColourSeparation.set_from_config(readFloat("AmdLook", "ColourSeparation"));
+            AmdLookShadowDepth.set_from_config(readFloat("AmdLook", "ShadowDepth"));
+            AmdLookAntiHalo.set_from_config(readFloat("AmdLook", "AntiHalo"));
+            AmdLookFlatAreaProtection.set_from_config(readFloat("AmdLook", "FlatAreaProtection"));
+            AmdLookInspect.set_from_config(readUInt("AmdLook", "Inspect"));
+            AmdLookTone.set_from_config(readFloat("AmdLook", "Tone"));
+            AmdLookExposureEV.set_from_config(readFloat("AmdLook", "ExposureEV"));
+            AmdLookContrast.set_from_config(readFloat("AmdLook", "Contrast"));
+            AmdLookSaturation.set_from_config(readFloat("AmdLook", "Saturation"));
+            AmdLookHighlightCompression.set_from_config(readFloat("AmdLook", "HighlightCompression"));
+            DlssNrSkinStructure.set_from_config(readFloat("DlssNr", "SkinStructure"));
+            DlssNrAutoMask.set_from_config(readBool("DlssNr", "AutoMask"));
+            DlssNrSkinProtection.set_from_config(readBool("DlssNr", "SkinProtection"));
+            DlssNrSkinToneEnabled.set_from_config(readBool("DlssNr", "SkinToneEnabled"));
+            DlssNrSkinDetail.set_from_config(readFloat("DlssNr", "SkinDetail"));
+            DlssNrSkinColour.set_from_config(readFloat("DlssNr", "SkinColour"));
+            DlssNrEnvironmentDetail.set_from_config(readFloat("DlssNr", "EnvironmentDetail"));
+            DlssNrEnvironmentColour.set_from_config(readFloat("DlssNr", "EnvironmentColour"));
+            DlssNrShowSkinMask.set_from_config(readBool("DlssNr", "ShowSkinMask"));
+            DlssNrPass2Intensity.set_from_config(readFloat("DlssNr", "Pass2Intensity"));
+            DlssNrPass2LocalStructure.set_from_config(readFloat("DlssNr", "Pass2LocalStructure"));
+            DlssNrPass2LocalTone.set_from_config(readFloat("DlssNr", "Pass2LocalTone"));
+            DlssNrPass2SkinStructure.set_from_config(readFloat("DlssNr", "Pass2SkinStructure"));
+            DlssNrPass2AutoMask.set_from_config(readBool("DlssNr", "Pass2AutoMask"));
+            DlssNrPass3Intensity.set_from_config(readFloat("DlssNr", "Pass3Intensity"));
+            DlssNrPass3LocalStructure.set_from_config(readFloat("DlssNr", "Pass3LocalStructure"));
+            DlssNrPass3LocalTone.set_from_config(readFloat("DlssNr", "Pass3LocalTone"));
+            DlssNrPass3SkinStructure.set_from_config(readFloat("DlssNr", "Pass3SkinStructure"));
+            DlssNrPass3AutoMask.set_from_config(readBool("DlssNr", "Pass3AutoMask"));
+            DlssNrReversibleMode.set_from_config(readUInt("DlssNr", "ReversibleMode"));
+            DlssNrApplyModel.set_from_config(readBool("DlssNr", "ApplyModel"));
+            DlssNrHoldFrame.set_from_config(readBool("DlssNr", "HoldFrame"));
             UseGenericAppIdWithDlss.set_from_config(readBool("DLSS", "UseGenericAppIdWithDlss"));
 
             RenderPresetOverride.set_from_config(readBool("DLSS", "RenderPresetOverride"));
@@ -408,6 +722,10 @@ bool Config::Reload(std::filesystem::path iniPath)
             LogSingleFile.set_from_config(readBool("Log", "SingleFile"));
             LogAsync.set_from_config(readBool("Log", "LogAsync"));
             LogAsyncThreads.set_from_config(readInt("Log", "LogAsyncThreads"));
+            // AMDNR 0.3.4 (Config.h): read at startup, never saved.
+            KeepPreviousLogs.set_from_config(readInt("Log", "KeepPreviousLogs"));
+            CrashHandler.set_from_config(readBool("Log", "CrashHandler"));
+            CrashDump.set_from_config(readBool("Log", "CrashDump"));
 
             {
                 auto setting = readString("Log", "LogFileName", false);
@@ -447,6 +765,11 @@ bool Config::Reload(std::filesystem::path iniPath)
 
             if (auto setting = readFloat("Sharpness", "Sharpness"); setting.has_value())
                 Sharpness.set_from_config(std::clamp(setting.value(), 0.0f, 1.3f));
+
+            // (AMDNR 0.3.4.2, RN3) The sharpening after Ray Regeneration when the title sends none, a hard-coded
+            // constant until now: clamped to the range FSR SR takes, auto = the shipped default.
+            if (auto setting = readFloat("Sharpness", "RrDefaultSharpness"); setting.has_value())
+                RrDefaultSharpness.set_from_config(std::clamp(setting.value(), 0.0f, 1.0f));
         }
 
         // Menu
@@ -504,6 +827,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             HookOriginalNvngxOnly.set_from_config(readBool("Hooks", "HookOriginalNvngxOnly"));
             EarlyHooking.set_from_config(readBool("Hooks", "EarlyHooking"));
             UseNtdllHooks.set_from_config(readBool("Hooks", "UseNtdllHooks"));
+            SkipOwnVulkanObjects.set_from_config(readBool("Hooks", "SkipOwnVulkanObjects"));
         }
 
         // RCAS
@@ -613,8 +937,17 @@ bool Config::Reload(std::filesystem::path iniPath)
                 AnisotropyOverride.reset();
 
             AnisotropySkipPointFilter.set_from_config(readBool("Anisotropy", "SkipPointFilter"));
-            AnisotropyModifyComp.set_from_config(readBool("Anisotropy", "AFModifyComparison"));
-            AnisotropyModifyMinMax.set_from_config(readBool("Anisotropy", "AFModifyMinMax"));
+            // X-AF (AMDNR 0.3.4): SaveIni writes ModifyComparison / ModifyMinMax, but only the AF* names were read, so
+            // a saved value never came back. The written name first; the AF* name still counts when it alone is set.
+            if (auto setting = readBool("Anisotropy", "ModifyComparison"); setting.has_value())
+                AnisotropyModifyComp.set_from_config(setting);
+            else
+                AnisotropyModifyComp.set_from_config(readBool("Anisotropy", "AFModifyComparison"));
+
+            if (auto setting = readBool("Anisotropy", "ModifyMinMax"); setting.has_value())
+                AnisotropyModifyMinMax.set_from_config(setting);
+            else
+                AnisotropyModifyMinMax.set_from_config(readBool("Anisotropy", "AFModifyMinMax"));
         }
 
         // Mipmap
@@ -663,6 +996,25 @@ bool Config::Reload(std::filesystem::path iniPath)
             ExposureResourceBarrier.set_from_config(readInt("Hotfix", "ExposureResourceBarrier"));
             OutputResourceBarrier.set_from_config(readInt("Hotfix", "OutputResourceBarrier"));
             CreateD3D12DeviceForLuma.set_from_config(readBool("Hotfix", "CreateD3D12DeviceForLuma"));
+
+            // Crash-triage kill switches (see Config.h). Not saved by SaveIni.
+            DiagNoInputHooks.set_from_config(readBool("Hotfix", "DiagNoInputHooks"));
+            DiagInputHooksSkip.set_from_config(readString("Hotfix", "DiagInputHooksSkip", true));
+            DiagNoAmdxc64Hooks.set_from_config(readBool("Hotfix", "DiagNoAmdxc64Hooks"));
+            DiagNoStreamlineHooks.set_from_config(readBool("Hotfix", "DiagNoStreamlineHooks"));
+            DiagNoAntiLag2.set_from_config(readBool("Hotfix", "DiagNoAntiLag2"));
+            DiagNoTrustHooks.set_from_config(readBool("Hotfix", "DiagNoTrustHooks"));
+            DiagNoFfxProxies.set_from_config(readBool("Hotfix", "DiagNoFfxProxies"));
+            DiagNoXessProxies.set_from_config(readBool("Hotfix", "DiagNoXessProxies"));
+            DiagNoSwapchainWrap.set_from_config(readBool("Hotfix", "DiagNoSwapchainWrap"));
+            DiagNoOverlay.set_from_config(readBool("Hotfix", "DiagNoOverlay"));
+            DiagNoD3D12Hooks.set_from_config(readBool("Hotfix", "DiagNoD3D12Hooks"));
+            DiagNoAmdGpuProbe.set_from_config(readBool("Hotfix", "DiagNoAmdGpuProbe"));
+
+            // AMDNR 0.3.4 (Config.h): read at startup, not saved by SaveIni.
+            MenuToggleDebounceMs.set_from_config(readInt("Hotfix", "MenuToggleDebounceMs"));
+            MenuLowLevelHookPassThrough.set_from_config(readBool("Hotfix", "MenuLowLevelHookPassThrough"));
+            WarnMissingREFramework.set_from_config(readBool("Hotfix", "WarnMissingREFramework"));
         }
 
         // Dx11 with Dx12
@@ -879,6 +1231,7 @@ bool Config::SaveIni()
     // Frame Generation
     {
         ini.SetValue("FrameGen", "Enabled", GetBoolValue(Instance()->FGEnabled.value_for_config()).c_str());
+        ini.SetValue("FrameGen", "External", GetBoolValue(Instance()->ExternalFrameGeneration.value_for_config()).c_str());
         ini.SetValue("FrameGen", "DebugView", GetBoolValue(Instance()->FGDebugView.value_for_config()).c_str());
         std::string FGInputString = "auto";
         if (auto FGInputHeld = Instance()->FGInput.value_for_config(); FGInputHeld.has_value())
@@ -935,6 +1288,7 @@ bool Config::SaveIni()
 
         ini.SetValue("FrameGen", "FTInput", GetIntValue(ftInput).c_str());
         ini.SetValue("FrameGen", "DrawUIOverFG", GetBoolValue(Instance()->FGDrawUIOverFG.value_for_config()).c_str());
+        ini.SetValue("FrameGen", "AllowXeFGWithNativeXeFG", GetBoolValue(Instance()->FGAllowXeFGWithNativeXeFG.value_for_config()).c_str());
         ini.SetValue("FrameGen", "UIPremultipliedAlpha",
                      GetBoolValue(Instance()->FGUIPremultipliedAlpha.value_for_config()).c_str());
         ini.SetValue("FrameGen", "DisableHudless",
@@ -994,8 +1348,16 @@ bool Config::SaveIni()
     {
         ini.SetValue("XeFG", "InterpolationCount",
                      GetIntValue(Instance()->FGXeFGInterpolationCount.value_for_config()).c_str());
+        ini.SetValue("XeFG", "UnlockMFG", GetBoolValue(Instance()->FGXeFGUnlockEnabled.value_for_config()).c_str());
+        ini.SetValue("XeFG", "ExtraPacing", GetBoolValue(Instance()->FGXeFGExtraPacing.value_for_config()).c_str());
+        ini.SetValue("XeFG", "PaceOnSwapchain",
+                     GetBoolValue(Instance()->FGXeFGPaceOnSwapchain.value_for_config()).c_str());
+        ini.SetValue("XeFG", "MaxInterpolatedFrames",
+                     GetIntValue(Instance()->FGXeFGMaxInterpolatedFrames.value_for_config()).c_str());
         ini.SetValue("XeFG", "IgnoreInitChecks",
                      GetBoolValue(Instance()->FGXeFGIgnoreInitChecks.value_for_config()).c_str());
+        ini.SetValue("XeFG", "AllowDilatedMV",
+                     GetBoolValue(Instance()->FGXeFGAllowDilatedMV.value_for_config()).c_str());
         ini.SetValue("XeFG", "UIComposition", GetBoolValue(Instance()->FGXeFGUIComposition.value_for_config()).c_str());
         ini.SetValue("XeFG", "DepthInverted", GetBoolValue(Instance()->FGXeFGDepthInverted.value_for_config()).c_str());
         ini.SetValue("XeFG", "JitteredMV", GetBoolValue(Instance()->FGXeFGJitteredMV.value_for_config()).c_str());
@@ -1141,6 +1503,300 @@ bool Config::SaveIni()
     // DLSS
     {
         ini.SetValue("DLSS", "Enabled", GetBoolValue(Instance()->DLSSEnabled.value_for_config()).c_str());
+
+    // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) ---
+    ini.SetValue("DlssNr", "Enabled", GetBoolValue(Instance()->DlssNrEnabled.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RunBeforeSR",
+                 GetBoolValue(Instance()->DlssNrRunBeforeSr.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ApplyAfterRR",
+                 GetBoolValue(Instance()->DlssNrApplyAfterRR.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RRPasses",
+                 GetIntValue(Instance()->DlssNrRRPasses.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "RRWorkingScale",
+                 GetFloatValue(Instance()->DlssNrRRWorkingScale.value_for_config()).c_str());
+    {
+        auto toggle = Instance()->DlssNrToggleKey.value_for_config();
+        ini.SetValue("DlssNr", "ToggleKey", GetIntValue(toggle, toggle > 0).c_str());
+        auto captureKey = Instance()->DlssNrCaptureKey.value_for_config();
+        ini.SetValue("DlssNr", "CaptureKey", GetIntValue(captureKey, captureKey > 0).c_str());
+    }
+    ini.SetValue("DlssNr", "TransferStrength",
+                 GetFloatValue(Instance()->DlssNrTransferStrength.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ColourStrength",
+                 GetFloatValue(Instance()->DlssNrColourStrength.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "MaxRatio", GetFloatValue(Instance()->DlssNrMaxRatio.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Transfer", GetIntValue(Instance()->DlssNrTransfer.value_for_config()).c_str());
+
+    ini.SetValue("DlssNr", "ProbeD3D11",
+                 GetBoolValue(Instance()->DlssNrProbeD3D11.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "WhitePointFromExposure",
+                 GetBoolValue(Instance()->DlssNrWhitePointFromExposure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "DebugView", GetIntValue(Instance()->DlssNrDebugView.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Compare", GetIntValue(Instance()->DlssNrCompare.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "CompareSplit",
+                 GetFloatValue(Instance()->DlssNrCompareSplit.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "CompareZoom",
+                 GetFloatValue(Instance()->DlssNrCompareZoom.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "CompareSwap",
+                 GetBoolValue(Instance()->DlssNrCompareSwap.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "CompareTags",
+                 GetBoolValue(Instance()->DlssNrCompareTags.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "TagScale",
+                 GetFloatValue(Instance()->DlssNrTagScale.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "WorkingScale", GetFloatValue(Instance()->DlssNrWorkingScale.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScalingDownscaler", GetIntValue(Instance()->DlssNrScalingDownscaler).c_str());
+    ini.SetValue("DlssNr", "AutoCapture", GetBoolValue(Instance()->DlssNrAutoCapture.value_for_config()).c_str());
+
+    // These were read every launch but never written, so nothing set through the menu survived a
+    // restart -- the white-point source, both trims, the anchor, the pass count and the rest all
+    // reset to default on the next run.
+    ini.SetValue("DlssNr", "WhitePointSource", GetIntValue(Instance()->DlssNrWhitePointSource.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "WhitePointTrim", GetFloatValue(Instance()->DlssNrWhitePointTrim.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanTrim", GetFloatValue(Instance()->DlssNrScanTrim.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanAnchorValue", GetFloatValue(Instance()->DlssNrScanAnchorValue.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanAnchorWhitePoint", GetFloatValue(Instance()->DlssNrScanAnchorWhitePoint.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanAnchors", Instance()->DlssNrScanAnchors.value_for_config_or("").c_str());
+    ini.SetValue("DlssNr", "NrBackend", Instance()->DlssNrBackend.value_for_config_or("").c_str());
+    ini.SetValue("DlssNr", "StyleSlot1", Instance()->AmdStyleSlot1.value_for_config_or("").c_str());
+    ini.SetValue("DlssNr", "StyleSlot2", Instance()->AmdStyleSlot2.value_for_config_or("").c_str());
+    ini.SetValue("DlssNr", "StyleSlot3", Instance()->AmdStyleSlot3.value_for_config_or("").c_str());
+    ini.SetValue("DlssNr", "ScanInverted", GetBoolValue(Instance()->DlssNrScanInverted.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ScanMeter", GetBoolValue(Instance()->DlssNrScanMeter.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Passes", GetIntValue(Instance()->DlssNrPasses.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "UseProxy", GetBoolValue(Instance()->DlssNrUseProxy.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ProxyProbe", GetBoolValue(Instance()->DlssNrProxyProbe.value_for_config()).c_str());
+    // ScanExposure is a developer override with no menu control; persist it so a set ini keeps it.
+    ini.SetValue("DlssNr", "ScanExposure", GetBoolValue(Instance()->DlssNrScanExposure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "WhitePointScale",
+                 GetFloatValue(Instance()->DlssNrWhitePointScale.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Preset", GetIntValue(Instance()->DlssNrPreset.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Intensity", GetFloatValue(Instance()->DlssNrIntensity.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Style", GetIntValue(Instance()->DlssNrStyle.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass2Preset",
+                 GetIntValue(Instance()->DlssNrPass2Preset.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass2Style",
+                 GetIntValue(Instance()->DlssNrPass2Style.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass3Preset",
+                 GetIntValue(Instance()->DlssNrPass3Preset.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass3Style",
+                 GetIntValue(Instance()->DlssNrPass3Style.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "LocalStructure",
+                 GetFloatValue(Instance()->DlssNrLocalStructure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "LocalTone", GetFloatValue(Instance()->DlssNrLocalTone.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdNeuralLighting", GetBoolValue(Instance()->AmdNeuralLighting.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdNeuralLightingStrength", GetFloatValue(Instance()->AmdNeuralLightingStrength.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdEncoding", GetIntValue(Instance()->AmdEncoding.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdHighlightProxy", GetIntValue(Instance()->AmdHighlightProxy.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdHighlightProxyKnee", GetFloatValue(Instance()->AmdHighlightProxyKnee.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdHighlightProxyRange", GetFloatValue(Instance()->AmdHighlightProxyRange.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdSlots", GetIntValue(Instance()->AmdSlots.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdModelScale", GetFloatValue(Instance()->AmdNrScale.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdNrSizeStep", GetIntValue(Instance()->AmdNrSizeStep.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdTemporalStability", GetFloatValue(Instance()->AmdTemporalStability.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdStabilityMode", GetIntValue(Instance()->AmdStabilityMode.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveFill", GetIntValue(Instance()->AmdInterleaveFill.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveSharp", GetBoolValue(Instance()->AmdInterleaveSharp.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveDebug", GetIntValue(Instance()->AmdInterleaveDebug.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleavePreset", GetIntValue(Instance()->AmdInterleavePreset.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleavePacing", GetFloatValue(Instance()->AmdInterleavePacing.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveGhostBound", GetFloatValue(Instance()->AmdInterleaveGhostBound.value_for_config()).c_str());
+
+    // FSR Ray Regeneration - see the matching read block.
+    ini.SetValue("FSR-RR", "FfxDenoiserIndex", GetIntValue(Instance()->FfxDenoiserIndex.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDebugMode", GetIntValue(Instance()->FfxDenoiserDebugMode.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDebugViewport", GetIntValue(Instance()->FfxDenoiserDebugViewport.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserInternalDebugViews", GetBoolValue(Instance()->FfxDenoiserInternalDebugViews.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDiffuseSignalType", GetIntValue(Instance()->FfxDenoiserDiffuseSignalType.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSpecularSignalType", GetIntValue(Instance()->FfxDenoiserSpecularSignalType.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDenoiseDiffuse", GetBoolValue(Instance()->FfxDenoiserDenoiseDiffuse.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDenoiseSpecular", GetBoolValue(Instance()->FfxDenoiserDenoiseSpecular.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserTaggedAmbientOcclusion", GetBoolValue(Instance()->FfxDenoiserTaggedAmbientOcclusion.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserNormalsInViewSpace", GetBoolValue(Instance()->FfxDenoiserNormalsInViewSpace.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserUseTitleLinearDepth", GetBoolValue(Instance()->FfxDenoiserUseTitleLinearDepth.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserResponsivityThreshold", GetFloatValue(Instance()->FfxDenoiserResponsivityThreshold.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserResponsivityInvert", GetBoolValue(Instance()->FfxDenoiserResponsivityInvert.value_for_config()).c_str());
+    // ignore_default (0.3.3.2): an explicit 1.0 persists, so RE Requiem's quirk default 0 never replaces it next
+    // launch; the quirk's volatile 0 still saves as auto.
+    ini.SetValue("FSR-RR", "FfxDenoiserBiasMaskStrength", GetFloatValue(Instance()->FfxDenoiserBiasMaskStrength.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorDetailBoost", GetFloatValue(Instance()->FfxDenoiserFloorDetailBoost.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorNormalSharpness", GetFloatValue(Instance()->FfxDenoiserFloorNormalSharpness.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorAlbedoGuide", GetFloatValue(Instance()->FfxDenoiserFloorAlbedoGuide.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorLumSymmetry", GetFloatValue(Instance()->FfxDenoiserFloorLumSymmetry.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorGrazingSharpness", GetFloatValue(Instance()->FfxDenoiserFloorGrazingSharpness.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorEnvelopeBias", GetFloatValue(Instance()->FfxDenoiserFloorEnvelopeBias.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorSoftMin", GetFloatValue(Instance()->FfxDenoiserFloorSoftMin.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserHardwareDepth", GetBoolValue(Instance()->FfxDenoiserHardwareDepth.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserUseAmdDefaults", GetBoolValue(Instance()->FfxDenoiserUseAmdDefaults.value_for_config()).c_str());
+    // (AMDNR 0.3.4, RR-7000) ignore_default: unset (auto) offers Ray Regeneration on RDNA 3, so an explicit false (the
+    // class default) is a different choice (RDNA 4 only) and must not be folded to auto on save.
+    ini.SetValue("FSR-RR", "FfxDenoiserAllowPreRdna4", GetBoolValue(Instance()->FfxDenoiserAllowPreRdna4.value_for_config_ignore_default()).c_str());
+    // ignore_default: an explicit value equal to the class default still persists, where
+    // value_for_config() would fold it to auto and let the path-traced profile (its ten keys
+    // below: DisocThreshold ... FloorRawBlend) or a quirk (SkinSmoothing, its radius and guide
+    // thresholds on RE Requiem) replace it next launch. Volatile values set by the profile or a
+    // quirk still save as auto.
+    ini.SetValue("FSR-RR", "FfxDenoiserPathTracedProfile", GetBoolValue(Instance()->FfxDenoiserPathTracedProfile.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserProfileTextureRoute", GetFloatValue(Instance()->FfxDenoiserProfileTextureRoute.value_for_config_ignore_default()).c_str());
+    // AMDNR 0.3.4: the profile's temporal half, the same pattern as the profile flag above. FfxDenoiserAlbedoFp16 and
+    // FfxDenoiserNgxDirectSLConstants are read only (experimental switches), like the kill switches.
+    ini.SetValue("FSR-RR", "FfxDenoiserPathTracedTemporal", GetBoolValue(Instance()->FfxDenoiserPathTracedTemporal.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothing", GetBoolValue(Instance()->FfxDenoiserSkinSmoothing.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingStrength", GetFloatValue(Instance()->FfxDenoiserSkinSmoothingStrength.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingRadius", GetIntValue(Instance()->FfxDenoiserSkinSmoothingRadius.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingShowMask", GetBoolValue(Instance()->FfxDenoiserSkinSmoothingShowMask.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingGuideLow", GetFloatValue(Instance()->FfxDenoiserSkinSmoothingGuideLow.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingGuideHigh", GetFloatValue(Instance()->FfxDenoiserSkinSmoothingGuideHigh.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingClassifier", GetIntValue(Instance()->FfxDenoiserSkinSmoothingClassifier.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingMovedLow", GetFloatValue(Instance()->FfxDenoiserSkinSmoothingMovedLow.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingMovedHigh", GetFloatValue(Instance()->FfxDenoiserSkinSmoothingMovedHigh.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserSkinSmoothingShowCues", GetBoolValue(Instance()->FfxDenoiserSkinSmoothingShowCues.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDisocThreshold", GetFloatValue(Instance()->FfxDenoiserDisocThreshold.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserCrossBlNormStr", GetFloatValue(Instance()->FfxDenoiserCrossBlNormStr.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserStabilityBias", GetFloatValue(Instance()->FfxDenoiserStabilityBias.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserMaxRadiance", GetFloatValue(Instance()->FfxDenoiserMaxRadiance.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserRadianceClip", GetFloatValue(Instance()->FfxDenoiserRadianceClip.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserGaussKernRelax", GetFloatValue(Instance()->FfxDenoiserGaussKernRelax.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDebugDepthMax", GetFloatValue(Instance()->FfxDenoiserDebugDepthMax.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDiagnostics", GetBoolValue(Instance()->FfxDenoiserDiagnostics.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserCorrelationBias", GetFloatValue(Instance()->FfxDenoiserCorrelationBias.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDiffuseHitDistance", GetBoolValue(Instance()->FfxDenoiserDiffuseHitDistance.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorIsolation", GetFloatValue(Instance()->FfxDenoiserFloorIsolation.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserRoughnessFloor", GetFloatValue(Instance()->FfxDenoiserRoughnessFloor.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorHandover", GetIntValue(Instance()->FfxDenoiserFloorHandover.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorHandoverStrength", GetFloatValue(Instance()->FfxDenoiserFloorHandoverStrength.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorRawBlend", GetFloatValue(Instance()->FfxDenoiserFloorRawBlend.value_for_config_ignore_default()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserDemodDivisorFloor", GetFloatValue(Instance()->FfxDenoiserDemodDivisorFloor.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorClampSmoothing", GetFloatValue(Instance()->FfxDenoiserFloorClampSmoothing.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorStructureGate", GetFloatValue(Instance()->FfxDenoiserFloorStructureGate.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorHandoverDetail", GetFloatValue(Instance()->FfxDenoiserFloorHandoverDetail.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorHandoverAnchorClamp", GetFloatValue(Instance()->FfxDenoiserFloorHandoverAnchorClamp.value_for_config()).c_str());
+    ini.SetValue("FSR-RR", "FfxDenoiserFloorHandoverCorrelationMix", GetFloatValue(Instance()->FfxDenoiserFloorHandoverCorrelationMix.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveFreshHistory", GetBoolValue(Instance()->AmdInterleaveFreshHistory.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveModelHistory", GetBoolValue(Instance()->AmdInterleaveModelHistory.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfHistory", GetBoolValue(Instance()->AmdLmxxfHistory.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "LmxxfFullNetwork", GetBoolValue(Instance()->LmxxfFullNetwork.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfEditDetail", GetFloatValue(Instance()->AmdLmxxfEditDetail.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfEditSaturation", GetFloatValue(Instance()->AmdLmxxfEditSaturation.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfAutoExposure", GetBoolValue(Instance()->AmdLmxxfAutoExposure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfHighlightChromaGuard", GetBoolValue(Instance()->AmdLmxxfHighlightChromaGuard.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfAutoExposureHighlightCap", GetBoolValue(Instance()->AmdLmxxfAutoExposureHighlightCap.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfEdgeGuard", GetFloatValue(Instance()->AmdLmxxfEdgeGuard.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdLmxxfOutputSmooth", GetFloatValue(Instance()->AmdLmxxfOutputSmooth.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveAdaptive", GetBoolValue(Instance()->AmdInterleaveAdaptive.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleaveAdaptiveSensitivity", GetIntValue(Instance()->AmdInterleaveAdaptiveSensitivity.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdJitterSign", GetIntValue(Instance()->AmdJitterSign.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdNetworkOutput", GetBoolValue(Instance()->AmdNetworkOutput.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdResidualIntensity", GetFloatValue(Instance()->AmdResidualIntensity.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdResidualLimit", GetFloatValue(Instance()->AmdResidualLimit.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdResidualFade", GetFloatValue(Instance()->AmdResidualFade.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdResidualTemporal", GetBoolValue(Instance()->AmdResidualTemporal.value_for_config()).c_str());
+    // AMDNR 0.3.4: the danielblnc highlight guard and runtime knobs are saved like their neighbours (-1 / false write
+    // "auto"). AmdEditShaperLimit / Scope / CarryCap, AmdLmxxfTierSnap and AmdLmxxfTierCap are read only, like
+    // AmdEditShaper.
+    ini.SetValue("DlssNr", "AmdDanielHighlightGuard", GetBoolValue(Instance()->AmdDanielHighlightGuard.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdRuntimeStyle", GetIntValue(Instance()->AmdRuntimeStyle.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdToneCurve", GetIntValue(Instance()->AmdToneCurve.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdToneLift", GetFloatValue(Instance()->AmdToneLift.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdUseGameExposure", GetIntValue(Instance()->AmdUseGameExposure.value_for_config()).c_str());
+    // (0.3.4, danielblnc support) unset writes "auto"; an explicit false (Reference) is kept, so it survives a save and a restart
+    ini.SetValue("DlssNr", "AmdDanielFastMode", GetBoolValue(Instance()->AmdDanielFastMode.value_for_config_ignore_default()).c_str());
+    // (0.3.4, lmxxf Fast mode) like LmxxfFullNetwork: false (the default) writes "auto"
+    ini.SetValue("DlssNr", "AmdLmxxfFastMode", GetBoolValue(Instance()->AmdLmxxfFastMode.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdStabilityThreshold", GetFloatValue(Instance()->AmdStabilityThreshold.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdStabilityStaticRelax", GetFloatValue(Instance()->AmdStabilityStaticRelax.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdDetailStrength", GetFloatValue(Instance()->AmdDetailStrength.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdColourStrength", GetFloatValue(Instance()->AmdColourStrength.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdComposition", GetIntValue(Instance()->AmdComposition.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdComposeDetail", GetFloatValue(Instance()->AmdComposeDetail.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdComposeColour", GetFloatValue(Instance()->AmdComposeColour.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdSharpness", GetFloatValue(Instance()->AmdSharpness.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdDynamicRes", GetBoolValue(Instance()->AmdDynamicRes.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdDynamicTargetFps", GetIntValue(Instance()->AmdDynamicTargetFps.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdInterleave", GetFloatValue(Instance()->AmdInterleave.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdGraphicsWaitExperimental", GetBoolValue(Instance()->AmdGraphicsWaitExperimental.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdEveryFrame", GetBoolValue(Instance()->AmdEveryFrame.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdFinalImage", GetBoolValue(Instance()->AmdFinalImage.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdSpinDraw", GetIntValue(Instance()->AmdSpinDraw.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdVkLateCopyWait", GetBoolValue(Instance()->AmdVkLateCopyWait.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdNeuralListRecovery", GetBoolValue(Instance()->AmdNeuralListRecovery.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdDeviceGate", GetBoolValue(Instance()->AmdDeviceGate.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AmdOneStreamPerFrame", GetBoolValue(Instance()->AmdOneStreamPerFrame.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Enabled", GetBoolValue(Instance()->AmdRtgiEnabled.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Quality", GetIntValue(Instance()->AmdRtgiQuality.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Denoiser", GetIntValue(Instance()->AmdRtgiDenoiser.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Inspect", GetIntValue(Instance()->AmdRtgiInspect.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Contact", GetFloatValue(Instance()->AmdRtgiContact.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Saturation", GetFloatValue(Instance()->AmdRtgiSaturation.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Radius", GetFloatValue(Instance()->AmdRtgiRadius.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Mix", GetFloatValue(Instance()->AmdRtgiMix.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Lighting", GetFloatValue(Instance()->AmdRtgiLighting.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Occlusion", GetFloatValue(Instance()->AmdRtgiOcclusion.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Ambient", GetFloatValue(Instance()->AmdRtgiAmbient.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Thickness", GetFloatValue(Instance()->AmdRtgiThickness.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Smoothness", GetFloatValue(Instance()->AmdRtgiSmoothness.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Fade", GetFloatValue(Instance()->AmdRtgiFade.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "Fov", GetFloatValue(Instance()->AmdRtgiFov.value_for_config()).c_str());
+    ini.SetValue("AmdRtgi", "FarPlane", GetFloatValue(Instance()->AmdRtgiFarPlane.value_for_config()).c_str());
+    // (0.3.4 preview) AMDNR Screen GI; DebugView and the hidden keys are never written
+    ini.SetValue("AmdGi", "Enabled", GetBoolValue(Instance()->AmdGiEnabled.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Quality", GetIntValue(Instance()->AmdGiQuality.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Intensity", GetFloatValue(Instance()->AmdGiIntensity.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Occlusion", GetFloatValue(Instance()->AmdGiOcclusion.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Radius", GetFloatValue(Instance()->AmdGiRadius.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Thickness", GetFloatValue(Instance()->AmdGiThickness.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Saturation", GetFloatValue(Instance()->AmdGiSaturation.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Sky", GetFloatValue(Instance()->AmdGiSky.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Feedback", GetFloatValue(Instance()->AmdGiFeedback.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Placement", GetIntValue(Instance()->AmdGiPlacement.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Fov", GetFloatValue(Instance()->AmdGiFov.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "FovAxis", GetIntValue(Instance()->AmdGiFovAxis.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "NearFade", GetFloatValue(Instance()->AmdGiNearFade.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "DistanceFade", GetFloatValue(Instance()->AmdGiDistanceFade.value_for_config()).c_str());
+    ini.SetValue("AmdGi", "Encoding", GetIntValue(Instance()->AmdGiEncoding.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "Enabled", GetBoolValue(Instance()->AmdLookEnabled.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "Appearance", GetIntValue(Instance()->AmdLookAppearance.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "Mix", GetFloatValue(Instance()->AmdLookMix.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "MaterialDetail", GetFloatValue(Instance()->AmdLookMaterialDetail.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "ShapeDefinition", GetFloatValue(Instance()->AmdLookShapeDefinition.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "LocalLighting", GetFloatValue(Instance()->AmdLookLocalLighting.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "SkinDetail", GetFloatValue(Instance()->AmdLookSkinDetail.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "SkinSoftness", GetFloatValue(Instance()->AmdLookSkinSoftness.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "DetectSkin", GetBoolValue(Instance()->AmdLookDetectSkin.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "SpecularControl", GetFloatValue(Instance()->AmdLookSpecularControl.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "HighlightRollOff", GetFloatValue(Instance()->AmdLookHighlightRollOff.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "ColourSeparation", GetFloatValue(Instance()->AmdLookColourSeparation.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "ShadowDepth", GetFloatValue(Instance()->AmdLookShadowDepth.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "AntiHalo", GetFloatValue(Instance()->AmdLookAntiHalo.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "FlatAreaProtection", GetFloatValue(Instance()->AmdLookFlatAreaProtection.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "Inspect", GetIntValue(Instance()->AmdLookInspect.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "Tone", GetFloatValue(Instance()->AmdLookTone.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "ExposureEV", GetFloatValue(Instance()->AmdLookExposureEV.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "Contrast", GetFloatValue(Instance()->AmdLookContrast.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "Saturation", GetFloatValue(Instance()->AmdLookSaturation.value_for_config()).c_str());
+    ini.SetValue("AmdLook", "HighlightCompression", GetFloatValue(Instance()->AmdLookHighlightCompression.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SkinStructure",
+                 GetFloatValue(Instance()->DlssNrSkinStructure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "AutoMask", GetBoolValue(Instance()->DlssNrAutoMask.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SkinProtection", GetBoolValue(Instance()->DlssNrSkinProtection.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SkinToneEnabled", GetBoolValue(Instance()->DlssNrSkinToneEnabled.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SkinDetail", GetFloatValue(Instance()->DlssNrSkinDetail.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "SkinColour", GetFloatValue(Instance()->DlssNrSkinColour.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "EnvironmentDetail", GetFloatValue(Instance()->DlssNrEnvironmentDetail.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "EnvironmentColour", GetFloatValue(Instance()->DlssNrEnvironmentColour.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ShowSkinMask", GetBoolValue(Instance()->DlssNrShowSkinMask.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass2Intensity", GetFloatValue(Instance()->DlssNrPass2Intensity.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass2LocalStructure", GetFloatValue(Instance()->DlssNrPass2LocalStructure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass2LocalTone", GetFloatValue(Instance()->DlssNrPass2LocalTone.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass2SkinStructure", GetFloatValue(Instance()->DlssNrPass2SkinStructure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass2AutoMask", GetBoolValue(Instance()->DlssNrPass2AutoMask.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass3Intensity", GetFloatValue(Instance()->DlssNrPass3Intensity.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass3LocalStructure", GetFloatValue(Instance()->DlssNrPass3LocalStructure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass3LocalTone", GetFloatValue(Instance()->DlssNrPass3LocalTone.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass3SkinStructure", GetFloatValue(Instance()->DlssNrPass3SkinStructure.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "Pass3AutoMask", GetBoolValue(Instance()->DlssNrPass3AutoMask.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ReversibleMode", GetIntValue(Instance()->DlssNrReversibleMode.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "ApplyModel", GetBoolValue(Instance()->DlssNrApplyModel.value_for_config()).c_str());
+    ini.SetValue("DlssNr", "HoldFrame", GetBoolValue(Instance()->DlssNrHoldFrame.value_for_config()).c_str());
         ini.SetValue("DLSS", "RenderPresetOverride",
                      GetBoolValue(Instance()->RenderPresetOverride.value_for_config()).c_str());
         ini.SetValue("DLSS", "RenderPresetForAll",
@@ -1202,6 +1858,10 @@ bool Config::SaveIni()
         ini.SetValue("Sharpness", "OverrideSharpness",
                      GetBoolValue(Instance()->OverrideSharpness.value_for_config()).c_str());
         ini.SetValue("Sharpness", "Sharpness", GetFloatValue(Instance()->Sharpness.value_for_config()).c_str());
+        // (AMDNR 0.3.4.2, RN3) value_for_config_ignore_default: a player who typed the shipped number keeps it in the
+        // ini, so a later build that moves the default does not move their picture.
+        ini.SetValue("Sharpness", "RrDefaultSharpness",
+                     GetFloatValue(Instance()->RrDefaultSharpness.value_for_config_ignore_default()).c_str());
     }
 
     // CAS
@@ -1299,6 +1959,8 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->HookOriginalNvngxOnly.value_for_config()).c_str());
         ini.SetValue("Hooks", "EarlyHooking", GetBoolValue(Instance()->EarlyHooking.value_for_config()).c_str());
         ini.SetValue("Hooks", "UseNtdllHooks", GetBoolValue(Instance()->UseNtdllHooks.value_for_config()).c_str());
+        ini.SetValue("Hooks", "SkipOwnVulkanObjects",
+                     GetBoolValue(Instance()->SkipOwnVulkanObjects.value_for_config()).c_str());
     }
 
     // InitFlags
@@ -1596,6 +2258,11 @@ bool Config::SaveIni()
 
 bool Config::SaveXeFG()
 {
+    ini.SetValue("XeFG", "UnlockMFG", GetBoolValue(Instance()->FGXeFGUnlockEnabled.value_for_config()).c_str());
+    ini.SetValue("XeFG", "ExtraPacing", GetBoolValue(Instance()->FGXeFGExtraPacing.value_for_config()).c_str());
+    ini.SetValue("XeFG", "PaceOnSwapchain", GetBoolValue(Instance()->FGXeFGPaceOnSwapchain.value_for_config()).c_str());
+    ini.SetValue("XeFG", "MaxInterpolatedFrames",
+                 GetIntValue(Instance()->FGXeFGMaxInterpolatedFrames.value_for_config()).c_str());
     ini.SetValue("XeFG", "DepthInverted", GetBoolValue(Instance()->FGXeFGDepthInverted.value_for_config()).c_str());
     ini.SetValue("XeFG", "JitteredMV", GetBoolValue(Instance()->FGXeFGJitteredMV.value_for_config()).c_str());
     ini.SetValue("XeFG", "HighResMV", GetBoolValue(Instance()->FGXeFGHighResMV.value_for_config()).c_str());

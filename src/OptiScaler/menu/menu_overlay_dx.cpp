@@ -1,4 +1,6 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
+#include <dlssnr/amd/PresentExperimental.h>
 #include "menu_overlay_base.h"
 #include "menu_overlay_dx.h"
 
@@ -6,9 +8,12 @@
 #include <Logger.h>
 #include <Config.h>
 
+#include <proxies/XeFGPacing.h>
+
 #include <imgui/imgui_impl_dx11.h>
 #include <imgui/imgui_impl_dx12.h>
 #include <imgui/imgui_impl_win32.h>
+#include <misc/DiagSwitches.h>
 
 // menu
 static int const NUM_BACK_BUFFERS = 8;
@@ -34,6 +39,181 @@ static D3D12_CPU_DESCRIPTOR_HANDLE g_mainRenderTargetDescriptor[NUM_BACK_BUFFERS
 
 // current command queue for dx12 swapchain
 static IUnknown* currentSCCommandQueue = nullptr;
+
+// AMDNR 0.3.3 (MFG stutter, D). The eight allocators above used to be picked by
+// GetCurrentBackBufferIndex(), so with a three-buffer swapchain only three were ever used,
+// and each was Reset with no fence - about every 10 ms at 300 presents/s, while the GPU
+// was 10 ms or more behind on the present queue. All 43 of the exact 100 ms stalls in the
+// Silent Hill 2 9X/10X logs fell inside this overlay. Now the eight are taken in turn and
+// each carries the fence value its last submission signalled: an allocator is only reused
+// once the GPU has passed that value, nothing ever waits on the fence, and when the next
+// allocator is still in flight this present goes without the overlay instead.
+//
+// Only the next one in turn is ever considered. One queue retires in order, so if it is
+// not done none of the newer ones is either; and ImGui's own eight vertex/index buffer
+// sets (NumFramesInFlight = NUM_BACK_BUFFERS) advance once per draw too, so they stay
+// covered by the same fences. If the fence cannot be created, or a Signal fails, the
+// overlay goes back to the old per-back-buffer allocators.
+//
+// Known gap, left for 0.3.4 (review of 0.3.3; not a regression, the old code had no fence
+// at all). ImGui's TEXTURES are not covered the same way. A skipped present still runs
+// ImGui::NewFrame (RenderMenu) and ImGui::Render before the fence check, and ImGui 1.92
+// counts every NewFrame toward a WantDestroy texture's UnusedFrames (imgui_draw.cpp), while
+// the DX12 backend destroys it at UnusedFrames >= NumFramesInFlight inside RenderDrawData
+// (imgui_impl_dx12.cpp). After skips, that draw's fence only proves the draw eight DRAWS
+// back is done, not the last draw that sampled the texture. It needs a replaced font atlas
+// (new glyphs or a new scale, e.g. the menu opening) while the GPU is more than eight
+// overlay draws behind (9X/10X). Fix for 0.3.4: do the next-allocator check before
+// ImGui_ImplDX12_NewFrame / RenderMenu (RenderMenu also runs the hotkeys and frame timing,
+// so that needs its own pass), or hold a WantDestroy texture until the fence value of the
+// last draw that used it has completed.
+static ID3D12Fence* g_overlayFence = nullptr;
+static UINT64 g_overlayFenceValue = 0;
+static UINT64 g_allocatorFenceValues[NUM_BACK_BUFFERS] = {};
+static UINT g_nextAllocator = 0;
+
+// The rate-limited WARN timing (D): which step of an overlay present took over 20 ms,
+// and how many presents went without the overlay. One line a second at most.
+static constexpr double OverlaySlowStepMs = 20.0;
+static int64_t g_overlayLastWarnQpc = 0;
+static uint32_t g_overlaySlowSuppressed = 0;
+static uint32_t g_overlaySkipped = 0;
+
+static int64_t OverlayQpcNow()
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+static double OverlayQpcFrequency()
+{
+    static const double frequency = []()
+    {
+        LARGE_INTEGER f {};
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart > 0 ? static_cast<double>(f.QuadPart) : 1.0;
+    }();
+
+    return frequency;
+}
+
+static double OverlayMs(int64_t qpc) { return (qpc * 1000.0) / OverlayQpcFrequency(); }
+
+// True when a WARN may go out now; otherwise counts it for the next one.
+static bool OverlayMayWarn(int64_t nowQpc)
+{
+    if (g_overlayLastWarnQpc != 0 && (nowQpc - g_overlayLastWarnQpc) < static_cast<int64_t>(OverlayQpcFrequency()))
+        return false;
+
+    g_overlayLastWarnQpc = nowQpc;
+    return true;
+}
+
+static void WarnOverlayTimes(int64_t menu, int64_t render, int64_t reset, int64_t draw, int64_t submit)
+{
+    if (OverlayMs(menu) <= OverlaySlowStepMs && OverlayMs(render) <= OverlaySlowStepMs &&
+        OverlayMs(reset) <= OverlaySlowStepMs && OverlayMs(draw) <= OverlaySlowStepMs &&
+        OverlayMs(submit) <= OverlaySlowStepMs)
+        return;
+
+    if (!OverlayMayWarn(OverlayQpcNow()))
+    {
+        g_overlaySlowSuppressed++;
+        return;
+    }
+
+    LOG_WARN("Overlay present step over {:.0f} ms: menu {:.1f}, ImGui::Render {:.1f}, allocator reset {:.1f}, "
+             "draw {:.1f} (texture uploads included), submit {:.1f} ms; {} more slow and {} overlay draws "
+             "skipped since the last warning",
+             OverlaySlowStepMs, OverlayMs(menu), OverlayMs(render), OverlayMs(reset), OverlayMs(draw),
+             OverlayMs(submit), g_overlaySlowSuppressed, g_overlaySkipped);
+
+    g_overlaySlowSuppressed = 0;
+    g_overlaySkipped = 0;
+}
+
+static void NoteOverlaySkipped()
+{
+    g_overlaySkipped++;
+
+    if (!OverlayMayWarn(OverlayQpcNow()))
+        return;
+
+    LOG_WARN("Overlay skipped on this present: all {} command allocators are still in flight on the GPU "
+             "({} skipped since the last warning)",
+             NUM_BACK_BUFFERS, g_overlaySkipped);
+
+    g_overlaySkipped = 0;
+}
+
+// Once a second, while XeFG runs at 3X or above: what DXGI says it displayed (D). The
+// deltas over five seconds give the real refresh rate and how many presents made it to
+// the screen, next to how many were made. One INFO line per five seconds; nothing at 2X
+// or without frame generation.
+static void SamplePresentStatistics(IDXGISwapChain* swapChain)
+{
+    static int64_t nextSampleQpc = 0;
+    static int32_t samples = 0;
+    static uint32_t failures = 0;
+    static uint32_t presents = 0;
+    static bool haveFirst = false;
+    static DXGI_FRAME_STATISTICS first {};
+
+    if (swapChain == nullptr || !XeFGPacing::MfgActive())
+    {
+        nextSampleQpc = 0;
+        samples = 0;
+        failures = 0;
+        presents = 0;
+        haveFirst = false;
+        return;
+    }
+
+    presents++;
+
+    const int64_t now = OverlayQpcNow();
+
+    if (nextSampleQpc != 0 && now < nextSampleQpc)
+        return;
+
+    nextSampleQpc = now + static_cast<int64_t>(OverlayQpcFrequency());
+
+    DXGI_FRAME_STATISTICS stats {};
+
+    if (swapChain->GetFrameStatistics(&stats) != S_OK)
+    {
+        failures++;
+        return;
+    }
+
+    if (!haveFirst)
+    {
+        first = stats;
+        haveFirst = true;
+        samples = 0;
+        presents = 0;
+        failures = 0;
+        return;
+    }
+
+    if (++samples < 5)
+        return;
+
+    const double seconds =
+        static_cast<double>(stats.SyncQPCTime.QuadPart - first.SyncQPCTime.QuadPart) / OverlayQpcFrequency();
+    const UINT refreshes = stats.SyncRefreshCount - first.SyncRefreshCount;
+
+    LOG_INFO("XeFG present statistics: {} presents made, {} counted by DXGI, {} refreshes in {:.2f} s ({:.1f} Hz); "
+             "{} samples failed",
+             presents, stats.PresentCount - first.PresentCount, refreshes, seconds,
+             seconds > 0.0 ? refreshes / seconds : 0.0, failures);
+
+    first = stats;
+    samples = 0;
+    presents = 0;
+    failures = 0;
+}
 
 // status
 static bool _isInited = false;
@@ -145,7 +325,13 @@ static void CleanupRenderTargetDx12(bool clearQueue)
         for (UINT i = 0; i < NUM_BACK_BUFFERS; ++i)
         {
             SAFE_RELEASE(g_commandAllocators[i]);
+            g_allocatorFenceValues[i] = 0;
         }
+
+        // AMDNR 0.3.3: the allocators' fence goes with them.
+        SAFE_RELEASE(g_overlayFence);
+        g_overlayFenceValue = 0;
+        g_nextAllocator = 0;
 
         SAFE_RELEASE(g_pd3dCommandList);
 
@@ -199,6 +385,11 @@ static void CleanupRenderTargetDx11(bool shutDown)
 
 static void RenderImGui_DX11(IDXGISwapChain* pSwapChain)
 {
+    // Final image mode for D3D11 games: the back buffer crosses to D3D12 and back before
+    // the menu is drawn, so the menu is not in the picture the model sees.
+    if (AmdFinalImage::Enabled())
+        AmdFinalImage::RenderDx11(pSwapChain, Util::DllPath().parent_path());
+
     bool drawMenu = false;
 
     do
@@ -269,6 +460,13 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
     {
         if (pSwapChainPlain->QueryInterface(IID_PPV_ARGS(&pSwapChain)) != S_OK || pSwapChain == nullptr)
             return;
+
+        // Final image mode: the neural pass over the back buffer, for games that give the
+        // upscaler path nothing to hook. Runs before the menu is drawn so the menu is not
+        // in the picture the model sees.
+        if (AmdFinalImage::Enabled())
+            AmdFinalImage::Render(pSwapChain, (ID3D12CommandQueue*) currentSCCommandQueue,
+                                  Util::DllPath().parent_path());
 
         if (!MenuOverlayBase::IsInited())
             break;
@@ -374,6 +572,20 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                 pSwapChain->Release();
                 return;
             }
+
+            g_allocatorFenceValues[i] = 0;
+        }
+
+        // AMDNR 0.3.3 (MFG stutter, D): one fence value per allocator, see g_overlayFence.
+        // Without the fence the overlay keeps the old per-back-buffer allocators.
+        g_overlayFenceValue = 0;
+        g_nextAllocator = 0;
+        SAFE_RELEASE(g_overlayFence);
+
+        if (device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_overlayFence)) != S_OK)
+        {
+            g_overlayFence = nullptr;
+            LOG_WARN("Overlay fence could not be created, command allocators stay per back buffer");
         }
 
         result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_commandAllocators[0], NULL,
@@ -437,12 +649,45 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
 
             ImGui_ImplDX12_NewFrame();
 
+            // AMDNR 0.3.3 (D): timed, for the rate-limited WARN; and the total is handed to
+            // the XeFG pacing engine, which takes it back out of its present timing.
+            const int64_t menuStart = OverlayQpcNow();
+
             if (MenuOverlayBase::RenderMenu())
             {
+                const int64_t renderStart = OverlayQpcNow();
+
                 ImGui::Render();
 
+                const int64_t allocatorStart = OverlayQpcNow();
+
                 UINT backBufferIdx = pSwapChain->GetCurrentBackBufferIndex();
-                ID3D12CommandAllocator* commandAllocator = g_commandAllocators[backBufferIdx];
+
+                // AMDNR 0.3.3 (D): the next allocator in turn, if the GPU is done with it;
+                // otherwise no overlay on this present. Never waits. Without the fence,
+                // the old per-back-buffer choice.
+                int allocatorSlot = -1;
+                ID3D12CommandAllocator* commandAllocator = nullptr;
+
+                if (g_overlayFence != nullptr)
+                {
+                    const UINT slot = g_nextAllocator % NUM_BACK_BUFFERS;
+
+                    if (g_allocatorFenceValues[slot] > g_overlayFence->GetCompletedValue())
+                    {
+                        NoteOverlaySkipped();
+                        XeFGPacing::NoteOverlayTime(OverlayQpcNow() - menuStart);
+                        pSwapChain->Release();
+                        return;
+                    }
+
+                    allocatorSlot = static_cast<int>(slot);
+                    commandAllocator = g_commandAllocators[slot];
+                }
+                else
+                {
+                    commandAllocator = g_commandAllocators[backBufferIdx];
+                }
 
                 auto result = commandAllocator->Reset();
                 if (result != S_OK)
@@ -452,6 +697,8 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                     pSwapChain->Release();
                     return;
                 }
+
+                const int64_t drawStart = OverlayQpcNow();
 
                 D3D12_RESOURCE_BARRIER barrier = {};
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -475,6 +722,8 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
 
                 ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_pd3dCommandList);
 
+                const int64_t submitStart = OverlayQpcNow();
+
                 barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
                 g_pd3dCommandList->ResourceBarrier(1, &barrier);
@@ -490,6 +739,36 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
 
                 ID3D12CommandList* ppCommandLists[] = { g_pd3dCommandList };
                 ((ID3D12CommandQueue*) currentSCCommandQueue)->ExecuteCommandLists(1, ppCommandLists);
+
+                // AMDNR 0.3.3 (D): mark the allocator's work, and move on to the next one.
+                // A Signal that fails would leave the allocator waiting on a value that never
+                // comes, so the fence is dropped and the old per-back-buffer choice returns.
+                if (allocatorSlot >= 0 && g_overlayFence != nullptr)
+                {
+                    const UINT64 value = g_overlayFenceValue + 1;
+
+                    if (((ID3D12CommandQueue*) currentSCCommandQueue)->Signal(g_overlayFence, value) == S_OK)
+                    {
+                        g_overlayFenceValue = value;
+                        g_allocatorFenceValues[allocatorSlot] = value;
+                        g_nextAllocator = (static_cast<UINT>(allocatorSlot) + 1) % NUM_BACK_BUFFERS;
+                    }
+                    else
+                    {
+                        LOG_WARN("Overlay fence Signal failed, command allocators go back to per back buffer");
+                        SAFE_RELEASE(g_overlayFence);
+                    }
+                }
+
+                const int64_t submitEnd = OverlayQpcNow();
+
+                XeFGPacing::NoteOverlayTime(submitEnd - menuStart);
+                WarnOverlayTimes(renderStart - menuStart, allocatorStart - renderStart, drawStart - allocatorStart,
+                                 submitStart - drawStart, submitEnd - submitStart);
+            }
+            else
+            {
+                XeFGPacing::NoteOverlayTime(OverlayQpcNow() - menuStart);
             }
         }
         else
@@ -528,7 +807,13 @@ void MenuOverlayDx::CleanupRenderTarget(bool clearQueue, HWND hWnd)
 void MenuOverlayDx::Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags,
                             const DXGI_PRESENT_PARAMETERS* pPresentParameters, IUnknown* pDevice, HWND hWnd, bool isUWP)
 {
-    if (!Config::Instance()->OverlayMenu.value_or_default())
+    // AMDNR 0.3.3 (MFG stutter, D): XeFG at 3X and above only, whether or not the overlay
+    // is drawn; does nothing otherwise.
+    SamplePresentStatistics(pSwapChain);
+
+    // [Hotfix] DiagNoOverlay (crash triage): same as OverlayMenu=false from here on, but the DXGI
+    // hooks and the swapchain wrapper stay in place.
+    if (!Config::Instance()->OverlayMenu.value_or_default() || DiagSwitches::NoOverlay())
     {
         MenuOverlayBase::Present();
         return;

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 3zwr1 (AMDNR)
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -82,6 +84,9 @@ bool ResolveXInputExportsLocked(HMODULE module)
 
 void UpdateXInputIntegrationLocked()
 {
+    if (DiagSkipHookGroup(DiagHookGroup::XInput))
+        return;
+
     if (_state.XInputGetStateHookInstalled || _state.XInputGetStateExHookInstalled ||
         _state.XInputGetKeystrokeHookInstalled || _state.XInputSetStateHookInstalled)
     {

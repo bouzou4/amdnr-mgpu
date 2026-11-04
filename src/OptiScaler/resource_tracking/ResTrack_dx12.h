@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 #include "SysUtils.h"
@@ -587,4 +588,32 @@ class ResTrack_Dx12
     static void ReleaseDeviceHooks();
     static void ClearPossibleHudless();
     static void SetResourceCmdList(FG_ResourceType type, ID3D12GraphicsCommandList* cmdList);
+
+    // ---- Ray Regeneration resource inspector -------------------------------------
+    //
+    // A diagnostic for finding RR inputs in titles that publish neither Streamline tags
+    // nor NGX pointers for them: it watches pipeline-state changes, barriers and debug
+    // markers and guesses which render target is the normals buffer, the roughness, and
+    // so on. Useful when bringing up a new title, and useless afterwards.
+    //
+    // It is DECLARED here and answers "disabled" - the upstream implementation hooks
+    // ResourceBarrier, SetPipelineState and all three CreatePipelineState entry points,
+    // which means per-draw work on every command list in every game whether or not
+    // anyone is inspecting anything. That is the exact cost class that took Stellar Blade
+    // from 49 fps to 31 in a neighbouring project, and Ray Regeneration needs RDNA 4 and
+    // a Ray Reconstruction title before it can do anything at all. Paying it globally to
+    // serve that intersection is the wrong trade.
+    //
+    // The RR path reads IsRRResourceInspectorEnabled() first and skips the rest when it
+    // is false, so the tag-driven path - which is how a title that publishes its RR
+    // resources properly is meant to work - is unaffected. Port the real implementation
+    // if a title turns up that needs it, behind a config option that is off by default.
+    static void SetRRResourceInspectorEnabled(bool enabled);
+    static bool IsRRResourceInspectorEnabled();
+    static void NotifyRRResourceInspectorFrame(uint64_t frameIndex);
+    static void RefreshRRResourceCandidates(uint32_t renderWidth, uint32_t renderHeight);
+    static uint32_t GetRRResourceChannel();
+    static float GetRRResourceViewScale();
+    static ID3D12Resource* AcquireRRResourceCandidate();
+    static void LogRRScalarResourceCandidates(uint32_t renderWidth, uint32_t renderHeight);
 };

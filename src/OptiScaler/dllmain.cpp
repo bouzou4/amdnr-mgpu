@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "dllmain.h"
 
@@ -47,6 +48,9 @@
 #include <magic_enum.hpp>
 #include <version_check.h>
 #include <misc/IdentifyGpu.h>
+#include <misc/REFrameworkCheck.h>
+#include <misc/ProcessNameMatch.h>
+#include <misc/CrashReport.h>
 #include <sha1/sha1.hpp>
 
 static std::vector<HMODULE> _asiHandles;
@@ -231,6 +235,18 @@ void LoadAsiPlugins()
             std::wstring fileName = entry.path().filename().wstring();
             std::transform(fileName.begin(), fileName.end(), fileName.begin(),
                            [](wchar_t c) { return std::towlower(c); });
+
+            // The XeFG multi-frame unlock is built into this build (proxies/XeFGUnlock.h).
+            // The third-party plugin applies the same byte patches to the same provider;
+            // two copies of one patch in a process is a crash at swapchain init, and a
+            // plugin tied to one provider build is a crash on the next. Skip it, say so.
+            if (fileName.rfind(L"xefgunlock", 0) == 0 && Config::Instance()->FGXeFGUnlockEnabled.value_or_default())
+            {
+                LOG_WARN(L"Skipped {}: the XeFG multi-frame unlock is built into this build (XeFG\\UnlockMFG). "
+                         L"Delete the plugin; it is not needed and can crash the game alongside the built-in one.",
+                         entry.path().wstring());
+                continue;
+            }
 
             HMODULE hMod = nullptr;
 
@@ -953,14 +969,23 @@ static void CheckWorkingMode()
         auto nvapi64 = LibraryLoadHooks::LoadNvApi();
     }
 
-    // GDI32
-    hookGdi32();
+    // [Hotfix] DiagNoTrustHooks (crash triage): skip the three process-wide detours below.
+    if (Config::Instance()->DiagNoTrustHooks.value_or_default())
+    {
+        LOG_INFO("[Diag] DiagNoTrustHooks=true: WinVerifyTrust, CryptQueryObject and gdi32 D3DKMTQueryAdapterInfo "
+                 "are not detoured (no HAGS spoof, no signed-FFX/nvngx substitution)");
+    }
+    else
+    {
+        // GDI32
+        hookGdi32();
 
-    // Wintrust
-    hookWintrust();
+        // Wintrust
+        hookWintrust();
 
-    // Crypt32
-    hookCrypt32();
+        // Crypt32
+        hookCrypt32();
+    }
 
     // Advapi32
     if (Config::Instance()->DxgiSpoofing.value_or_default() ||
@@ -1316,6 +1341,18 @@ static void printQuirks(flag_set<GameQuirk>& quirks)
     if (quirks & GameQuirk::CreateSLOnThe2ndDevice)
         stringQuirks.push_back("Create SL on the 2nd device");
 
+    if (quirks & GameQuirk::PathTracedRayReconstruction)
+        stringQuirks.push_back("FSR Ray Regeneration path-traced title (profile opt-in)");
+
+    if (quirks & GameQuirk::SkinSmoothingDefault)
+        stringQuirks.push_back("FSR Ray Regeneration skin smoothing on by default");
+
+    if (quirks & GameQuirk::RrBiasMaskDefaultOff)
+        stringQuirks.push_back("FSR Ray Regeneration bias mask strength 0 by default");
+
+    if (quirks & GameQuirk::NeedsREFramework)
+        stringQuirks.push_back("Needs REFramework (warns when it is missing)");
+
     state->detectedQuirks.append_range(stringQuirks);
     for (auto& stringQuirk : stringQuirks)
         spdlog::info("Quirk: {}", stringQuirk);
@@ -1562,6 +1599,64 @@ static void CheckQuirks(bool isNvidia)
     else
         quirks.reset(GameQuirk::DoNotLoadAmdxc64);
 
+    // 0.3.3.1: this quirk no longer turns the path-traced profile on. In Resident Evil Requiem it removed
+    // most of the grain on faces but corrupted the rest of the picture (tester report, RX 9070 XT,
+    // 2026-09-25), so the profile is opt-in again until that is understood. The quirk bit stays so the
+    // menu can point path-traced titles at the checkbox.
+
+    // RE Requiem publishes the SSS guide, and skin smoothing greatly reduced flicker on faces there
+    // (tester report, 2026-09-25) with radius 16 and guide thresholds 0.0265 / 0.0414 - the guide's
+    // scale is the game's, so those apply whenever the key has no value, also with smoothing
+    // turned on by hand. Strength stays 1.0. An explicit value always wins.
+    if (quirks & GameQuirk::SkinSmoothingDefault)
+    {
+        auto* config = Config::Instance();
+        const bool setRadius = !config->FfxDenoiserSkinSmoothingRadius.has_value();
+        const bool setGuideLow = !config->FfxDenoiserSkinSmoothingGuideLow.has_value();
+        const bool setGuideHigh = !config->FfxDenoiserSkinSmoothingGuideHigh.has_value();
+        const bool setSmoothing = !config->FfxDenoiserSkinSmoothing.has_value();
+
+        if (setRadius)
+            config->FfxDenoiserSkinSmoothingRadius.set_volatile_value(16);
+        if (setGuideLow)
+            config->FfxDenoiserSkinSmoothingGuideLow.set_volatile_value(0.0265f);
+        if (setGuideHigh)
+            config->FfxDenoiserSkinSmoothingGuideHigh.set_volatile_value(0.0414f);
+        if (setSmoothing)
+            config->FfxDenoiserSkinSmoothing.set_volatile_value(true);
+        else
+            quirks.reset(GameQuirk::SkinSmoothingDefault);
+
+        spdlog::info("[RR_SKIN] RE Requiem defaults (quirk = set here, own = your [FSR-RR] value): skin smoothing {}, "
+                     "radius {}, guide low {}, guide high {}",
+                     setSmoothing ? "on (quirk)" : "own", setRadius ? "16 (quirk)" : "own",
+                     setGuideLow ? "0.0265 (quirk)" : "own", setGuideHigh ? "0.0414 (quirk)" : "own");
+    }
+
+    // RE Requiem (0.3.3.2 rebuild): [FSR-RR] FfxDenoiserBiasMaskStrength 0 while the key has no value; an explicit
+    // value, also 1.0 (SaveIni keeps it), always wins. RR-10 (0.3.4): the strength scales the DLSS bias mask, and
+    // RE Requiem publishes none (tester logs: [RR_GUIDES] biasMask absent; [RR_PROFILE] says "no mask published:
+    // inert"), so this default changes nothing in that game today. Kept because it is harmless and would act if a
+    // game update starts publishing the mask.
+    if (quirks & GameQuirk::RrBiasMaskDefaultOff)
+    {
+        auto* config = Config::Instance();
+        if (!config->FfxDenoiserBiasMaskStrength.has_value())
+        {
+            config->FfxDenoiserBiasMaskStrength.set_volatile_value(0.0f);
+            spdlog::info("[RR_BIAS] RE Requiem default: RR bias mask strength 0 (quirk; it acts only if the game "
+                         "publishes a bias mask, see [RR_PROFILE]); [FSR-RR] FfxDenoiserBiasMaskStrength=1 restores "
+                         "the bypass");
+        }
+        else
+        {
+            spdlog::info("[RR_BIAS] RE Requiem: RR bias mask strength {:.2f} is your [FSR-RR] value (quirk default 0 "
+                         "not applied)",
+                         config->FfxDenoiserBiasMaskStrength.value());
+            quirks.reset(GameQuirk::RrBiasMaskDefaultOff);
+        }
+    }
+
     // For Luma, we assume if Luma addon in game folder it's used
     const auto dir = Util::ExePath().parent_path();
     bool lumaDetected = false;
@@ -1659,6 +1754,28 @@ static void CheckQuirks(bool isNvidia)
         LOG_INFO("FG Inputs are enabled, LoadSpecialK disabled");
     }
 
+    // AMDNR 0.3.3.2: REFramework (misc/REFrameworkCheck.h). The one WARN at start; confirmed on the first
+    // menu frame against the dinput8.dll actually loaded (MenuCommon::UpdateVersionAndStartupNotifications).
+    if (quirks & GameQuirk::NeedsREFramework)
+    {
+        bool folderOnly = false, loaded = false;
+        const std::string files = REFrameworkCheck::FilesFound(Util::ExePath().parent_path(), folderOnly);
+        const std::wstring proxy = REFrameworkCheck::LoadedProxy(loaded);
+        if (!files.empty() || !proxy.empty())
+            LOG_INFO("REFramework found: {}", !files.empty() ? files : wstring_to_string(proxy));
+        else if (!Config::Instance()->WarnMissingREFramework.value_or_default())
+        {
+            // AMDNR 0.3.4 (OI-12B): [Hotfix] WarnMissingREFramework=false silences the warning (no WARN line, no
+            // post code, so no toast and no menu line); one INFO line keeps the fact in the log.
+            LOG_INFO("REFramework not found (warning silenced by [Hotfix] WarnMissingREFramework=false)");
+        }
+        else
+        {
+            state->postCodes |= PostCode::REFrameworkMissing;
+            LOG_WARN("REFramework NOT found. {}", REFrameworkCheck::Advice(state->gameExe, folderOnly));
+        }
+    }
+
     State::Instance().gameQuirks = quirks;
 
     printQuirks(quirks);
@@ -1705,6 +1822,16 @@ void CheckForExcludedProcess()
             _passThruMode = true;
             return;
         }
+    }
+
+    // AMDNR 0.3.4 (FB-L9): helpers the exact names above miss - danielblnc's installer under any name
+    // (dlssnr_on_amd_setup*.exe) and crash reporters / CEF helpers by a narrow name part - by the one rule in
+    // misc/ProcessNameMatch.h (AmdBridge's installer check uses the same). No logging here: pass-through
+    // processes never open the log.
+    if (ProcessNameMatch::IsHelperProcess(exeLower))
+    {
+        _passThruMode = true;
+        return;
     }
 
     _passThruMode = false;
@@ -1824,7 +1951,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             Config::Instance()->LogLevel.set_volatile_value(1);
 #endif
 
+        // Before PrepareLogger empties OptiScaler.log: keep the last session's log and write this exe's
+        // running marker (Logger.cpp, BeginLogSession). The header is the new log's first line.
+        BeginLogSession();
+
         PrepareLogger();
+
+        LogSessionHeader();
 
         spdlog::warn("{0} loaded", VER_PRODUCT_NAME);
         spdlog::warn("---------------------------------");
@@ -1859,6 +1992,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 #endif
 
         // Initial state of FG
+        State::Instance().externalFrameGeneration = Config::Instance()->ExternalFrameGeneration.value_or_default();
+        if (State::Instance().externalFrameGeneration)
+        {
+            // Only runtime overrides: preserve the user's OptiFG configuration for the next
+            // startup with External=false. Do not load a second FG provider or change Reflex.
+            auto* cfg = Config::Instance();
+            cfg->FGInput.set_volatile_value(FGInput::NoFG);
+            cfg->FGOutput.set_volatile_value(FGOutput::NoFG);
+            cfg->FGNvngxReplacement.set_volatile_value(FGNvngxReplacement::None);
+            cfg->FGEnabled.set_volatile_value(false);
+            cfg->ForceXeLL.set_volatile_value(false);
+            cfg->UseFakenvapi.set_volatile_value(false);
+            cfg->FN_ForceReflex.set_volatile_value(ForceReflex::InGame);
+            LOG_INFO("External frame generation: leaving Streamline/Reflex and MFG control to the game or unlocker; NR/SR remain available");
+        }
         State::Instance().activeFgInput = Config::Instance()->FGInput.value_or_default();
         State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
         State::Instance().activeFgNvngx = Config::Instance()->FGNvngxReplacement.value_or_default();
@@ -1870,10 +2018,35 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         if (State::Instance().activeFgInput == FGInput::NvngxFG)
             State::Instance().activeFgOutput = FGOutput::NoFG;
 
+        // A title with native XeSS Frame Generation (its own libxess_fg.dll was loaded before
+        // OptiScaler asked for one) keeps its own frame generation: wrapping its swapchain with
+        // OptiScaler's XeFG as well put two FG swapchains on one window, and Anvil (AC Black Flag
+        // Resynced) answered with DX12 Error 0x80070057 at launch. ForceXeLL selects XeFG output
+        // silently, so this catches the ini and the forced path alike. The built-in unlock still
+        // raises the game's own XeSS FG to 6X where its provider build is a confirmed one.
+        if (State::Instance().activeFgOutput == FGOutput::XeFG && XeFGProxy::NativeModule() != nullptr &&
+            !Config::Instance()->FGAllowXeFGWithNativeXeFG.value_or_default())
+        {
+            State::Instance().activeFgOutput = FGOutput::NoFG;
+            State::Instance().activeFgInput = FGInput::NoFG;
+            State::Instance().activeFgNvngx = FGNvngxReplacement::None;
+            State::Instance().fgNote =
+                "This game has its own XeSS Frame Generation (" + wstring_to_string(XeFGProxy::NativePath()) +
+                "). OptiScaler's XeFG output is off here to keep one FG swapchain per window; use the game's own "
+                "XeSS FG option. [FrameGen] AllowXeFGWithNativeXeFG=true forces the old behaviour.";
+            LOG_WARN("{}", State::Instance().fgNote);
+        }
+
         // Init Kernel proxies
         NtdllProxy::Init();
         KernelBaseProxy::Init();
         Kernel32Proxy::Init();
+
+        // AMDNR 0.3.4 (CRASH-b, D22): in-process crash note (misc/CrashReport.h), only with [Log] CrashHandler=true;
+        // at the default nothing is registered. After the kernel proxies: the optional dump ([Log] CrashDump) loads
+        // System32's dbghelp through them, on its writer thread once DllMain has returned.
+        if (Config::Instance()->CrashHandler.value_or_default())
+            CrashReport::Install(Config::Instance()->CrashDump.value_or_default());
 
         // Check for Wine
         spdlog::info("");
@@ -2066,6 +2239,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             LoadAsiPlugins();
         }
 
+        // Any XeSS-FG provider the game mapped before this point (its own copy).
+        XeFGUnlock::ApplyToAllLoaded();
+
         if (!Config::Instance()->DxgiSpoofing.has_value() && !State::Instance().nvngxReplacement.has_value())
         {
             LOG_WARN("Nvngx replacement not found!");
@@ -2200,6 +2376,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         spdlog::info("");
         spdlog::info("DLL_PROCESS_DETACH");
         spdlog::info("Unloading OptiScaler");
+
+        // CRASH-b: END line in amdnr_crash.log, handlers removed (a no-op when Install never ran)
+        if (Config::Instance()->CrashHandler.value_or_default())
+            CrashReport::Uninstall();
+
+        // A clean exit: the running marker goes (nothing to do in pass-through mode, which never wrote one)
+        EndLogSession();
+
         CloseLogger();
 
         break;

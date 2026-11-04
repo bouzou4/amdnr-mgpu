@@ -48,6 +48,10 @@ bool FSR2FeatureDx12_212::EvaluateInternal(ID3D12GraphicsCommandList* InCommandL
     ID3D12Resource* paramColor;
     if (InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor) != NVSDK_NGX_Result_Success)
         InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &paramColor);
+    // AMDNR (C3-A): the NR replacement arrives in NON_PIXEL_SHADER_RESOURCE and leaves in it. The title's colour
+    // barriers below describe the title's own texture, so neither is applied to it; the Unreal auto-detect still
+    // runs, because the bridge reads that value as the title colour's state (IFeature_Dx12::IsNrColour).
+    const bool nrColour = IsNrColour(InParameters, paramColor);
 
     if (paramColor)
     {
@@ -55,17 +59,19 @@ bool FSR2FeatureDx12_212::EvaluateInternal(ID3D12GraphicsCommandList* InCommandL
 
         if (Config::Instance()->ColorResourceBarrier.has_value())
         {
-            ResourceBarrier(InCommandList, paramColor,
-                            (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value(),
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (!nrColour)
+                ResourceBarrier(InCommandList, paramColor,
+                                (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value(),
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
                  State::Instance().gameEngine == GameEngineType::Unreal ||
                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
         {
             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
-            ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (!nrColour)
+                ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
 
         params.color = Fsr212::ffxGetResourceDX12_212(&_context, paramColor, (wchar_t*) L"FSR2_Color",
@@ -330,7 +336,7 @@ bool FSR2FeatureDx12_212::EvaluateInternal(ID3D12GraphicsCommandList* InCommandL
     }
 
     // restore resource states
-    if (paramColor && Config::Instance()->ColorResourceBarrier.has_value())
+    if (!nrColour && paramColor && Config::Instance()->ColorResourceBarrier.has_value())
         ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value());
 

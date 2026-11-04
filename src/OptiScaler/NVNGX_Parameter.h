@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 // Use real NVNGX params encapsulated in custom one
@@ -186,6 +187,24 @@ struct Parameter
     size_t key = 0;
 };
 
+enum class NGXPointerParameterKind : uint32_t
+{
+    OpaquePointer,
+    D3D11Resource,
+    D3D12Resource
+};
+
+/// @brief One resource-shaped entry of a parameter table, for diagnosing which inputs a
+/// title actually published. Ray Reconstruction tables carry a dozen resources whose
+/// presence varies per engine, and "the title publishes no specular ray length" is only
+/// answerable by listing what is there.
+struct NGXPointerParameter
+{
+    std::string name;
+    NGXPointerParameterKind kind = NGXPointerParameterKind::OpaquePointer;
+    void* address = nullptr;
+};
+
 /// @brief Implementation of the NVSDK_NGX_Parameter interface, providing thread-safe storage and retrieval of NGX
 /// parameters.
 struct NVNGX_Parameters : public NVSDK_NGX_Parameter
@@ -226,6 +245,7 @@ struct NVNGX_Parameters : public NVSDK_NGX_Parameter
     void Reset() override;
 
     std::vector<std::string> enumerate() const;
+    std::vector<NGXPointerParameter> enumeratePointerParameters() const;
 
   private:
     ankerl::unordered_dense::map<std::string, Parameter> m_values;
@@ -241,6 +261,37 @@ struct NVNGX_Parameters : public NVSDK_NGX_Parameter
  * whether the table should be destroyed when NGX DestroyParameters() is used.
  */
 NVNGX_Parameters* GetNGXParameters(API api, bool isPersistent);
+
+/**
+ * @brief Reads an NGX key only when the config option that governs it is enabled.
+ * Keeps "the title published this" and "we are allowed to use it" as one expression,
+ * so a disabled option cannot leave a stale value in `outValue` from a previous frame.
+ */
+template <typename T>
+static bool TryGetToggleableNGXParam(const NVSDK_NGX_Parameter& ngxParams, const char* key,
+                                     const CustomOptional<bool>& isEnabled, T& outValue)
+{
+    return isEnabled.value_or_default() && (ngxParams.Get(key, &outValue) == NVSDK_NGX_Result_Success);
+}
+
+/**
+ * @brief Reads a resource pointer from an NGX table, tolerating either of the two ways
+ * titles publish one. Some set the typed pointer overload, some set the raw `void**`;
+ * the same key can be either depending on the engine, and a Ray Reconstruction table
+ * carries a dozen of these. Trying the typed read first and falling back costs one
+ * failed lookup and removes a whole class of "the title publishes it but we see null".
+ */
+template <typename T>
+    requires std::is_pointer_v<T>
+static bool TryGetNGXVoidPointer(const NVSDK_NGX_Parameter& ngxParams, const char* key, T& outValue)
+{
+    NVSDK_NGX_Result result = ngxParams.Get(key, &outValue);
+
+    if (result != NVSDK_NGX_Result_Success)
+        result = ngxParams.Get(key, reinterpret_cast<void**>(&outValue));
+
+    return (result == NVSDK_NGX_Result_Success) && outValue != nullptr;
+}
 
 /**
  * @brief Sets a custom tracking tag to indicate the memory management strategy required by

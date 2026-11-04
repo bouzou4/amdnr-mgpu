@@ -1,8 +1,11 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include <pch.h>
+#include <dlssnr/amd/AmdBridge.h>
 
 #include "IFeature_VkwDx12.h"
 
 #include <Config.h>
+#include <dlssnr/DlssNr.h>
 #include <SysUtils.h>
 
 #include <proxies/DXGI_Proxy.h>
@@ -990,9 +993,17 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
     uint64_t lastFrameToWaitFor = (_frameCount > 1) ? (_frameCount - 1) : 0;
     if (Dx12Fence->GetCompletedValue() < lastFrameToWaitFor)
     {
-        // Only wait for N-1 frame, not current frame
+        // Only wait for N-1 frame, not current frame. The wait stays unbounded, but it says so
+        // every two seconds: a game that stops here (Indiana Jones with the lmxxf runtime) used
+        // to leave no line at all, and this is the one place a stuck D3D12 queue shows.
         Dx12Fence->SetEventOnCompletion(lastFrameToWaitFor, Dx12FenceEvent);
-        WaitForSingleObject(Dx12FenceEvent, INFINITE);
+        unsigned waitedSeconds = 0;
+        while (WaitForSingleObject(Dx12FenceEvent, 2000) == WAIT_TIMEOUT)
+        {
+            waitedSeconds += 2;
+            LOG_WARN("Vulkan bridge: D3D12 frame {} has not completed after {} s (fence at {}) - the D3D12 queue is "
+                     "stuck behind something; still waiting", lastFrameToWaitFor, waitedSeconds, Dx12Fence->GetCompletedValue());
+        }
     }
 
     Dx12CommandAllocator[frame]->Reset();
@@ -1352,12 +1363,62 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &imageBarrier);
     }
 
-    // D3D12 wait on the shared fence signaled by Vulkan
-    result = Dx12CommandQueue->Wait(dx12FenceTextureCopy[frame], Vulkan_wDx12::signalValueResourceCopy);
-    if (result != S_OK)
+    // [DlssNr] AmdVkLateCopyWait, opt-in (default false). The gate is read once per frame, here; the
+    // flush in CopyBackOutput only looks at what was held, so a menu or hotkey change during Evaluate
+    // cannot split a frame into "held" and "not queued".
+    //
+    // The Wait below is signalled only at the game's own vkQueueSubmit of InCmdList, and the game
+    // cannot submit that command buffer while it is still inside this Evaluate recording it. Queued
+    // here (upstream, and with the key off), it puts every queue operation issued during Evaluate
+    // behind that submit: danielblnc's
+    // Record-time staging drain and its inline flag check (5.33 s first Record per session and
+    // "store ... NOT seen" at every staging on Indiana Jones), lmxxf's deferred output Wait. Held
+    // and queued right before ExecuteCommandLists, it still sits ahead of the one list that reads
+    // the copies, and the frame's order stays Wait -> Execute -> Signal (shared fence) -> Signal
+    // (Dx12Fence). The value is taken now, not at the flush: signalValueResourceCopy is a static
+    // that the next ProcessVulkanTextures of any bridge feature overwrites.
+    const bool holdCopyWait = Config::Instance()->DlssNrEnabled.value_or_default() &&
+                              Config::Instance()->AmdVkLateCopyWait.value_or_default();
+
+    if (holdCopyWait)
     {
-        LOG_ERROR("Dx12CommandQueue->Wait failed: {0:x}", result);
-        return false;
+        // Held from here, whatever the fence pointer is (see _copyWaitHeld in the header).
+        _copyWaitHeld = true;
+        _copyWaitFence = dx12FenceTextureCopy[frame];
+        _copyWaitValue = Vulkan_wDx12::signalValueResourceCopy;
+
+        // No fence for this frame index (a partial CreateSharedFenceSemaphore failure): fail the frame
+        // here, before anything is recorded - the outcome the key-off Wait below has on the same state.
+        // The hold stays set, so the guard at the end of Evaluate drops it; the list is never executed.
+        if (_copyWaitFence == nullptr)
+        {
+            LOG_ERROR("Vulkan bridge: AmdVkLateCopyWait has no copy fence for frame {} - the bridge list is "
+                      "not executed this frame",
+                      frame);
+            return false;
+        }
+
+        static bool reportedLateCopyWait = false;
+
+        if (!reportedLateCopyWait)
+        {
+            reportedLateCopyWait = true;
+            LOG_INFO("Vulkan bridge: AmdVkLateCopyWait is on (experimental) - the D3D12 Wait on the game's "
+                     "texture copies (fence value {}) is held and queued right before the bridge's "
+                     "ExecuteCommandLists, so queue work issued during Evaluate no longer waits for the "
+                     "game's vkQueueSubmit",
+                     _copyWaitValue);
+        }
+    }
+    else
+    {
+        // D3D12 wait on the shared fence signaled by Vulkan
+        result = Dx12CommandQueue->Wait(dx12FenceTextureCopy[frame], Vulkan_wDx12::signalValueResourceCopy);
+        if (result != S_OK)
+        {
+            LOG_ERROR("Dx12CommandQueue->Wait failed: {0:x}", result);
+            return false;
+        }
     }
 
 #pragma endregion
@@ -1397,6 +1458,85 @@ bool IFeature_VkwDx12::ProcessVulkanTextures(VkCommandBuffer InCmdList, const NV
 
     Vulkan_wDx12::lastCmdBuffer = InCmdList;
     return true;
+}
+
+// AmdVkLateCopyWait: queue the held copy Wait. Called only between Close and ExecuteCommandLists in
+// CopyBackOutput. The hold is cleared before the Wait is tried, so a failure leaves nothing behind for
+// the Evaluate guard to drop; the caller then skips the Execute.
+bool IFeature_VkwDx12::FlushCopyWait()
+{
+    if (!_copyWaitHeld)
+        return true;
+
+    ID3D12Fence* fence = _copyWaitFence;
+    const UINT64 value = _copyWaitValue;
+
+    _copyWaitHeld = false;
+    _copyWaitFence = nullptr;
+    _copyWaitValue = 0;
+
+    // Held with no fence: the Wait cannot be queued, so the list must not run without it.
+    if (fence == nullptr)
+    {
+        LOG_ERROR("AmdVkLateCopyWait: the held copy Wait (fence value {}) has no fence; the bridge list is not "
+                  "executed this frame",
+                  value);
+        return false;
+    }
+
+    const HRESULT result = Dx12CommandQueue->Wait(fence, value);
+    if (result != S_OK)
+    {
+        LOG_ERROR("Dx12CommandQueue->Wait (AmdVkLateCopyWait, fence value {}) failed: {:x}; the bridge list is "
+                  "not executed this frame",
+                  value, (UINT) result);
+        return false;
+    }
+
+    return true;
+}
+
+// AmdVkLateCopyWait: forget a held copy Wait without queueing it.
+//
+// Safe because a Wait still held here was never queued, and then the list it guards was never executed
+// either: Dx12CommandList[frame] reaches ExecuteCommandLists only in CopyBackOutput, after FlushCopyWait
+// has queued the Wait (and cleared the hold). Nothing else on the D3D12 side reads the copies, so no
+// queued work loses its guard. Upstream's early-returning frame leaves its Wait on the queue; dropping it
+// instead cannot stall anything, and nothing needs it.
+//
+// If such a frame left its list open (the list is Reset in ProcessVulkanTextures and closed only in
+// CopyBackOutput), the next Evaluate keeps recording into it at the same frame index (_frameCount does
+// not advance on failure), holds its own Wait on the same dx12FenceTextureCopy[frame] with a higher value
+// (_fenceValue only grows), and flushes that before the Execute. The executed list is guarded either way.
+//
+// frameEnded: false when Evaluate starts (a hold carried in from an Evaluate that did not end normally,
+// e.g. unwound by an exception), true from the guard at the end of Evaluate.
+void IFeature_VkwDx12::DropCopyWait(bool frameEnded)
+{
+    if (!_copyWaitHeld)
+        return;
+
+    const UINT64 value = _copyWaitValue;
+
+    _copyWaitHeld = false;
+    _copyWaitFence = nullptr;
+    _copyWaitValue = 0;
+    _copyWaitDrops++;
+
+    static bool reportedDrop = false;
+
+    if (!reportedDrop)
+    {
+        reportedDrop = true;
+        LOG_INFO("Vulkan bridge: AmdVkLateCopyWait dropped the held copy Wait (fence value {}) {} - the "
+                 "bridge list was not executed, so nothing needed it; later drops are logged at debug level",
+                 value, frameEnded ? "at the end of a failed Evaluate" : "left over when Evaluate started");
+    }
+    else
+    {
+        LOG_DEBUG("AmdVkLateCopyWait: dropped held copy Wait (fence value {}, {}), drop #{} for this feature",
+                  value, frameEnded ? "failed Evaluate" : "carried over", _copyWaitDrops);
+    }
 }
 
 bool IFeature_VkwDx12::CopyBackOutput()
@@ -1440,6 +1580,18 @@ bool IFeature_VkwDx12::CopyBackOutput()
     if (result != S_OK)
     {
         LOG_ERROR("Dx12CommandList->Close failed: {0:x}", result);
+        // (0.3.3.2, [DlssNr] AmdNeuralListRecovery) The list is never executed: what the neural pass
+        // recorded on it is gone, and the backend must not wait for its submission.
+        DlssNr::AmdBridge::ListDiscarded(Dx12CommandList[frame]);
+        return false;
+    }
+
+    // AmdVkLateCopyWait: the copy Wait held since ProcessVulkanTextures is queued here, directly ahead
+    // of the list that reads the copies. If it cannot be queued, the list is not executed. With the
+    // key off nothing is held (the Wait went on the queue in ProcessVulkanTextures, as upstream).
+    if (_copyWaitHeld && !FlushCopyWait())
+    {
+        DlssNr::AmdBridge::ListDiscarded(Dx12CommandList[frame]); // closed and never executed (0.3.3.2)
         return false;
     }
 
@@ -1723,7 +1875,7 @@ bool IFeature_VkwDx12::CopyBackOutput()
         // Trigger the injection on next vkQueueSubmit
         Vulkan_wDx12::commandBufferFoundCount = 0;
 
-        LOG_DEBUG("Output copy completed synchronously");
+        LOG_DEBUG("Output copy-back recorded; it runs at the game's next vkQueueSubmit");
     }
 
     return true;
@@ -1823,6 +1975,13 @@ void IFeature_VkwDx12::ReleaseSharedResources()
 void IFeature_VkwDx12::ReleaseSyncResources()
 {
     LOG_FUNC();
+
+    // A held copy Wait points at one of the fences released below; it must not outlive them.
+    // _copyWaitHeld is left as it is: a hold still pending would then fail its flush (no fence)
+    // instead of letting the list run without its Wait. Evaluate's guard clears it.
+    _copyWaitFence = nullptr;
+    _copyWaitValue = 0;
+
     for (uint32_t i = 0; i < VKDX12_BUFFER_COUNT; i++)
     {
         SAFE_DESTROY_VK(vkDestroySemaphore, VulkanDevice, vkSemaphoreTextureCopy[i], nullptr);
@@ -1981,6 +2140,11 @@ IFeature_VkwDx12::IFeature_VkwDx12(unsigned int InHandleId, NVSDK_NGX_Parameter*
 
 IFeature_VkwDx12::~IFeature_VkwDx12()
 {
+    // AmdVkLateCopyWait: never queued from here. The list it guarded was not executed (see DropCopyWait).
+    _copyWaitHeld = false;
+    _copyWaitFence = nullptr;
+    _copyWaitValue = 0;
+
     if (State::Instance().isShuttingDown)
         return;
 
@@ -2001,6 +2165,29 @@ bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevi
     VulkanDevice = InDevice;
     VulkanGIPA = InGIPA;
     VulkanGDPA = InGDPA;
+
+    // (0.3.3.2, C3-D) The D3D12 colour and motion vectors every upscaler here - and the neural pass - see
+    // are this bridge's own copies, taken COMMON -> NON_PIXEL_SHADER_RESOURCE before Evaluate and back
+    // after (ProcessVulkanTextures, CopyBackOutput), in every engine. Unreal's RENDER_TARGET default
+    // describes the game's own colour: set as the volatile value by an inner upscaler on its first UE
+    // frame, it made that upscaler transition the copy from a state it is not in, and AmdBridge handed
+    // the backends the same wrong state for the NR input. Stated here as the D3D11 bridge states it
+    // (IFeature_Dx11wDx12::Init). A value from the ini still wins.
+    if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
+        State::Instance().gameEngine == GameEngineType::Unreal ||
+        State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+    {
+        auto& cfg = *Config::Instance();
+        const bool colourFromIni = cfg.ColorResourceBarrier.value_for_config().has_value();
+        const bool motionFromIni = cfg.MVResourceBarrier.value_for_config().has_value();
+        if (!colourFromIni)
+            cfg.ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (!motionFromIni)
+            cfg.MVResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        LOG_INFO("Vulkan bridge on an Unreal title: colour and motion vectors are the bridge's own copies in "
+                 "NON_PIXEL_SHADER_RESOURCE, not RENDER_TARGET{}",
+                 colourFromIni || motionFromIni ? " (an ini ColorResourceBarrier / MVResourceBarrier is kept)" : "");
+    }
 
     // Load external memory functions
     if (!LoadVulkanExternalMemoryFunctions())
@@ -2051,9 +2238,70 @@ bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevi
 
     SetInitParameters(InParameters);
 
-    // Non-DLSS upscalers don't use the cmdList during Init
-    // We have more than one cmdList so unsure how that would even work
-    SetInit(dx12Feature->Init(_dx11on12Device, Dx12CommandList[0], InParameters));
+    // The list has to be recording, and what is recorded on it has to run.
+    //
+    // Same defect the D3D11 bridge had: every list here is closed the moment it is created, and the
+    // note this replaces said non-DLSS upscalers do not use the list during Init. True when written.
+    // DLSS and Ray Reconstruction are the only features whose InitInternal touches the argument --
+    // NVSDK_NGX_D3D12_CreateFeature records the model's weight upload and history initialisation onto
+    // it and requires the caller to submit it afterwards. Recorded onto a closed list it is silently
+    // discarded, CreateFeature still answers Success, and the model runs on state that was never
+    // uploaded.
+    //
+    // Latent here today only because no DLSS-on-12 variant is wired to the Vulkan provider yet. It
+    // stops being latent the moment one is.
+    HRESULT prep = Dx12CommandAllocator[0]->Reset();
+
+    if (prep != S_OK)
+        LOG_WARN("Init: allocator reset before feature creation failed: {:X}", (UINT) prep);
+
+    prep = Dx12CommandList[0]->Reset(Dx12CommandAllocator[0], nullptr);
+
+    if (prep != S_OK)
+        LOG_WARN("Init: command list reset before feature creation failed: {:X}", (UINT) prep);
+
+    const bool initialised = dx12Feature->Init(_dx11on12Device, Dx12CommandList[0], InParameters);
+
+    SetInit(initialised);
+
+    if (Dx12CommandList[0]->Close() == S_OK && Dx12CommandQueue != nullptr)
+    {
+        ID3D12CommandList* lists[] = { Dx12CommandList[0] };
+        Dx12CommandQueue->ExecuteCommandLists(1, lists);
+
+        // A fence of its own, created and destroyed here.
+        //
+        // Dx12Fence on this bridge is signalled with _frameCount and waited on against
+        // lastFrameToWaitFor, and _fenceValue belongs to the texture-copy fences. Borrowing either
+        // for a one-time init would perturb a scheme that works; a local fence cannot.
+        ID3D12Fence* initFence = nullptr;
+
+        if (_dx11on12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&initFence)) == S_OK &&
+            Dx12CommandQueue->Signal(initFence, 1) == S_OK)
+        {
+            if (initFence->GetCompletedValue() < 1)
+            {
+                HANDLE done = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+                if (done != nullptr)
+                {
+                    if (initFence->SetEventOnCompletion(1, done) == S_OK)
+                        WaitForSingleObject(done, INFINITE);
+
+                    CloseHandle(done);
+                }
+            }
+
+            LOG_INFO("Init: feature creation work submitted and waited on");
+        }
+
+        SAFE_RELEASE(initFence);
+    }
+    else
+    {
+        LOG_WARN("Init: could not submit the feature creation work; a feature that records during "
+                 "creation will be missing it");
+    }
 
     return IsInited();
 }
@@ -2067,6 +2315,27 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
 
     auto frame = _frameCount % VKDX12_BUFFER_COUNT;
     auto cmdList = Dx12CommandList[frame];
+
+    // AmdVkLateCopyWait: a held copy Wait belongs to one Evaluate. None is carried in (cleared here),
+    // and none is carried out: the guard drops whatever is still held when this call returns, which
+    // happens only on the paths that never reached the Execute in CopyBackOutput. Every such path,
+    // after ProcessVulkanTextures held the Wait:
+    //   - ProcessVulkanTextures itself: no copy fence for this frame index (held, then failed);
+    //   - changeBackend set during ProcessVulkanTextures or the upscaler (break below);
+    //   - the upscaler's Evaluate returned false (dx12EvalResult false);
+    //   - CopyBackOutput: Close failed (returns before the flush);
+    //   - CopyBackOutput: the flushed Wait itself failed (hold already cleared, Execute skipped);
+    //   - an exception unwinding out of the NR or upscaler calls.
+    // CopyBackOutput's failures after the Execute (the Signals, the Vulkan copy-back recording) come
+    // after a successful flush, so nothing is held there. With the key off nothing is ever held and
+    // both of these are no-ops.
+    DropCopyWait(false);
+
+    struct HeldCopyWaitGuard
+    {
+        IFeature_VkwDx12* feature;
+        ~HeldCopyWaitGuard() { feature->DropCopyWait(true); }
+    } heldCopyWaitGuard { this };
 
     bool dx12EvalResult = false;
     do
@@ -2094,7 +2363,26 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
             InParameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) vkReactive.Dx12Resource);
 
         LOG_DEBUG("Dispatch!!");
+        if (dx12Feature->GetUpscalerType() != Upscaler::DLSSD)
+            DlssNr::EvaluateBeforeUpscale(cmdList, InParameters, Dx12CommandQueue, _frameCount);
         dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
+        DlssNr::AmdBridge::Restore(InParameters);
+
+        // The parameter block still holds the D3D12 resources written above -- the Vulkan handles are
+        // not put back until after this -- so the pass reads exactly what the upscaler just wrote.
+        static bool reportedNrOffer = false;
+
+        if (!reportedNrOffer)
+        {
+            reportedNrOffer = true;
+            LOG_INFO("DLSS-NR: the Vulkan bridge reached the hand-off (upscale ok: {}, enabled: {})",
+                     dx12EvalResult, Config::Instance()->DlssNrEnabled.value_or_default());
+        }
+
+        if (dx12EvalResult && Config::Instance()->DlssNrEnabled.value_or_default())
+            DlssNr::EvaluateAfterUpscale(cmdList, InParameters, Dx12CommandQueue,
+                                         dx12Feature->GetUpscalerType() == Upscaler::DLSSD,
+                                         _frameCount);
 
     } while (false);
 

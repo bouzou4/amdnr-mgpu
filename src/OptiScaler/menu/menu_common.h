@@ -1,9 +1,16 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 #include "SysUtils.h"
 #include <Config.h>
 
 #include <imgui/imgui.h>
+
+// AMDNR 0.3.4 menu look (dlssnr/menu/NeuralUi.h): the mock's fold row, for ScopedCollapsingHeader below.
+namespace DlssNr::NeuralUi
+{
+bool TreeNode(const char* label, ImGuiTreeNodeFlags flags);
+}
 
 class ScopedIndent
 {
@@ -23,10 +30,28 @@ class ScopedCollapsingHeader
     {
         ImGui::PushID(label);
 
+        // (AMDNR 0.3.4, the approved mock) The child is a window of its own, which starts at ImGui's default item
+        // width (65 % of the window, about 470 px): the tab's control width (190 px at Menu Scale 1.0) is carried in, so
+        // the sliders and combos inside a fold keep the one column of the rest of the tab.
+        const float itemWidth = ImGui::CalcItemWidth();
+
+        // No tinted box behind a section (AMDNR 0.3.4): the child is only a layout scope, so its background is
+        // transparent. Begin reads ChildBg, so the colour is popped right after it (ImGui's own FrameStyle does the
+        // same); children drawn inside keep the theme's ChildBg.
+        ImVec4 childBg = ImGui::GetStyleColorVec4(ImGuiCol_ChildBg);
+        childBg.w = 0.0f;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, childBg);
         ImGui::BeginChild("##CollapsingHeaderChild", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleColor();
+        ImGui::PushItemWidth(itemWidth);
 
-        _headerOpen = ImGui::CollapsingHeader(label, flags);
+        // (AMDNR 0.3.4, the approved mock) A flat fold row (">" / "v" and the label) instead of a filled header bar;
+        // the same ID and open state as the CollapsingHeader it replaces (NoTreePushOnOpen, like a collapsing header),
+        // and its contents indented 22 px as the mock's children.
+        _headerOpen = DlssNr::NeuralUi::TreeNode(label, flags | ImGuiTreeNodeFlags_NoTreePushOnOpen);
+        if (_headerOpen)
+            ImGui::Indent();
         _active = true;
     }
 
@@ -36,6 +61,9 @@ class ScopedCollapsingHeader
     {
         if (_active)
         {
+            if (_headerOpen)
+                ImGui::Unindent();
+            ImGui::PopItemWidth();
             ImGui::EndChild();
             ImGui::PopID();
         }
@@ -44,6 +72,30 @@ class ScopedCollapsingHeader
   private:
     bool _active = false;
     bool _headerOpen = false;
+};
+
+// AMDNR 0.3.4 menu look: the main window's palette, taken from the owner-approved mock
+// (the owner-approved menu mock, APPROVED_MOCK.png). MenuCommon::ThemeColor() hands
+// them out; the helpers that draw by hand (dlssnr/menu/NeuralUi.h) use it.
+enum class MenuColor : int
+{
+    Text,         // #e6e4df labels
+    Dim,          // #8d8a84 credits, status lines, inactive tabs, footer
+    Tag,          // #7d7a74 the short word after a row ("running", "1.00x cost")
+    Section,      // #e05a5a section titles
+    Rule,         // #3a2226 the 1 px lines (sections, tab row, footer) and the window border
+    Frame,        // #26262a slider track, combo box, button
+    FrameHovered, // #2e2e33
+    FrameActive,  // #35353b
+    Fill,         // #7a1f2b slider fill
+    FillActive,   // #8f1d2c slider fill while hovered or dragged
+    Value,        // #dddddd the value inside a slider
+    CheckOutline, // #777777 an unticked checkbox
+    CheckOn,      // #c73a45 a ticked checkbox, the active tab's underline
+    ButtonBorder, // #4a2a30
+    Selected,     // #8f1d2c a selected button, the title bar
+    White,        // #ffffff the active tab, the title text
+    Count
 };
 
 template <typename T> struct MenuOption
@@ -151,6 +203,10 @@ class MenuCommon
     static void RenderNotifications(RenderMenuContext& ctx);
     static void UpdateFrameTimeAverages(RenderMenuContext& ctx);
     static void RenderPerformanceOverlay(RenderMenuContext& ctx);
+
+    // Labels for the Neural Rendering comparison views. Drawn every frame, into the frame plane,
+    // so a screenshot keeps them and the wipe reveals and hides them like the images.
+    static void RenderNrCompareTags();
     static void RenderMainMenuWindow(RenderMenuContext& ctx);
 
     // RenderMainMenuWindow section helpers. These keep the main window flow readable
@@ -160,6 +216,12 @@ class MenuCommon
     static void RenderActiveUpscalerSettings(RenderMenuContext& ctx);
     static void RenderFrameGenerationSelection(RenderMenuContext& ctx);
     static void RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx);
+    // AMDNR 0.3.4, the approved other-tabs mock: Frame Gen > Compatibility (the external FG box), Upscaling > Render
+    // resolution (Upscale Ratio Override and Output Scaling, from the Image tab), Image > Init Flags (split out so
+    // Textures sits between Sharpness and it).
+    static void RenderFrameGenerationCompatibility(RenderMenuContext& ctx);
+    static void RenderRenderResolutionSettings(RenderMenuContext& ctx);
+    static void RenderInitFlagsSettings(RenderMenuContext& ctx);
     static void RenderFsrCommonSettings(RenderMenuContext& ctx);
     static void RenderFramerateSettings(RenderMenuContext& ctx);
     static void RenderFakenvapiSettings(RenderMenuContext& ctx);
@@ -167,9 +229,9 @@ class MenuCommon
     static void RenderActiveImageSettings(RenderMenuContext& ctx);
     static void RenderMagnifierSettings(RenderMenuContext& ctx);
     static void RenderQuirksSettings(RenderMenuContext& ctx);
+    static void RenderDisplaySettings(RenderMenuContext& ctx); // Advanced > Display (V-Sync), AMDNR 0.3.4
     static void RenderAdvancedSettings(RenderMenuContext& ctx);
     static void RenderLoggingSettings(RenderMenuContext& ctx);
-    static void RenderThemeSettings(RenderMenuContext& ctx);
     static void RenderFpsOverlaySettings(RenderMenuContext& ctx);
     static void RenderUpscalerInputsSettings(RenderMenuContext& ctx);
     static void RenderApiAndTextureSettings(RenderMenuContext& ctx);
@@ -182,6 +244,38 @@ class MenuCommon
     static void UpdateManualInput(HWND targetHwnd);
 
   public:
+    // The main window's tabs, in their order (AMDNR 0.3.4, T11g).
+    enum class MenuTab
+    {
+        Neural,
+        Upscaling,
+        FrameGen,
+        Image,
+        Interface,
+        Advanced,
+    };
+    // Selects a tab of the main window on the next frame, e.g. an "Open Upscaling" button on the Neural tab
+    // (AMDNR 0.3.4, T11g). Menu thread only.
+    static void RequestTab(MenuTab tab);
+
+    // AMDNR 0.3.4 menu look: a palette colour through the menu's HDR tone map (MenuHdrCheck tone-maps the style
+    // colours; a colour drawn by hand must get the same, or it glows in an HDR game). With [Menu] LightTheme=true the
+    // light style's own colours stand in (the mock has no light variant). Menu thread only.
+    static ImVec4 ThemeColor(MenuColor c);
+    // The same with the current style alpha applied (a greyed row), ready for an ImDrawList call.
+    static ImU32 ThemeColorU32(MenuColor c);
+    // AMDNR 0.3.4 menu look: one mock px at the current font size (the menu font is 14 px at Menu Scale 1.0, which
+    // draws the mock's 12.5 px CSS text; a [Menu] FontSize override and the Menu Scale scale it). Every hand-drawn
+    // size of the main window is in mock px times this (DlssNr::NeuralUi::Px). Menu thread only.
+    static float MockPx();
+    // AMDNR 0.3.4 (the approved mock, D-3): the Save report button and its result block (Saving / Report saved with
+    // Open folder / Hide, or the orange failure), shared state; drawn first in Advanced > Logging and last in the
+    // Neural tab's Diagnostics drawer. idSuffix keeps the two places' IDs apart. Menu thread only.
+    static void RenderSaveReportRow(const char* idSuffix);
+
+    // The Neural Rendering toggle-key binder, for the Neural tab; and a key's display name.
+    static void RenderDlssNrToggleKeybind();
+    static std::string KeyName(int virtualKey);
     static void Dx11Inited() { _dx11Ready = true; }
     static void Dx12Inited() { _dx12Ready = true; }
     static void VulkanInited() { _vulkanReady = true; }

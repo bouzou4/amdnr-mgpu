@@ -1,3 +1,5 @@
+// Copyright (c) 2026 3zwr1 (AMDNR)
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "pch.h"
 #include "input_system_internal.h"
 
@@ -42,6 +44,29 @@ DirectInputDeviceKind GetDirectInputDeviceKind(REFGUID guid)
 bool ShouldBlockDirectInputKeyboardLocked()
 {
     return _state.Initialized && _state.Focused && ShouldBlockKeyboardInputLocked();
+}
+
+// AMDNR 0.3.4.2: the DirectInput keyboard offset (DIK_*) of a virtual key: its scan code from the layout, turned
+// into a DIK offset by MenuInput::DirectInputOffsetFromScanCodeEx (which also holds the Pause / NumLock quirk of
+// MapVirtualKeyW). 0 when the layout has no scan code for the key.
+int DirectInputKeyOffsetOfVirtualKey(int vk)
+{
+    if (vk <= 0 || vk >= 256)
+        return 0;
+
+    return MenuInput::DirectInputOffsetFromScanCodeEx(vk, MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC_EX));
+}
+
+// The DIK offset of the menu key that closed the menu, while it is held back from the game (HoldKeyUntilReleased):
+// the keyboard filter above blocks the whole device only while the menu is open, so after the close that one key is
+// masked in what the game reads, until its release. -1 when no key is held.
+int HeldKeyDirectInputOffsetLocked()
+{
+    if (_state.HeldKeyVk <= 0 || !IsHeldKeyLocked(_state.HeldKeyVk))
+        return -1;
+
+    const int offset = DirectInputKeyOffsetOfVirtualKey(_state.HeldKeyVk);
+    return offset > 0 ? offset : -1;
 }
 
 bool ShouldBlockDirectInputMouseLocked()
@@ -455,6 +480,9 @@ HRESULT CallDirectInputCreateDeviceOriginal(DirectInputCreateDevice_t original, 
 
 void UpdateDirectInputIntegrationLocked()
 {
+    if (DiagSkipHookGroup(DiagHookGroup::DInput))
+        return;
+
     HMODULE module8 = FindLoadedDirectInput8Module();
     HMODULE legacyModule = FindLoadedDirectInputLegacyModule();
 
@@ -702,9 +730,12 @@ HRESULT WINAPI hkDirectInputCreateDeviceW(void* directInput, REFGUID guid, void*
 
 HRESULT WINAPI hkDirectInputGetDeviceState(void* device, DWORD dataSize, LPVOID data)
 {
+    bool keyboard = false;
+
     {
         std::unique_lock lock(_state.Mutex);
         const DirectInputDeviceKind kind = GetDirectInputDeviceKindLocked(device);
+        keyboard = kind == DirectInputDeviceKind::Keyboard;
         _state.DirectInputGetDeviceStateCallCount++;
 
         if (ShouldBlockDirectInputDeviceLocked(kind))
@@ -724,16 +755,34 @@ HRESULT WINAPI hkDirectInputGetDeviceState(void* device, DWORD dataSize, LPVOID 
     if (o_DirectInputDeviceGetDeviceState == nullptr)
         return DIERR_GENERIC;
 
-    ScopedHookBypass bypass;
-    return o_DirectInputDeviceGetDeviceState(device, dataSize, data);
+    HRESULT result = DIERR_GENERIC;
+    {
+        ScopedHookBypass bypass;
+        result = o_DirectInputDeviceGetDeviceState(device, dataSize, data);
+    }
+
+    // AMDNR 0.3.4.2: the held menu key reads as up in the keyboard state (256 bytes at DIK offsets).
+    if (SUCCEEDED(result) && keyboard && data != nullptr)
+    {
+        std::unique_lock lock(_state.Mutex);
+        const int offset = HeldKeyDirectInputOffsetLocked();
+
+        if (offset >= 0 && static_cast<DWORD>(offset) < dataSize)
+            static_cast<BYTE*>(data)[offset] = 0;
+    }
+
+    return result;
 }
 
 HRESULT WINAPI hkDirectInputGetDeviceData(void* device, DWORD objectDataSize, LPDIDEVICEOBJECTDATA data, LPDWORD inOut,
                                           DWORD flags)
 {
+    bool keyboard = false;
+
     {
         std::unique_lock lock(_state.Mutex);
         const DirectInputDeviceKind kind = GetDirectInputDeviceKindLocked(device);
+        keyboard = kind == DirectInputDeviceKind::Keyboard;
         _state.DirectInputGetDeviceDataCallCount++;
 
         if (ShouldBlockDirectInputDeviceLocked(kind))
@@ -753,8 +802,46 @@ HRESULT WINAPI hkDirectInputGetDeviceData(void* device, DWORD objectDataSize, LP
     if (o_DirectInputDeviceGetDeviceData == nullptr)
         return DIERR_GENERIC;
 
-    ScopedHookBypass bypass;
-    return o_DirectInputDeviceGetDeviceData(device, objectDataSize, data, inOut, flags);
+    HRESULT result = DIERR_GENERIC;
+    {
+        ScopedHookBypass bypass;
+        result = o_DirectInputDeviceGetDeviceData(device, objectDataSize, data, inOut, flags);
+    }
+
+    // AMDNR 0.3.4.2: the held menu key's buffered events (dwOfs, the first DWORD of every entry in the DX3 layout
+    // too, equal to its DIK offset) are dropped and the rest closed up; *inOut becomes the count kept.
+    if (SUCCEEDED(result) && keyboard && data != nullptr && inOut != nullptr && *inOut > 0 &&
+        objectDataSize >= sizeof(DWORD))
+    {
+        std::unique_lock lock(_state.Mutex);
+        const int offset = HeldKeyDirectInputOffsetLocked();
+
+        if (offset >= 0)
+        {
+            BYTE* const bytes = reinterpret_cast<BYTE*>(data);
+            const DWORD count = *inOut;
+            DWORD kept = 0;
+
+            for (DWORD i = 0; i < count; ++i)
+            {
+                const BYTE* const entry = bytes + static_cast<std::size_t>(i) * objectDataSize;
+                DWORD entryOffset = 0;
+                std::memcpy(&entryOffset, entry, sizeof(entryOffset));
+
+                if (entryOffset == static_cast<DWORD>(offset))
+                    continue;
+
+                if (kept != i)
+                    std::memmove(bytes + static_cast<std::size_t>(kept) * objectDataSize, entry, objectDataSize);
+
+                kept++;
+            }
+
+            *inOut = kept;
+        }
+    }
+
+    return result;
 }
 
 ULONG WINAPI hkDirectInputDeviceRelease(void* device)

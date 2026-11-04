@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include <string>
 
@@ -62,7 +63,14 @@ enum class Upscaler
 
     DLSS, // "dlss", used for the DLSS upscaler backend
 
+    DLSS_on12, // "dlss_12", DLSS run on the D3D12 side of the D3D11 bridge
+
     DLSSD, // "dlssd", used for the DLSS-D/Ray Reconstruction upscaler+denoiser backend
+
+    // "fsr_rr", AMD FSR Ray Regeneration driven from a title's DLSS Ray
+    // Reconstruction inputs. Distinct from DLSSD above, which forwards those
+    // inputs to NVIDIA's denoiser; this one translates them.
+    FSR_RR,
     Reset
 };
 

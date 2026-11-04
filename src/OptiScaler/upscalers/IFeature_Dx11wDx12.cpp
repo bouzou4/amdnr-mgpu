@@ -1,5 +1,8 @@
 #include <pch.h>
+#include <dlssnr/amd/AmdBridge.h>
 #include "IFeature_Dx11wDx12.h"
+
+#include <dlssnr/DlssNr.h>
 
 #include <Config.h>
 
@@ -225,9 +228,64 @@ bool IFeature_Dx11wDx12::Init(ID3D11Device* InDevice, ID3D11DeviceContext* InCon
 
     SetInitParameters(InParameters);
 
-    // Non-DLSS upscalers don't use the cmdList during Init
-    // We have more than one cmdList so unsure how that would even work
-    SetInit(dx12Feature->Init(_dx11on12Device, Dx12CommandList[0], InParameters));
+    // The list has to be recording, and what is recorded on it has to run.
+    //
+    // Every command list here is closed the moment it is created, and the note this replaces said
+    // non-DLSS upscalers do not use the list during Init -- which was true, and stopped being true the
+    // day DLSS got a bridge variant. DLSS and Ray Reconstruction are the only features whose
+    // InitInternal touches the argument at all: NVSDK_NGX_D3D12_CreateFeature records the model's
+    // weight upload and history initialisation onto it, and documents that the caller must submit it
+    // afterwards.
+    //
+    // Recorded onto a closed list, all of that is discarded. ID3D12GraphicsCommandList methods return
+    // void, so nothing fails, nothing logs, and CreateFeature still answers Success -- the model then
+    // runs against state that was never uploaded. That is the posterised, flat-blocked picture, and it
+    // gets worse with model size: the old CNN degraded to soft, the transformer collapses to blocks.
+    //
+    // So: open the list, let Init record into it, submit it, and wait. The wait is not optional --
+    // the first Evaluate resets this same allocator, and doing that under work still in flight is a
+    // device removal rather than a bad picture.
+    HRESULT prep = Dx12CommandAllocator[0]->Reset();
+
+    if (prep != S_OK)
+        LOG_WARN("Init: allocator reset before feature creation failed: {:X}", (UINT) prep);
+
+    prep = Dx12CommandList[0]->Reset(Dx12CommandAllocator[0], nullptr);
+
+    if (prep != S_OK)
+        LOG_WARN("Init: command list reset before feature creation failed: {:X}", (UINT) prep);
+
+    const bool initialised = dx12Feature->Init(_dx11on12Device, Dx12CommandList[0], InParameters);
+
+    SetInit(initialised);
+
+    if (Dx12CommandList[0]->Close() == S_OK && Dx12CommandQueue != nullptr)
+    {
+        ID3D12CommandList* lists[] = { Dx12CommandList[0] };
+        Dx12CommandQueue->ExecuteCommandLists(1, lists);
+
+        // Recorded against allocator 0, so allocator 0 must not be reset until this has retired. That
+        // is what Dx12CommandAllocatorFenceValue is for, and ProcessDx11Textures already honours it.
+        const UINT64 signalled = ++Dx12FenceValue;
+
+        if (Dx12CommandQueue->Signal(Dx12Fence, signalled) == S_OK)
+        {
+            Dx12CommandAllocatorFenceValue[0] = signalled;
+
+            if (Dx12Fence->GetCompletedValue() < signalled &&
+                Dx12Fence->SetEventOnCompletion(signalled, Dx12FenceEvent) == S_OK)
+            {
+                WaitForSingleObject(Dx12FenceEvent, INFINITE);
+            }
+        }
+
+        LOG_INFO("Init: feature creation work submitted and waited on (fence {})", signalled);
+    }
+    else
+    {
+        LOG_WARN("Init: could not submit the feature creation work; a feature that records during "
+                 "creation will be missing it");
+    }
 
     return IsInited();
 }
@@ -372,6 +430,7 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
     bool dx12EvalResult = false;
     bool commandListRecording = false;
     bool commandListExecuted = false;
+    bool commandListCloseFailed = false;
     do
     {
         if (!ProcessDx11Textures(InParameters))
@@ -400,7 +459,37 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
                               (void*) dx11Reactive.Dx12Resource);
 
         LOG_DEBUG("Dispatch!!");
+        if (dx12Feature->GetUpscalerType() != Upscaler::DLSSD)
+            DlssNr::EvaluateBeforeUpscale(cmdList, InParameters, Dx12CommandQueue, _frameCount);
         dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
+        DlssNr::AmdBridge::Restore(InParameters);
+
+        // DLSS 5 Neural Rendering rides the bridge: at this moment the block carries the D3D12 copies
+        // of every input, the list is still recording, and the model's edit lands on the D3D12 output
+        // before it is copied back to the game's D3D11 texture. This one call is what makes the pass
+        // work in DirectX 11 games, whatever upscaler carried it here.
+        static bool reportedNrOffer = false;
+
+        if (!reportedNrOffer)
+        {
+            reportedNrOffer = true;
+            LOG_INFO("DLSS-NR: the D3D11 bridge reached the hand-off (upscale ok: {}, enabled: {})",
+                     dx12EvalResult, Config::Instance()->DlssNrEnabled.value_or_default());
+
+        }
+
+        if (dx12EvalResult && Config::Instance()->DlssNrEnabled.value_or_default())
+        {
+            DlssNr::EvaluateAfterUpscale(cmdList, InParameters, Dx12CommandQueue,
+                                         dx12Feature->GetUpscalerType() == Upscaler::DLSSD,
+                                         _frameCount);
+
+            // Asked only after the D3D12 path has had its turn. Probing first would have made a D3D11
+            // init the very first thing to ever touch the snippet, and if that had left its core
+            // holding a D3D11 device the D3D12 create would have failed -- killing the feature in
+            // exactly the games the probe was written to help. Off by default regardless.
+            DlssNr::ProbeD3D11(Dx11Device);
+        }
 
     } while (false);
 
@@ -429,6 +518,7 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
         {
             LOG_ERROR("CommandList Close error: {:X}", (UINT) closeResult);
             dx12EvalResult = false;
+            commandListCloseFailed = true;
         }
     }
 
@@ -449,6 +539,28 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
         {
             Dx12CommandAllocatorFenceValue[frame] = fenceValue;
         }
+    }
+
+    // (0.3.3.2, [DlssNr] AmdNeuralListRecovery) Closed and not executed: whatever the neural pass
+    // recorded on it never runs, and the next Evaluate resets it. Said now, so the backend does not
+    // wait for a submission that cannot come.
+    if (commandListRecording && !commandListExecuted)
+        DlssNr::AmdBridge::ListDiscarded(cmdList);
+
+    // A list whose Close failed is not reusable: every later Reset of it returns E_INVALIDARG, and since
+    // _frameCount does not advance on a failed frame the same slot is picked again on every Evaluate, so
+    // one bad frame kept the bridge down for the rest of the session ("CommandList Reset error: 80070057",
+    // "Can't process Dx11 textures!" each frame). Replace the list: CreateD3D12Objects creates the missing
+    // one on the same allocator and closes it; the next Evaluate resets both as usual.
+    if (commandListCloseFailed)
+    {
+        SAFE_RELEASE(Dx12CommandList[frame]);
+        cmdList = nullptr;
+
+        if (CreateD3D12Objects())
+            LOG_WARN("Command list {} recreated after a failed Close", frame);
+        else
+            LOG_ERROR("Could not recreate command list {} after a failed Close", frame);
     }
 
     auto evalResult = false;

@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include <pch.h>
 
 #include <functional>
@@ -5,6 +6,8 @@
 
 #include "IFeature_Dx12.h"
 #include "State.h"
+#include <Config.h>
+#include <dlssnr/amd/AmdBridge.h>
 
 void IFeature_Dx12::ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
                                     D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState) const
@@ -19,6 +22,12 @@ void IFeature_Dx12::ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID
     barrier.Transition.StateAfter = InAfterState;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     InCommandList->ResourceBarrier(1, &barrier);
+}
+
+bool IFeature_Dx12::IsNrColour(const NVSDK_NGX_Parameter* InParameters, ID3D12Resource* InColour) const
+{
+    return InColour != nullptr && Config::Instance()->AmdNrColourGuard.value_or_default() &&
+           InColour == DlssNr::AmdBridge::Replacement(InParameters);
 }
 
 bool IFeature_Dx12::Init(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCommandList,
@@ -52,8 +61,14 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         return false;
     }
 
+    // AMDNR 0.3.4.1: this frame's RCAS hand-over (set by the RCAS setup below) starts clear; see GetSharpness.
+    _sharpnessHandedToRcas = false;
+
     if (Config::Instance()->OverrideSharpness.value_or_default())
+    {
         _sharpness = Config::Instance()->Sharpness.value_or_default();
+        _sharpnessIsFeatureDefault = false;
+    }
     else
         _sharpness = GetSharpness(InParameters);
 
@@ -139,6 +154,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                   // Disable any built-in sharpness shaders
                   InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
                   _sharpness = 0.0f;
+                  _sharpnessHandedToRcas = true; // AMDNR 0.3.4.1: the upscaler's GetSharpness keeps this 0
 
                   if (RCAS->CreateBufferResource(Device, nextOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
                   {

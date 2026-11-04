@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "Nvngx_Nukems.h"
 
@@ -5,7 +6,11 @@ void Nvngx_Nukems::LoadLibraries()
 {
     HMODULE memModule = nullptr;
     auto& optiPath = Config::Instance()->MainDllPath.value();
-    Util::LoadProxyLibrary(L"dlssg_to_fsr3_amd_is_better.dll", L"", optiPath, &memModule, &dll);
+    // The zip ships Nukem9's release binary renamed amdnr_dlssg_fsr3.dll (0.3.2); a
+    // dlssg_to_fsr3_amd_is_better.dll the player put there themselves is honoured too.
+    Util::LoadProxyLibrary(L"amdnr_dlssg_fsr3.dll", L"", optiPath, &memModule, &dll);
+    if (dll == nullptr && memModule == nullptr)
+        Util::LoadProxyLibrary(L"dlssg_to_fsr3_amd_is_better.dll", L"", optiPath, &memModule, &dll);
 
     if (dll == nullptr && memModule != nullptr)
         dll = memModule;

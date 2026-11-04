@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "D3D11_Hooks.h"
 
@@ -13,6 +14,11 @@
 #include <d3d11_4.h>
 #include <d3d11on12.h>
 #include <dxgi1_6.h>
+
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "Hook_Utils.h"
 
@@ -177,6 +183,22 @@ static HRESULT hkD3D11On12CreateDevice(IUnknown* pDevice, UINT Flags, const D3D_
     return result;
 }
 
+// (0.3.4.2, diagnostics) True the first time a caller module reaches hkD3D11CreateDevice in this process: its
+// "Caller" line is INFO once per distinct caller (a game, an overlay or a video player may create D3D11 devices
+// again and again; a support log has to name who created them), DEBUG after. Streamline_Hooks' pattern.
+static bool FirstD3D11CreateDeviceCaller(const std::string& caller)
+{
+    static std::mutex seenMutex;
+    static std::vector<std::string> seen;
+
+    std::scoped_lock lock(seenMutex);
+    if (std::find(seen.begin(), seen.end(), caller) != seen.end())
+        return false;
+
+    seen.push_back(caller);
+    return true;
+}
+
 VALIDATE_HOOK(hkD3D11CreateDevice, PFN_D3D11_CREATE_DEVICE)
 static HRESULT hkD3D11CreateDevice(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags,
                                    const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
@@ -190,7 +212,14 @@ static HRESULT hkD3D11CreateDevice(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE Drive
                                    ppDevice, pFeatureLevel, ppImmediateContext);
     }
 
-    LOG_DEBUG("Caller: {}", Util::WhoIsTheCaller(_ReturnAddress()));
+    {
+        // (0.3.4.2, diagnostics) INFO once per distinct caller module, DEBUG after (FirstD3D11CreateDeviceCaller).
+        const auto caller = Util::WhoIsTheCaller(_ReturnAddress());
+        if (FirstD3D11CreateDeviceCaller(caller))
+            LOG_INFO("Caller: {}", caller);
+        else
+            LOG_DEBUG("Caller: {}", caller);
+    }
 
 #ifdef ENABLE_DEBUG_LAYER_DX11
     Flags |= D3D11_CREATE_DEVICE_DEBUG;

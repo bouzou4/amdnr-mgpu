@@ -1,6 +1,8 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include <pch.h>
 #include <Config.h>
 #include "IFeature.h"
+#include <algorithm>
 
 void IFeature::SetHandle(unsigned int InHandleId)
 {
@@ -248,7 +250,10 @@ void IFeature::GetRenderResolution(const NVSDK_NGX_Parameter* InParameters, unsi
 float IFeature::GetSharpness(const NVSDK_NGX_Parameter* InParameters)
 {
     if (Config::Instance()->OverrideSharpness.value_or_default())
+    {
+        _sharpnessIsFeatureDefault = false;
         return Config::Instance()->Sharpness.value_or_default();
+    }
 
     float sharpness = 0.0f;
 
@@ -260,6 +265,21 @@ float IFeature::GetSharpness(const NVSDK_NGX_Parameter* InParameters)
             sharpness = 1.0f;
     }
 
+    // AMDNR 0.3.4.1: the title sends no sharpness (0 or none). A feature may put its own default in its place
+    // (FSR Ray Regeneration: RE Requiem sends 0 for DLSS-RR, which needs no sharpening, and RR's output then
+    // looked soft). Once Evaluate's RCAS setup zeroed the NGX sharpness, the 0 read here is RCAS's hand-over, not
+    // the title's: RCAS already runs with the default, so the upscaler stays at 0 and the flag keeps its value.
+    if (!(sharpness > 0.0f))
+    {
+        if (_sharpnessHandedToRcas)
+            return 0.0f;
+
+        const float fallback = std::clamp(DefaultSharpnessWhenTitleSendsNone(), 0.0f, 1.0f);
+        _sharpnessIsFeatureDefault = fallback > 0.0f;
+        return fallback;
+    }
+
+    _sharpnessIsFeatureDefault = false;
     return sharpness;
 }
 

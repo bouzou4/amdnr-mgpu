@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "SysUtils.h"
 #include <Util.h>
@@ -92,7 +93,12 @@ class NtdllHooks
             }
         }
 
-        return o_LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
+        {
+            const auto status = o_LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
+            if (status == 0 && ModuleHandle != nullptr && *ModuleHandle != nullptr)
+                LibraryLoadHooks::AfterLoad(name, (HMODULE) *ModuleHandle);
+            return status;
+        }
     }
 
     static NTSTATUS NTAPI hkNtLoadDll(PUNICODE_STRING PathToFile, PULONG Flags, PUNICODE_STRING ModuleFileName,
@@ -153,7 +159,12 @@ class NtdllHooks
             }
         }
 
-        return o_NtLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
+        {
+            const auto status = o_NtLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
+            if (status == 0 && ModuleHandle != nullptr && *ModuleHandle != nullptr)
+                LibraryLoadHooks::AfterLoad(name, (HMODULE) *ModuleHandle);
+            return status;
+        }
     }
 
     static NTSTATUS NTAPI hkLdrUnloadDll(PVOID lpLibrary)

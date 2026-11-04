@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 #include "SysUtils.h"
@@ -127,6 +128,7 @@ DEFINE_NAME_VECTORS(nvngxDlss, "nvngx_dlss");
 DEFINE_NAME_VECTORS(nvapi, "nvapi64");
 DEFINE_NAME_VECTORS(slInterposer, "sl.interposer");
 DEFINE_NAME_VECTORS(slDlss, "sl.dlss");
+DEFINE_NAME_VECTORS(slDlssd, "sl.dlss_d");
 DEFINE_NAME_VECTORS(slDlssg, "sl.dlss_g");
 DEFINE_NAME_VECTORS(slReflex, "sl.reflex");
 DEFINE_NAME_VECTORS(slPcl, "sl.pcl");

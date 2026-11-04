@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "IFGFeature.h"
 #include <Config.h>
@@ -39,8 +40,15 @@ UINT64 IFGFeature::StartNewFrame()
 
     if (_lastDispatchedFrame == 0 || (_frameCount - _lastDispatchedFrame) > 2)
     {
-        LOG_WARN("Frame count jumped too much! _frameCount: {}, _lastDispatchedFrame: {}", _frameCount,
-                 _lastDispatchedFrame);
+        // Only a warning while FG is active. With FG inactive nothing dispatches, so this fired every other frame
+        // (87% of a TLOU OptiScaler.log, each line a flushed write on the render thread). The resync below is
+        // unchanged either way.
+        if (IsActive())
+            LOG_WARN("Frame count jumped too much! _frameCount: {}, _lastDispatchedFrame: {}", _frameCount,
+                     _lastDispatchedFrame);
+        else
+            LOG_DEBUG("Frame count jumped too much (FG inactive)! _frameCount: {}, _lastDispatchedFrame: {}",
+                      _frameCount, _lastDispatchedFrame);
 
         _lastDispatchedFrame = _frameCount - 1;
     }

@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 
 #include "SysUtils.h"
@@ -64,6 +65,18 @@ enum class GameQuirk : uint64_t
     IgnoreTagsWithoutHudlessForFG,
     ForceFGRenderSizeMVs,
     CreateSLOnThe2ndDevice,
+    // Marked a path-traced title. It labelled the FSR-RR path-traced profile's checkbox ("opt-in for this game") and
+    // named it in Active Quirks; the profile is opt-in since 0.3.3.1 ([FSR-RR] FfxDenoiserPathTracedProfile) and
+    // retired in 0.3.4 (RR-25: worse in every RE Requiem report), so no entry sets the bit any more (it invited RE
+    // Requiem players to tick a retired profile). The member stays so no later value moves; a later profile (RR-18)
+    // can set it again
+    PathTracedRayReconstruction,
+    // Config-level: FSR-RR skin smoothing ([FSR-RR] FfxDenoiserSkinSmoothing) on by default
+    SkinSmoothingDefault,
+    // Config-level: FSR-RR bias-mask routing ([FSR-RR] FfxDenoiserBiasMaskStrength) 0 by default
+    RrBiasMaskDefaultOff,
+    // Warn-only: Capcom's anti-tamper needs REFramework next to OptiScaler (misc/REFrameworkCheck.h)
+    NeedsREFramework,
     // Don't forget to add the new entry to printQuirks
     _
 };
@@ -173,6 +186,13 @@ static const QuirkEntry quirkTable[] = {
     // Kunitsu-Gami: Path of the Goddess, Monster Hunter Wilds, MONSTER HUNTER RISE, Dead Rising Deluxe Remaster
     // (including the demo), Dragon's Dogma 2, PRAGMATA Demo, Resident Evil Requiem (+ demo)
     // Monster Hunter Stories 3: Twisted, Reflection, PRAGMATA, Onimusha: Way of the Sword Demo
+    // re9.exe (and its demo, re9demo.exe) and pragmata.exe are path-traced. Until 0.3.4 they carried
+    // PathTracedRayReconstruction, the label of the FSR-RR path-traced profile; the profile is retired (RR-25) and the
+    // label went with it (the ini key still works). re9 publishes the SSS guide, and skin smoothing
+    // there greatly reduced flicker on faces (tester report): SkinSmoothingDefault turns it on
+    // re9 also denoises the bias-mask pixels by default (tester 2 was best at FfxDenoiserBiasMaskStrength 0):
+    // RrBiasMaskDefaultOff
+    // re9, re9demo and pragmata warn when REFramework is missing (NeedsREFramework).
     QUIRK_ENTRY("kunitsugami.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing),
     QUIRK_ENTRY("kunitsugamidemo.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing),
     QUIRK_ENTRY("monsterhunterwilds.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing,
@@ -187,14 +207,18 @@ static const QuirkEntry quirkTable[] = {
     QUIRK_ENTRY("pragmata_sketchbook.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing,
                 GameQuirk::RestoreComputeSigOnNvidia, GameQuirk::AllowedFrameAhead2, GameQuirk::PregmataFixDLSSModes),
     QUIRK_ENTRY("re9.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing,
-                GameQuirk::RestoreComputeSigOnNvidia),
+                GameQuirk::RestoreComputeSigOnNvidia, GameQuirk::SkinSmoothingDefault, GameQuirk::RrBiasMaskDefaultOff,
+                GameQuirk::NeedsREFramework),
     QUIRK_ENTRY("re9demo.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing,
-                GameQuirk::RestoreComputeSigOnNvidia),
+                GameQuirk::RestoreComputeSigOnNvidia, GameQuirk::SkinSmoothingDefault, GameQuirk::RrBiasMaskDefaultOff,
+                GameQuirk::NeedsREFramework),
     QUIRK_ENTRY("monster_hunter_stories_3_twisted_reflection.exe", GameQuirk::RestoreComputeSigOnNonNvidia,
                 GameQuirk::DisableDxgiSpoofing, GameQuirk::RestoreComputeSigOnNvidia),
     QUIRK_ENTRY("pragmata.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing,
-                GameQuirk::RestoreComputeSigOnNvidia, GameQuirk::PregmataFixDLSSModes),
+                GameQuirk::RestoreComputeSigOnNvidia, GameQuirk::PregmataFixDLSSModes, GameQuirk::NeedsREFramework),
     QUIRK_ENTRY("onimushawots_demo.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing,
+                GameQuirk::RestoreComputeSigOnNvidia),
+    QUIRK_ENTRY("onimushawots.exe", GameQuirk::RestoreComputeSigOnNonNvidia, GameQuirk::DisableDxgiSpoofing,
                 GameQuirk::RestoreComputeSigOnNvidia),
 
     // REF PDUpscaler branch
@@ -526,6 +550,12 @@ static const QuirkEntry quirkTable[] = {
     QUIRK_ENTRY("f1_2020_dx12.exe", GameQuirk::DisableHudfix),
     QUIRK_ENTRY("f1_2021_dx12.exe", GameQuirk::DisableHudfix),
 
+    // Grand Theft Auto V (Legacy, D3D11): the game validates the feature level it asked for
+    // (11_0) and quits with ERR_GFX_D3D_NOFEATURELEVEL_1 ("No DirectX 10 or 11 adapter or
+    // runtime found") when the device comes back at 11_1. It has no upscaler to elevate for;
+    // the neural pass rides the final image mode's D3D11 -> D3D12 bridge, which needs 11_0 only.
+    QUIRK_ENTRY("gta5.exe", GameQuirk::SkipD3D11FeatureLevelElevation),
+
     // Grand Theft Auto V Enhanced
     // Hudfix incompatible
     QUIRK_ENTRY("gta5_enhanced.exe", GameQuirk::DisableHudfix),
@@ -540,7 +570,8 @@ static const QuirkEntry quirkTable[] = {
 
     // Stellar Blade
     // Hudfix incompatible
-    QUIRK_ENTRY_UE(sb, GameQuirk::DisableHudfix),
+    QUIRK_ENTRY_UE(sb, GameQuirk::DisableHudfix, GameQuirk::RestoreComputeSigOnNonNvidia,
+                   GameQuirk::ExtendedSigRestore),
 
     // Self-explanatory
     //

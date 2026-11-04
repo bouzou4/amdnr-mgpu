@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #include "pch.h"
 #include "menu_overlay_base.h"
 #include "menu_overlay_vk.h"
@@ -8,6 +9,9 @@
 
 #include <imgui/imgui_impl_vulkan.h>
 #include <imgui/imgui_impl_win32.h>
+
+#include <mutex>
+#include <unordered_set>
 
 // Vulkan overlay code adopted from here:
 // https://gist.github.com/mem99/0ec31ca302927457f86b1d6756aaa8c4
@@ -603,11 +607,55 @@ bool MenuOverlayVk::QueuePresent(VkQueue queue, VkPresentInfoKHR* pPresentInfo)
     return true;
 }
 
+// (AMDNR 0.3.4.1, Proton) A live top-level window of this process for the menu. Under vkd3d-proton with FSR FG
+// the window handed in can be a helper window that is already gone (IsWindow false); the menu then never took
+// input and OptiInput logged "SetTargetWindow rejected" every frame. Fall back to the process window then.
+static HWND ResolveMenuWindow(HWND hwnd)
+{
+    auto isOurLiveWindow = [](HWND h)
+    {
+        if (h == nullptr || !IsWindow(h))
+            return false;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        return pid == GetCurrentProcessId();
+    };
+
+    if (isOurLiveWindow(hwnd))
+        return hwnd;
+
+    HWND fallback = Util::GetProcessWindow();
+
+    if (!isOurLiveWindow(fallback))
+        return hwnd; // nothing better: the old behaviour
+
+    static std::mutex warnedMutex;
+    static std::unordered_set<HWND> warned;
+    {
+        std::lock_guard<std::mutex> lock(warnedMutex);
+        if (warned.insert(hwnd).second)
+        {
+            DWORD pid = 0;
+            if (hwnd != nullptr && IsWindow(hwnd))
+                GetWindowThreadProcessId(hwnd, &pid);
+
+            LOG_WARN("Vulkan menu: window {0:X} is not a live window of this process (isWindow:{1} pid:{2}); using "
+                     "the process window {3:X}",
+                     (UINT64) hwnd, hwnd != nullptr && IsWindow(hwnd) ? 1 : 0, pid, (UINT64) fallback);
+        }
+    }
+
+    return fallback;
+}
+
 void MenuOverlayVk::CreateSwapchain(VkDevice device, VkPhysicalDevice pd, VkInstance instance, HWND hwnd,
                                     const VkSwapchainCreateInfoKHR* pCreateInfo,
                                     const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain)
 {
     LOG_FUNC();
+
+    hwnd = ResolveMenuWindow(hwnd);
 
     if (MenuOverlayBase::Handle() != hwnd)
     {

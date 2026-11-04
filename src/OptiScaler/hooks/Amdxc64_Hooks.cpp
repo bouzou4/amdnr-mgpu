@@ -88,9 +88,32 @@ struct AmdExtD3DFactory : public IAmdExtD3DFactory
     }
 };
 
+// [Hotfix] DiagNoAmdxc64Hooks (crash triage): leave amdxc64.dll alone. Logged once.
+static bool DiagNoAmdxc64Hooks()
+{
+    static const bool disabled = []
+    {
+        const bool value = Config::Instance()->DiagNoAmdxc64Hooks.value_or_default();
+
+        if (value)
+        {
+            LOG_INFO("[Diag] DiagNoAmdxc64Hooks=true: AmdExtD3DCreateInterface is not detoured and amdxc64.dll is not "
+                     "loaded early; the game and the driver get the driver's own interfaces (no FSR 4 upgrade "
+                     "factory, no Anti-Lag 2 proxy)");
+        }
+
+        return value;
+    }();
+
+    return disabled;
+}
+
 void Amdxc64Hooks::Init()
 {
     if (o_AmdExtD3DCreateInterface != nullptr)
+        return;
+
+    if (DiagNoAmdxc64Hooks())
         return;
 
     LOG_DEBUG("");
@@ -137,6 +160,27 @@ void Amdxc64Hooks::Init()
 
 HRESULT STDMETHODCALLTYPE Amdxc64Hooks::hkAmdExtD3DCreateInterface(IUnknown* pOuter, REFIID riid, void** ppvObject)
 {
+    // Not reachable through a detour with the diag switch on, but GetProcAddress paths may still hand this
+    // function out; forward straight to the driver in that case.
+    if (DiagNoAmdxc64Hooks())
+    {
+        auto real = o_AmdExtD3DCreateInterface;
+
+        if (real == nullptr)
+        {
+            if (auto module = KernelBaseProxy::GetModuleHandleW_()(L"amdxc64.dll"); module != nullptr)
+            {
+                real = (PFN_AmdExtD3DCreateInterface) KernelBaseProxy::GetProcAddress_()(module,
+                                                                                         "AmdExtD3DCreateInterface");
+            }
+        }
+
+        if (real != nullptr && (void*) real != (void*) &hkAmdExtD3DCreateInterface)
+            return real(pOuter, riid, ppvObject);
+
+        return E_NOINTERFACE;
+    }
+
     // We need to know D3D12 capabilities by now, one of them being FSR 4
     IdentifyGpu::updateD3d12Capabilities();
 

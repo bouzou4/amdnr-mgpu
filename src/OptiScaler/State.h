@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "upscalers/IFeature.h"
 
@@ -10,6 +11,7 @@
 #include <set>
 #include <deque>
 #include <mutex>
+#include <atomic>
 #include <sl_dlss_g.h>
 #include <vulkan/vulkan.h>
 #include <ankerl/unordered_dense.h>
@@ -69,6 +71,7 @@ enum class PostCode : uint32_t
 {
     SlPluginsAlreadyInMemory,
     TryingFsr4Fp8OnUnsupported,
+    REFrameworkMissing, // AMDNR 0.3.3.2: re9 / re9demo / pragmata without REFramework (misc/REFrameworkCheck.h)
     _
 };
 
@@ -134,12 +137,27 @@ class State
 
     // Frame Generation
     FGInput activeFgInput = FGInput::NoFG;
+    bool externalFrameGeneration = false; // startup-only: do not switch hook ownership live
     FGOutput activeFgOutput = FGOutput::NoFG;
+    std::string fgNote; // why the FG output differs from the ini (native XeSS FG present), shown in the Frame Gen tab
     // This should be set to a non-None value only if all other requirements are met and nvngx can be used
     FGNvngxReplacement activeFgNvngx = FGNvngxReplacement::None;
 
     // Streamline FG inputs
     Sl_Inputs_Dx12 slFGInputs = {};
+    // The last sl::Constants the title published, kept whole. Ray Regeneration needs
+    // the view and projection matrices, and the FG input path above only keeps the
+    // fields frame generation happens to use.
+    // What the loaded Ray Regeneration provider says it can do. Filled once from
+    // ffxQuery and kept, so the menu can list real providers and debug modes by name
+    // instead of hard-coding a table that goes stale with the next SDK.
+    std::vector<const char*> ffxDenoiserVersionNames {};
+    std::vector<uint64_t> ffxDenoiserVersionIds {};
+    std::vector<uint64_t> ffxDenoiserDebugModes;
+    std::unordered_map<uint64_t, const char*> ffxDenoiserDebugModeNames;
+    sl::Constants slLastConstants = {};
+    uint32_t slLastConstantsFrame = UINT32_MAX;
+    uint32_t slLastConstantsViewport = UINT32_MAX;
     Sl1_Inputs_Dx12 s_sl1FGInputs {};
 
     // OptiFG
@@ -189,6 +207,25 @@ class State
 
     feature_version streamlineVersion = { 0, 0, 0 };
 
+    // WHAT THE GAME'S slInit RETURNED (0.3.3, NBA 2K27 "slInit error 0x18" report). hkslInit and
+    // hkslInit_sl1 store it with the call's duration so the log and the Neural tab can say that the
+    // game's Streamline failed to start, instead of leaving an idle pass unexplained.
+    //   slInitResult: the sl::Result value (Streamline 2+), or 0 / 1 for Streamline 1's bool
+    //                 (slInitIsSl1 set, 1 = failed); -1 = never seen - hkslInit was not installed
+    //                 ([FrameGen] External=true, a failed detour) or the game has not called slInit
+    //                 yet. The menu shows "unknown" for -1.
+    //   slInitResultName: a string literal ("eOk", "eErrorExceptionHandler", ...), never freed;
+    //                 nullptr until the first result. Written before slInitResult.
+    std::atomic<int32_t> slInitResult { -1 };
+    std::atomic<uint32_t> slInitMs { 0 };
+    std::atomic<bool> slInitIsSl1 { false };
+    std::atomic<const char*> slInitResultName { nullptr };
+    // True only while the game's slInit runs under hkslInit / hkslInit_sl1. The [SLINIT]
+    // diagnostics (plugin DLL loads, plugin onLoad results, SystemCaps before and after the
+    // spoof, NGX feature queries) log at INFO only inside this window, so the shipped LogLevel=2
+    // captures them and nothing is logged outside slInit.
+    std::atomic<bool> slInitInProgress { false };
+
     // Has value when Opti was able to hook sl and the game set DLSSG options
     std::optional<int> dlssgMfgMax = std::nullopt;
 
@@ -207,6 +244,14 @@ class State
 
     // for realtime changes
     ankerl::unordered_dense::map<unsigned int, bool> changeBackend;
+    // Ray Reconstruction handles whose FSR-RR gave up (the title never published RR's inputs) and
+    // were switched to plain FSR. The neural pass treats such a handle as Super Resolution: pre-SR
+    // placement, no ApplyAfterRR gate - there is no RR left to stay behind (Satisfactory report).
+    ankerl::unordered_dense::map<unsigned int, bool> rrFallbackToSr;
+    std::string rrFallbackReason; // why (the Neural tab's Live section), set with the entry above
+    // GetTickCount64() of the last successful FSR Ray Regeneration dispatch (0 = never): the Neural
+    // tab shows its Ray Regeneration controls only while the game is really using Ray Reconstruction.
+    volatile ULONGLONG fsrRrLastDispatchMs = 0;
     Upscaler newBackend = Upscaler::Reset;
 
     // XeSS debug stuff
@@ -481,10 +526,29 @@ class ScopedSkipHeapCapture
     ~ScopedSkipHeapCapture() { State::Instance().skipHeapCapture = previousState; }
 };
 
+// (AMDNR 0.3.3.2) Vulkan objects OptiScaler creates for itself, on this thread. Under Proton or DXVK its own
+// D3D12 / DXGI calls (the GPU probe, the Vulkan bridge's D3D12 device, Anti-Lag 2) create a VkInstance and a
+// VkDevice through the same hooks the game's go through, and those took them for the game's: State::
+// VulkanInstance pointed at an instance about to be destroyed, and the Anti-Lag 2 state at a dead device.
+// Decided per create call on the calling thread - never per instance (DXVK 2.4+ shares one VkInstance) and
+// never process-wide (vulkanSkipHooks is, so another thread's game device could be skipped). Read by the
+// Vulkan hooks while [Hooks] SkipOwnVulkanObjects is on. ScopedSkipVulkanHooks counts too.
+inline thread_local unsigned t_ownVulkanObjects = 0;
+inline bool CreatingOwnVulkanObjects() { return t_ownVulkanObjects != 0; }
+class ScopedOwnVulkanObjects
+{
+  public:
+    ScopedOwnVulkanObjects() { ++t_ownVulkanObjects; }
+    ~ScopedOwnVulkanObjects() { --t_ownVulkanObjects; }
+    ScopedOwnVulkanObjects(const ScopedOwnVulkanObjects&) = delete;
+    ScopedOwnVulkanObjects& operator=(const ScopedOwnVulkanObjects&) = delete;
+};
+
 class ScopedSkipVulkanHooks
 {
   private:
     bool previousState;
+    ScopedOwnVulkanObjects own; // (0.3.3.2) the per-thread mark, beside the process-wide flag
 
   public:
     ScopedSkipVulkanHooks()

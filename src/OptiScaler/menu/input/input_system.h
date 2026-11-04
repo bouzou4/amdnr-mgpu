@@ -1,7 +1,10 @@
+// Copyright (c) 2026 3zwr1 (AMDNR)
+// SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
 #include <Windows.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace OptiInput
@@ -229,5 +232,72 @@ bool ShouldBlockVirtualKey(int vk);
 
 bool IsExternalVirtualMouseAuthoritative();
 InputAcquisitionMode GetInputAcquisitionMode();
+
+// AMDNR 0.3.4.2 (Assetto Corsa menu): where a key or button edge came from, its event time, and the menu key's own
+// edge stream, so the menu toggles once per physical press (menu/input/KeyPressLatch.h), low-fps clicks are replayed
+// (menu/input/EdgeReplay.h) and the log says which source reaches the menu and how late.
+enum class InputEventSource : std::uint8_t
+{
+    None,
+    Poll,    // GetAsyncKeyState level read once per frame (BeginFrame)
+    PollTap, // GetAsyncKeyState "pressed since the last call" bit: a tap between two polls
+    Queue,   // PeekMessage / GetMessage detour (message removed from the queue)
+    WndProc, // the WndProc subclass
+    Raw,     // WM_INPUT
+};
+constexpr std::size_t InputEventSourceCount = 6;
+const char* InputEventSourceName(InputEventSource source);
+
+// One key as the menu code sees it now. Press* describe the freshest press edge since the last EndFrame.
+struct KeyObservation
+{
+    bool Down = false;
+    bool Pressed = false;
+    bool Released = false;
+    std::uint32_t PressCount = 0; // press edges so far (never reset): consume each edge once
+    DWORD PressTimeMs = 0;        // event time (message time; poll: tick of the poll)
+    InputEventSource PressSource = InputEventSource::None;
+    bool PressRepeat = false;     // WM_KEYDOWN autorepeat (lParam bit 30)
+    bool PolledThisFrame = false; // the poll read this key since the last EndFrame
+    bool PolledDown = false;      // the poll's last physical reading
+    bool PollDownBeforeValid = false;
+    DWORD PollDownBeforeMs = 0;   // last poll that saw it down, before this frame's poll
+};
+KeyObservation GetKeyObservation(int vk);
+
+// One edge of the menu key (SetMenuKey), in arrival order.
+struct KeyEdgeRecord
+{
+    bool Down = false;
+    InputEventSource Source = InputEventSource::None;
+    bool Repeat = false;
+    DWORD EventMs = 0;         // event time
+    DWORD SeenMs = 0;          // GetTickCount when OptiInput recorded it
+    bool PolledDown = false;   // the poll's last physical reading of the key at that moment
+    bool MenuVisible = false;
+};
+constexpr std::size_t MaxMenuKeyEdges = 32;
+// The menu key whose edges are recorded (0 = none); `readTapBit`: the poll also reads its "pressed since the last
+// call" bit (a tap between two polls becomes a press and a release), for the press latch only.
+void SetMenuKey(int vk, bool readTapBit);
+// Edges of the menu key since the last call, oldest first; returns how many were written (at most maxCount) and, in
+// `dropped`, how many older ones did not fit.
+std::size_t DrainMenuKeyEdges(KeyEdgeRecord* out, std::size_t maxCount, std::size_t* dropped);
+
+// The menu key closed the menu on its press: keep that key from the game (messages, raw input, its keyboard hooks,
+// DirectInput, the key state reads) until it is released: its key-up message, its raw key-up, its key-up at the
+// game's keyboard hook, or 3 s after the poll last saw it down; a press that closes the menu on release never reached
+// the game either. Nothing when the key is already up (a tap): a hold would keep its next press from the game.
+void HoldKeyUntilReleased(int vk);
+
+// [Hotfix] DiagInputHooksSkip tokens "presslatch" / "clickreplay": the two 0.3.4.2 menu input changes off (0.3.4.1
+// behaviour: the menu key toggles on release; clicks and nav keys only as a per-frame level).
+bool MenuPressLatchEnabled();
+bool MenuClickReplayEnabled();
+
+// One snapshot of what can keep input from the menu, on a menu open (first opens of a session only): window and
+// back-buffer sizes, DPI, clip, foreground, registered raw input devices, tracked hooks, DirectInput devices.
+void LogMenuOpenDiagnostics(int backBufferWidth, int backBufferHeight, float imguiDisplayWidth,
+                            float imguiDisplayHeight);
 
 } // namespace OptiInput

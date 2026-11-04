@@ -1299,7 +1299,9 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     if (willPresent && !state.reflexLimitsFps && state.activeFgOutput != FGOutput::NoFG &&
         !IdentifyGpu::getPrimaryGpu().usesDxvk && !XellHooks::canLimit())
     {
-        FrameLimit::sleep(fg != nullptr ? fg->IsActive() && !fg->IsPaused() : false);
+        const bool fgRunning = fg != nullptr && fg->IsActive() && !fg->IsPaused();
+        // The running multiplier: XeFG/DLSSG's live count (1 until set), 1 for FSR FG (IFGFeature::GetInterpolatedFrameCount)
+        FrameLimit::sleep(fgRunning, fgRunning ? fg->GetInterpolatedFrameCount() + 1 : 2);
     }
 
     if ((config->SimulateWaitableObject.value_or_default() ||

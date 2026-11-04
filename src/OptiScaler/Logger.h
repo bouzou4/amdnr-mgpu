@@ -1,3 +1,4 @@
+// Modifications Copyright (c) 2026 3zwr1 (AMDNR)
 #pragma once
 #include "SysUtils.h"
 #include <ankerl/unordered_dense.h>
@@ -5,6 +6,23 @@
 void PrepareLogger();
 void CloseLogger();
 void WaitForEnter();
+
+// OptiScaler.log session bookkeeping (Logger.cpp). BeginLogSession runs in DLL_PROCESS_ATTACH before
+// PrepareLogger: it keeps the previous log and writes this exe's running marker. LogSessionHeader runs
+// right after PrepareLogger: the session header line, then what BeginLogSession found. EndLogSession
+// runs in DLL_PROCESS_DETACH and removes the marker, which is what "clean exit" means at the next start -
+// but only while the marker still holds this session's header (a relaunched copy of the same exe may own
+// it by then). The check and the delete go through one handle, so nothing can rewrite it in between.
+void BeginLogSession();
+void LogSessionHeader();
+void EndLogSession();
+// (AMDNR 0.3.4, FB-L7) Called by the AMD bridge's RtlExitUserProcess hook as the game quits: stamps this session's
+// running marker, so a session that quit normally but did not reach DLL_PROCESS_DETACH is not reported as a missing
+// clean exit at the next start. kernel32 only, no allocation, no lock.
+void NoteSessionExitHook(long exitCode) noexcept;
+// (AMDNR 0.3.4, FB-L7, G1 review) The same hook, once AMDNR's own exit work has returned: a second stamp, "<what>
+// (<ms> ms)". Without it the next start still warns (that exit work did not finish). Same constraints.
+void NoteSessionExitDone(const char* what, unsigned long long ms) noexcept;
 
 #ifdef DLSS_PARAM_DUMP
 
