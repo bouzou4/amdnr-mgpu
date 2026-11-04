@@ -26,7 +26,7 @@
 
 static bool ShouldCreateDx11wDx12Swapchain()
 {
-    if (PluginApi::WantsDx11Interop())
+    if (PluginApi::WantsBridgedPresents())
         return true;
 
     return State::Instance().activeFgInput == FGInput::Upscaler && State::Instance().activeFgOutput != FGOutput::NoFG &&

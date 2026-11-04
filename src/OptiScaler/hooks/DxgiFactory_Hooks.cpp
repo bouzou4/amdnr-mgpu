@@ -565,7 +565,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
                                    State::Instance().activeFgOutput != FGOutput::NoFG &&
                                    State::Instance().activeFgInput != FGInput::NvngxFG;
             // A plugin's present callbacks see D3D11 games' frames on this D3D12 swapchain
-            if (!_skipFGSwapChainCreation && (fgInterop || PluginApi::WantsDx11Interop()))
+            if (!_skipFGSwapChainCreation && (fgInterop || PluginApi::WantsBridgedPresents()))
             {
                 auto hiddenHwnd = CreateHiddenSwapchainWindow();
 
@@ -964,7 +964,7 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
                                    State::Instance().activeFgOutput != FGOutput::NoFG &&
                                    State::Instance().activeFgInput != FGInput::NvngxFG;
             // A plugin's present callbacks see D3D11 games' frames on this D3D12 swapchain
-            if (!_skipFGSwapChainCreation && (fgInterop || PluginApi::WantsDx11Interop()))
+            if (!_skipFGSwapChainCreation && (fgInterop || PluginApi::WantsBridgedPresents()))
             {
                 // For dx11 swapchain
                 auto hiddenHwnd = CreateHiddenSwapchainWindow();

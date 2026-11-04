@@ -567,6 +567,16 @@ void MenuOverlayVk::DeviceCreated(VkDevice device, const VkDeviceCreateInfo* pCr
     }
 }
 
+bool MenuOverlayVk::QueueFamily(VkQueue queue, uint32_t* family)
+{
+    std::lock_guard lock(_queueFamiliesMutex);
+    auto it = _queueFamilies.find(queue);
+    if (it == _queueFamilies.end())
+        return false;
+    *family = it->second;
+    return true;
+}
+
 bool MenuOverlayVk::QueuePresent(VkQueue queue, VkPresentInfoKHR* pPresentInfo)
 {
     LOG_FUNC();

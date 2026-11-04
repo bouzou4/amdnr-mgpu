@@ -1107,7 +1107,7 @@ bool PluginApi::WantsHudless()
     return (_presentRequests.load(std::memory_order_relaxed) & OptiPresentRequest_Hudless) != 0;
 }
 
-bool PluginApi::WantsDx11Interop() { return HasPresentCallbacks() && WantsHudless(); }
+bool PluginApi::WantsBridgedPresents() { return HasPresentCallbacks() && WantsHudless(); }
 
 uint64_t PluginApi::LastUpscaleFrameId() { return _lastUpscaleFrameId.load(std::memory_order_relaxed); }
 

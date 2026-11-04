@@ -21,6 +21,7 @@
 
 #include <spoofing/Vulkan_Spoofing.h>
 #include <hudfix/Hudfix_Vk.h>
+#include <with_dx12/vk_present_dx12.h>
 
 #include <vulkan/vulkan.h>
 
@@ -808,6 +809,10 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     VkPresentInfoKHR localPresentInfo {};
     memcpy(&localPresentInfo, pPresentInfo, sizeof(VkPresentInfoKHR));
 
+    // Plugin present callbacks before the menu draws (frame generation off)
+    if (!dxgiBacked && (fg == nullptr || !fg->IsActive() || fg->IsPaused()))
+        VkPresentDx12::QueuePresent(queue, &localPresentInfo);
+
     // render menu if needed
     if (!dxgiBacked && !MenuOverlayVk::QueuePresent(queue, &localPresentInfo))
     {
@@ -896,6 +901,17 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
         }
     }
 
+    // Plugin present callbacks copy the swapchain image both ways
+    if (pCreateInfo != nullptr && !State::Instance().vulkanSkipHooks && !dxgiBacked && VkPresentDx12::Wanted())
+    {
+        if (pCreateInfo != &localCreateInfo)
+        {
+            localCreateInfo = *pCreateInfo;
+            pCreateInfo = &localCreateInfo;
+        }
+        VkPresentDx12::AdjustSwapchainInfo(_PD, &localCreateInfo);
+    }
+
     // The Reflex output needs the swapchain's low latency mode, games with VK_NV_low_latency2 enable it themselves
     VkSwapchainLatencyCreateInfoNV latencyCreateInfo {};
     bool lowLatencySwapchain = false;
@@ -958,6 +974,8 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
         _device = device;
         LOG_DEBUG("_device captured: {0:X}", (UINT64) _device);
 
+        VkPresentDx12::SwapchainCreated(device, _PD, *pSwapchain, pCreateInfo);
+
         auto hwnd = VulkanHooks::SurfaceWindow(pCreateInfo->surface);
         MenuOverlayVk::CreateSwapchain(device, _PD, _instance, hwnd != nullptr ? hwnd : _hwnd, pCreateInfo, pAllocator,
                                        pSwapchain);
@@ -978,6 +996,8 @@ static void hkvkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, c
 
     if (swapchain != VK_NULL_HANDLE)
         VulkanHooks::ForgetLowLatencySwapchain(swapchain);
+
+    VkPresentDx12::SwapchainDestroyed(device, swapchain);
 
     if (auto fg = State::Instance().currentVkFG; fg != nullptr)
     {
