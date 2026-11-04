@@ -23,7 +23,11 @@ struct Settings
     bool temporal = false;     // send the render card's motion vectors; NR keeps a network history
     double uiGate = 0.90;      // HUD-less: above this share of differing pixels the pair is wrong: no NR that frame
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
+    bool dred = false;         // DRED breadcrumbs and page faults on the display device (diagnostics)
 };
+
+// Once per device: removed reason and, with DRED on, the page fault and the last breadcrumbs
+void LogDeviceRemoved(ID3D12Device* device, const char* where);
 
 // Upscaler inputs of one frame, taken on the render card at the upscaler's Evaluate.
 struct Guides

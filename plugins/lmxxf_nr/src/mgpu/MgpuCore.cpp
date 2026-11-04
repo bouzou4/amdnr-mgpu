@@ -206,6 +206,17 @@ static bool EnsureDisplayDevice()
         return true;
     if (!s_env.createDevice)
         return false;
+    if (CurrentSettings().dred)
+    {
+        // Process wide, for devices created from here on
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred))))
+        {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            Log(0, "DRED on for the display device");
+        }
+    }
     ++t_internal;
     HRESULT hr = s_env.createDevice(t->display.Get(), IID_PPV_ARGS(&t->displayDevice));
     --t_internal;
@@ -233,6 +244,46 @@ static bool EnsureDisplayDevice()
 }
 
 ID3D12Device* DisplayDevice() { return EnsureDisplayDevice() ? s_topo->displayDevice.Get() : nullptr; }
+
+void LogDeviceRemoved(ID3D12Device* device, const char* where)
+{
+    static std::mutex m;
+    static std::vector<ID3D12Device*> done;
+    std::lock_guard g(m);
+    if (device == nullptr || std::find(done.begin(), done.end(), device) != done.end())
+        return;
+    done.push_back(device);
+    Log(2, std::format("{}: device removed reason {:X}", where, (uint32_t) device->GetDeviceRemovedReason()));
+    ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred))))
+        return;
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)))
+    {
+        Log(2, std::format("DRED page fault at {:X}", pf.PageFaultVA));
+        for (auto* n = pf.pHeadExistingAllocationNode; n; n = n->pNext)
+            Log(2, std::format("  existing allocation {} type {}", n->ObjectNameA ? n->ObjectNameA : "?", (int) n->AllocationType));
+        for (auto* n = pf.pHeadRecentFreedAllocationNode; n; n = n->pNext)
+            Log(2, std::format("  freed allocation {} type {}", n->ObjectNameA ? n->ObjectNameA : "?", (int) n->AllocationType));
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc {};
+    if (FAILED(dred->GetAutoBreadcrumbsOutput(&bc)))
+        return;
+    int lists = 0;
+    for (auto* n = bc.pHeadAutoBreadcrumbNode; n && lists < 24; n = n->pNext)
+    {
+        const UINT done2 = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+        if (done2 >= n->BreadcrumbCount)
+            continue; // finished
+        ++lists;
+        std::string ops;
+        for (UINT i = done2 > 2 ? done2 - 2 : 0; i < n->BreadcrumbCount && i < done2 + 4; i++)
+            ops += std::format("{}{}{} ", i == done2 ? "[" : "", (int) n->pCommandHistory[i], i == done2 ? "]" : "");
+        Log(2, std::format("DRED list {} queue {}: {}/{} ops done, around: {}",
+                           n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?",
+                           n->pCommandQueueDebugNameA ? n->pCommandQueueDebugNameA : "?", done2, n->BreadcrumbCount, ops));
+    }
+}
 ID3D12CommandQueue* DisplayQueue() { return EnsureDisplayDevice() ? s_topo->displayQueue.Get() : nullptr; }
 
 bool NrOnDisplay()

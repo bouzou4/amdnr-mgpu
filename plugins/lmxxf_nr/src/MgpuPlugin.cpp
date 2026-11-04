@@ -180,6 +180,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.temporal = api->GetBool(plugin, "MgpuMotionVectors", true);
     s.uiGate = std::clamp(api->GetFloat(plugin, "MgpuUiGate", 0.90f), 0.0f, 1.0f);
     s.maxLead = (unsigned) std::clamp(api->GetInt(plugin, "MgpuMaxFramesAhead", 1), 1, 3);
+    s.dred = api->GetBool(plugin, "MgpuDred", false);
 
     g_dir = dumpDir;
     Mgpu::Env e;

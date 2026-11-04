@@ -1052,8 +1052,9 @@ void NrEngine::CaptureMotion(OptiUpscaleFrame* f)
     auto* list = static_cast<ID3D12GraphicsCommandList*>(f->commandList);
     std::lock_guard lock(_mutex);
     _mvCap = {};
+    // Also without history: sequence dumps score against the vectors
     if (mv == nullptr || list == nullptr || _state != State::Ready || f->device != _device.Get() ||
-        !_settings.temporal || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return;
     LogMotion(f);
     const auto md = mv->GetDesc();

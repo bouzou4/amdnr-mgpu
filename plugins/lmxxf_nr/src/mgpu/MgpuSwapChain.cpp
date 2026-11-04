@@ -870,7 +870,10 @@ void ProxySwapChain::PresenterLoop()
             slotDisplayValue[s] = _dValue;
         }
         if (FAILED(hr))
+        {
             Log(2, std::format("real Present failed {:X}", (uint32_t) hr));
+            LogDeviceRemoved(_ddev.Get(), "display");
+        }
 
         lk.lock();
         _consumed = g;
