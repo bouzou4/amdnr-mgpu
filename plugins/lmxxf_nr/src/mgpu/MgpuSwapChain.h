@@ -171,6 +171,19 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     std::mutex _scMutex; // serialises the game's calls on the real swapchain (not the presenter's Present)
     std::atomic<BOOL> _fsCached { FALSE };
     UINT _presentFails = 0, _renewals = 0;
+    struct FrameTrace
+    {
+        UINT64 g = 0;
+        bool tiles = false, hud = false, nr = false, sendAtQueue = false, sendAtPresent = false;
+    };
+    static constexpr UINT kTrace = 16;
+    FrameTrace _trace[kTrace] {}; // presenter: the last frames, logged when the display device is lost
+    UINT64 _sendPendingAtPresent = 0;
+    struct
+    {
+        double idle = 0, sendWait = 0, rec = 0, gate = 0; // presenter time per frame (EMA, ms)
+        std::chrono::steady_clock::time_point lastPresent {};
+    } _tm;
     std::atomic<bool> _tearingOff { false };
     std::mutex _fsM;
     ComPtr<IDXGIOutput> _fsOutput;
@@ -203,6 +216,23 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     class TileDiff* _diff = nullptr;
     class TileScatter* _scatter = nullptr;
     std::vector<Guides> _mvConst;
+    // motion vectors packed losslessly on the render card (perf skip bit 256: sent raw)
+    class MvPack* _mvPackR = nullptr;
+    std::vector<ComPtr<ID3D12Resource>> _mvPacked; // per game back buffer
+    std::vector<D3D12_RESOURCE_DESC> _mvDesc;      // the staging's texture (the staging is a footprint buffer)
+    std::vector<UINT64> _mvPackTag;
+    ComPtr<ID3D12Resource> _mvTotal, _mvTotalRb;
+    ComPtr<ID3D12CommandAllocator> _encAlloc[4];
+    ComPtr<ID3D12GraphicsCommandList> _encList;
+    UINT64 _encValue[4] {}, _encCount = 0;
+    void EncodeMotion(UINT i, UINT64 g);
+    ComPtr<ID3D12Resource> _markRb;
+    UINT* _markMapped = nullptr;
+    UINT _longSendWaits = 0;
+    ComPtr<ID3D12CommandAllocator> _markAlloc[K];
+    ComPtr<ID3D12GraphicsCommandList> _markList[K];
+    void Mark(ID3D12GraphicsCommandList* c, UINT what, UINT64 g);
+    void LogMarks(UINT64 g);
     UINT64 _hudOffset = 0, _mvOffset = 0, _mvCap = 0;
     ComPtr<ID3D12CommandAllocator> _rxAlloc[K];
     ComPtr<ID3D12GraphicsCommandList> _rxList[K];
@@ -217,6 +247,8 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
         bool tiles = false; // hud holds only the runs, the rest of the HUD-less colour is the back buffer
         std::vector<TileRun> runs;
         UINT64 tileBytes = 0;
+        bool mvPacked = false;
+        UINT64 mvBytes = 0;
         Guides g;
         D3D12_RESOURCE_DESC mvDesc {};
     } _meta[K];
@@ -230,7 +262,8 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT64 _dummyKey = 0;
 
     // display card
-    ComPtr<ID3D12Resource> _hudD, _mvD, _nrD, _bbD, _compD, _tileStageD;
+    ComPtr<ID3D12Resource> _hudD, _mvD, _nrD, _bbD, _compD, _tileStageD, _mvStageD, _mvLinD;
+    class MvPack* _mvPackD = nullptr;
     std::vector<ComPtr<ID3D12Resource>> _graveD;
     ComPtr<ID3D12CommandAllocator> _dxAlloc[K], _duAlloc[K]; // ingest of the extras, UI pass
     ComPtr<ID3D12GraphicsCommandList> _dxList[K], _duList[K];

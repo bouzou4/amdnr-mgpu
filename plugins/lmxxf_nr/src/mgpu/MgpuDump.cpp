@@ -136,4 +136,45 @@ bool DumpTexture(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* tex, 
     Log(0, std::format("dumped {}x{} fmt {}", w, h, (int) d.Format));
     return true;
 }
+bool DumpBuffer(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* buf, UINT64 rowPitch, UINT64 rowBytes,
+                UINT rows, const std::wstring& base)
+{
+    const UINT64 n = rowPitch * rows;
+    D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC b {};
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    b.Width = n;
+    b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+    b.SampleDesc.Count = 1;
+    b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> rb;
+    ComPtr<ID3D12CommandAllocator> a;
+    ComPtr<ID3D12GraphicsCommandList> l;
+    ComPtr<ID3D12Fence> f;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(&rb))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a.Get(), nullptr, IID_PPV_ARGS(&l))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))))
+        return false;
+    l->CopyBufferRegion(rb.Get(), 0, buf, 0, n);
+    l->Close();
+    ID3D12CommandList* ls[] = { l.Get() };
+    q->ExecuteCommandLists(1, ls);
+    q->Signal(f.Get(), 1);
+    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    f->SetEventOnCompletion(1, e);
+    WaitForSingleObject(e, 5000);
+    CloseHandle(e);
+    uint8_t* p = nullptr;
+    if (FAILED(rb->Map(0, nullptr, (void**) &p)))
+        return false;
+    {
+        std::ofstream raw(base + L".raw", std::ios::binary);
+        for (UINT y = 0; y < rows; ++y)
+            raw.write((const char*) p + UINT64(y) * rowPitch, rowBytes);
+    }
+    rb->Unmap(0, nullptr);
+    return true;
+}
 } // namespace Mgpu

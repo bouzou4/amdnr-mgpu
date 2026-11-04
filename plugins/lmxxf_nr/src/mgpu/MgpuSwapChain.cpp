@@ -1,6 +1,7 @@
 #include "MgpuCommon.h"
 #include "MgpuSwapChain.h"
 #include "MgpuComposite.h"
+#include "MvPack.h"
 
 #include <format>
 
@@ -70,6 +71,23 @@ static D3D12_RESOURCE_BARRIER Tr(ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D
     v.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     v.Transition = { r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, a, b };
     return v;
+}
+
+static ComPtr<ID3D12Resource> Buf(ID3D12Device* d, UINT64 n, D3D12_HEAP_TYPE type, D3D12_RESOURCE_FLAGS fl,
+                                  D3D12_RESOURCE_STATES s)
+{
+    D3D12_RESOURCE_DESC b {};
+    b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    b.Width = (n + 255) & ~255ull;
+    b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+    b.SampleDesc.Count = 1;
+    b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    b.Flags = fl;
+    D3D12_HEAP_PROPERTIES hp { type };
+    ComPtr<ID3D12Resource> r;
+    if (FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &b, s, nullptr, IID_PPV_ARGS(&r))))
+        r.Reset();
+    return r;
 }
 
 static ComPtr<ID3D12Resource> Tex(ID3D12Device* d, UINT64 w, UINT h, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS fl,
@@ -355,6 +373,32 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
             _mvCap = AlignUp(mt, 65536);
             slot += _mvCap;
             _mvR.resize(_gameCount);
+            _mvDesc.assign(_gameCount, D3D12_RESOURCE_DESC {});
+            _mvPacked.clear();
+            _mvPacked.resize(_gameCount);
+            _mvPackTag.assign(_gameCount, 0);
+            if (!_mvPackR)
+            {
+                _mvPackR = new MvPack();
+                if (!_mvPackR->Init(_rdev.Get()))
+                {
+                    Log(1, std::format("motion vector packing unavailable ({}): sent raw", _mvPackR->Error()));
+                    delete _mvPackR;
+                    _mvPackR = nullptr;
+                }
+            }
+            const auto ua = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            _mvTotal = Buf(_rdev.Get(), 256, D3D12_HEAP_TYPE_DEFAULT, ua, D3D12_RESOURCE_STATE_COMMON);
+            _mvTotalRb = Buf(_rdev.Get(), 4 * _gameCount, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_COPY_DEST);
+            for (auto& a : _encAlloc)
+                _rdev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+            _encList.Reset();
+            if (_encAlloc[0] && SUCCEEDED(_rdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _encAlloc[0].Get(),
+                                                                    nullptr, IID_PPV_ARGS(&_encList))))
+                _encList->Close();
+            for (auto& v : _encValue)
+                v = 0;
         }
     }
     _slotBytes = slot;
@@ -464,6 +508,23 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
                 return hr;
         }
     }
+    if (_wantMv)
+    {
+        _mvStageD = Buf(_ddev.Get(), _mvCap, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+        if (_mvStageD)
+            _mvStageD->SetName(L"Mgpu motion stage D");
+        _mvLinD.Reset();
+        if (!_mvPackD)
+        {
+            _mvPackD = new MvPack();
+            if (!_mvPackD->Init(_ddev.Get()))
+            {
+                Log(1, std::format("motion vector unpacking unavailable ({}): sent raw", _mvPackD->Error()));
+                delete _mvPackD;
+                _mvPackD = nullptr;
+            }
+        }
+    }
     if (_wantHud)
     {
         const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -492,6 +553,8 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
             _tileStageD.Reset();
             _ddev->CreateCommittedResource(&dp, D3D12_HEAP_FLAG_NONE, &sb, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                            IID_PPV_ARGS(&_tileStageD));
+            if (_tileStageD)
+                _tileStageD->SetName(L"Mgpu tile stage D");
         }
         if (!_ui)
         {
@@ -571,6 +634,17 @@ HRESULT ProxySwapChain::CreateFallbackLists()
 HRESULT ProxySwapChain::CreateIngestLists()
 {
     HRESULT hr;
+    if (!_markRb)
+    {
+        _markRb = Buf(_ddev.Get(), 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (_markRb && FAILED(_markRb->Map(0, nullptr, (void**) &_markMapped))) // stays mapped: readable after a removal
+            _markMapped = nullptr;
+        for (UINT s = 0; s < K && _markRb; ++s)
+            if (SUCCEEDED(_ddev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_markAlloc[s]))) &&
+                SUCCEEDED(_ddev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _markAlloc[s].Get(), nullptr,
+                                                   IID_PPV_ARGS(&_markList[s]))))
+                _markList[s]->Close();
+    }
     _dAlloc.resize(K * _realCount);
     _dList.resize(K * _realCount);
     for (UINT s = 0; s < K; ++s)
@@ -737,6 +811,13 @@ void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
     }
     dropAll(_fList);
     dropAll(_fAlloc);
+    drop(_encList);
+    for (auto& a : _encAlloc)
+        drop(a);
+    drop(_mvTotal);
+    drop(_mvTotalRb);
+    drop(_mvStageD);
+    drop(_mvLinD);
     if (retire && _ui)
         _retiredUi.push_back(_ui);
     else
@@ -770,6 +851,7 @@ void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
         std::lock_guard g(_capM);
         dropAll(_hudR);
         dropAll(_mvR);
+        dropAll(_mvPacked);
         dropAll(_graveR);
     }
     drop(_hudD);
@@ -857,23 +939,29 @@ void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& g
         _loggedMvFmt = true;
         return;
     }
-    if (!_mvR[i] || _mvR[i]->GetDesc().Width != m.Width || _mvR[i]->GetDesc().Height != m.Height ||
-        _mvR[i]->GetDesc().Format != m.Format)
+    // the staging is a buffer in the copyable footprint's layout: the send copies it as is, the packing reads it raw
+    if (!_mvR[i] || _mvDesc[i].Width != m.Width || _mvDesc[i].Height != m.Height || _mvDesc[i].Format != m.Format)
     {
         if (_mvR[i])
             _graveR.push_back(_mvR[i]);
-        D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
-        _mvR[i].Reset();
-        if (FAILED(_rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &m, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                  IID_PPV_ARGS(&_mvR[i]))))
+        if (_mvPacked[i])
+            _graveR.push_back(_mvPacked[i]);
+        _mvPacked[i].Reset();
+        _mvR[i] = Buf(_rdev.Get(), need, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+        if (!_mvR[i])
             return;
+        _mvDesc[i] = m;
+        if (_mvPackR)
+            _mvPacked[i] = Buf(_rdev.Get(), MvPack::MaxBytes(UINT(m.Width), m.Height), D3D12_HEAP_TYPE_DEFAULT,
+                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Log(0, std::format("motion staging {} {}x{} fmt {}", i, m.Width, m.Height, (int) m.Format));
     }
     D3D12_RESOURCE_BARRIER b[2] = { Tr(_mvR[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
                                     Tr(gd.motion, gd.motionState, D3D12_RESOURCE_STATE_COPY_SOURCE) };
     const UINT nb = gd.motionState == D3D12_RESOURCE_STATE_COPY_SOURCE ? 1 : 2;
     cl->ResourceBarrier(nb, b);
-    D3D12_TEXTURE_COPY_LOCATION dl { _mvR[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION dl { _mvR[i].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    _rdev->GetCopyableFootprints(&m, 0, 1, 0, &dl.PlacedFootprint, nullptr, nullptr, nullptr);
     D3D12_TEXTURE_COPY_LOCATION sl { gd.motion, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
     cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
     for (auto& x : b)
@@ -1010,12 +1098,25 @@ void ProxySwapChain::PresenterLoop()
             }
         }
         slotCounted[s] = false;
-        // the frame's send is complete (CPU) before any display work or Present is queued behind it
+        // The send is complete (CPU) before any display work or Present is queued behind it (perf skip bit 64: GPU
+        // wait only, which hung at the first HUD-less frames without NR). Not the whole display hang story yet.
+        using Clock = std::chrono::steady_clock;
+        const auto tPick = Clock::now();
         if (!(Perf().skip.load() & 64))
-            WaitFence(_filledD.Get(), g, 1000);
+        {
+            // no timeout that lets work queue behind it: a loading hitch can hold a send for seconds
+            for (int k = 0; k < 10 && _filledD->GetCompletedValue() < g; ++k)
+                WaitFence(_filledD.Get(), g, 1000);
+            const double w = std::chrono::duration<double, std::milli>(Clock::now() - tPick).count();
+            if (w > 900 && _longSendWaits++ < 20)
+                Log(1, std::format("frame {}: send wait {:.0f} ms, done {}", g, w, _filledD->GetCompletedValue() >= g));
+        }
+        const auto tSent = Clock::now();
+        FrameTrace& tr = _trace[g % kTrace];
+        tr = { g, meta.tiles, meta.hud, false, _filledD->GetCompletedValue() >= g, false };
 
-        double nrMs = 0;
-        bool hudFrame = false;
+        double nrMs = 0, gateMs = 0, recMs = 0;
+        bool hudFrame = false, early = false;
         HRESULT hr;
         UINT pfUsed = 0;
         {
@@ -1039,8 +1140,17 @@ void ProxySwapChain::PresenterLoop()
                     _ddev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, ns, nullptr, IID_PPV_ARGS(&_mvD));
                     if (_mvD)
                         _mvD->SetName(L"Mgpu motion D");
+                    if (_mvLinD)
+                        _graveD.push_back(_mvLinD);
+                    _mvLinD.Reset();
                 }
-                haveMv = meta.mv && _mvD;
+                if (meta.mvPacked && !_mvLinD && _mvPackD)
+                    _mvLinD = Buf(_ddev.Get(), UINT64(MvPack::Pitch(UINT(meta.mvDesc.Width))) * meta.mvDesc.Height,
+                                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_COMMON);
+                if (_mvLinD)
+                    _mvLinD->SetName(L"Mgpu motion linear D");
+                haveMv = meta.mv && _mvD && (!meta.mvPacked || (_mvPackD && _mvLinD && _mvStageD));
                 _dxAlloc[s]->Reset();
                 auto* c = _dxList[s].Get();
                 c->Reset(_dxAlloc[s].Get(), nullptr);
@@ -1094,13 +1204,52 @@ void ProxySwapChain::PresenterLoop()
                 }
                 else if (haveHud)
                     ingest(_hudD.Get(), _hudOffset);
-                if (haveMv)
+                if (haveMv && meta.mvPacked)
+                {
+                    // one linear read of the packed vectors into VRAM, unpacked into the footprint, copied in
+                    const UINT mw = UINT(meta.mvDesc.Width), mh = meta.mvDesc.Height;
+                    const auto ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, cm = D3D12_RESOURCE_STATE_COMMON;
+                    auto t0 = Tr(_mvStageD.Get(), cm, D3D12_RESOURCE_STATE_COPY_DEST);
+                    c->ResourceBarrier(1, &t0);
+                    c->CopyBufferRegion(_mvStageD.Get(), 0, _slotD[s].Get(), _mvOffset, meta.mvBytes);
+                    D3D12_RESOURCE_BARRIER t1[2] = { Tr(_mvStageD.Get(), D3D12_RESOURCE_STATE_COPY_DEST, ns),
+                                                     Tr(_mvLinD.Get(), cm, ua) };
+                    c->ResourceBarrier(2, t1);
+                    _mvPackD->Decode(c, s, _mvStageD.Get(), mw, mh, _mvLinD.Get());
+                    D3D12_RESOURCE_BARRIER t2[3] = { Tr(_mvStageD.Get(), ns, cm),
+                                                     Tr(_mvLinD.Get(), ua, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                     Tr(_mvD.Get(), ns, D3D12_RESOURCE_STATE_COPY_DEST) };
+                    c->ResourceBarrier(3, t2);
+                    D3D12_TEXTURE_COPY_LOCATION dl { _mvD.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                    D3D12_TEXTURE_COPY_LOCATION sl { _mvLinD.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                    auto dd = _mvD->GetDesc();
+                    _ddev->GetCopyableFootprints(&dd, 0, 1, 0, &sl.PlacedFootprint, nullptr, nullptr, nullptr);
+                    c->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                    D3D12_RESOURCE_BARRIER t3[2] = { Tr(_mvLinD.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, cm),
+                                                     Tr(_mvD.Get(), D3D12_RESOURCE_STATE_COPY_DEST, ns) };
+                    c->ResourceBarrier(2, t3);
+                }
+                else if (haveMv)
                     ingest(_mvD.Get(), _mvOffset);
+                Mark(c, 0, g);
                 c->Close();
                 l[nl++] = c;
             }
             _dq->ExecuteCommandLists(nl, l);
+            const auto tRec = Clock::now();
             _dq->Signal(_releasedD.Get(), g);
+            // the slot is taken: the game may queue its next frame while this one waits for NR and presents
+            // (perf skip bit 128: only after the Present)
+            early = !(Perf().skip.load() & 128);
+            if (early)
+            {
+                lk.lock();
+                _consumed = g;
+                lk.unlock();
+                _cv.notify_all();
+                if (_waitable)
+                    ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(released, 8), nullptr);
+            }
             const bool probe = _probeFrames > 0;
             if (probe)
             {
@@ -1204,6 +1353,15 @@ void ProxySwapChain::PresenterLoop()
                 ID3D12GraphicsCommandList* c = nullptr;
                 auto t0 = std::chrono::steady_clock::now();
                 const bool wrote = env.nrFrame(_ddev.Get(), _dq.Get(), in);
+                if (_markList[s])
+                {
+                    _markAlloc[s]->Reset();
+                    _markList[s]->Reset(_markAlloc[s].Get(), nullptr);
+                    Mark(_markList[s].Get(), 1, g);
+                    _markList[s]->Close();
+                    ID3D12CommandList* ml[] = { _markList[s].Get() };
+                    _dq->ExecuteCommandLists(1, ml);
+                }
                 nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 if (useHud)
                 {
@@ -1219,6 +1377,7 @@ void ProxySwapChain::PresenterLoop()
                     for (auto& x : b)
                         std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
                     c->ResourceBarrier(2, b);
+                    Mark(c, 2, g);
                     c->Close();
                     ID3D12CommandList* cl[] = { c };
                     _dq->ExecuteCommandLists(1, cl);
@@ -1233,6 +1392,7 @@ void ProxySwapChain::PresenterLoop()
                 // NR off: the mask is still measured (and dumped) so the gate can be checked without NR
                 auto* c = prepUi();
                 _ui->Record(c, s, _bbD.Get(), _hudD.Get(), nullptr, nullptr, _gameDesc.Width, _gameDesc.Height);
+                Mark(c, 2, g);
                 c->Close();
                 ID3D12CommandList* cl[] = { c };
                 _dq->ExecuteCommandLists(1, cl);
@@ -1241,8 +1401,11 @@ void ProxySwapChain::PresenterLoop()
             if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
+            const auto tSettle = Clock::now();
             if (env.nrSettle)
                 env.nrSettle();
+            gateMs = std::chrono::duration<double, std::milli>(Clock::now() - tSettle).count();
+            recMs = std::chrono::duration<double, std::milli>(tRec - tSent).count();
             if (probe)
             {
                 _dq->Signal(_dFence.Get(), ++_dValue);
@@ -1256,6 +1419,10 @@ void ProxySwapChain::PresenterLoop()
             if (sync == 0 && _tearing && !fs && !_tearingOff)
                 pf |= DXGI_PRESENT_ALLOW_TEARING;
             pfUsed = pf;
+            tr.nr = nrMs > 0;
+            tr.sendAtPresent = _filledD->GetCompletedValue() >= g;
+            if (!tr.sendAtPresent)
+                _sendPendingAtPresent++;
             hr = _real->Present(sync, pf);
             if (hr == DXGI_ERROR_INVALID_CALL && (pf & DXGI_PRESENT_ALLOW_TEARING))
             {
@@ -1286,6 +1453,13 @@ void ProxySwapChain::PresenterLoop()
                                    rd.Flags, fd.Windowed));
             }
             LogDeviceRemoved(_ddev.Get(), "display");
+            if (_presentFails == 1)
+                LogMarks(g);
+            if (_presentFails == 1)
+                for (UINT64 k = g >= kTrace ? g - kTrace + 1 : 1; k <= g; ++k)
+                    if (const auto& x = _trace[k % kTrace]; x.g == k)
+                        Log(1, std::format("trace frame {}: tiles {} hud {} nr {} send done at queue {} at present {}", x.g,
+                                           x.tiles, x.hud, x.nr, x.sendAtQueue, x.sendAtPresent));
             const HRESULT why = _ddev->GetDeviceRemovedReason();
             if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG ||
                 FAILED(why))
@@ -1308,12 +1482,15 @@ void ProxySwapChain::PresenterLoop()
 
         if (!_retired.empty() && _presentCount >= _retireAfter)
             ReleaseRetired();
-        lk.lock();
-        _consumed = g;
-        lk.unlock();
-        _cv.notify_all();
-        if (_waitable)
-            ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(released, 8), nullptr);
+        if (!early)
+        {
+            lk.lock();
+            _consumed = g;
+            lk.unlock();
+            _cv.notify_all();
+            if (_waitable)
+                ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(released, 8), nullptr);
+        }
 
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard sg(StatsMutex());
@@ -1342,15 +1519,23 @@ void ProxySwapChain::PresenterLoop()
         }
         if (nrMs > 0)
             st.nrMs = Ema(st.nrMs, nrMs);
+        _tm.sendWait = Ema(_tm.sendWait, std::chrono::duration<double, std::milli>(tSent - tPick).count() + 1e-6);
+        _tm.rec = Ema(_tm.rec, recMs + 1e-6);
+        _tm.gate = Ema(_tm.gate, gateMs + 1e-6);
+        if (_tm.lastPresent.time_since_epoch().count())
+            _tm.idle = Ema(_tm.idle, std::chrono::duration<double, std::milli>(tPick - _tm.lastPresent).count() + 1e-6);
+        _tm.lastPresent = now;
         st.ringDepth = UINT(_scheduled - g);
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
                                "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
-                               "hudless {} missed {} ui {:.2f}% gate {} motion {} tiles {:.1f}%",
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {} tiles {:.1f}% mv {:.1f}% send pending at present {}; "
+                               "presenter idle {:.3f} send wait {:.3f} record {:.3f} answer wait {:.3f} ms",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
                                st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
-                               st.hudTileShare * 100));
+                               st.hudTileShare * 100, st.mvShare * 100, _sendPendingAtPresent, _tm.idle, _tm.sendWait,
+                               _tm.rec, _tm.gate));
     }
 }
 
@@ -1398,9 +1583,19 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         if (i < _hudR.size() && _hudTag[i] == next)
             DumpTexture(_rdev.Get(), _gameQueue.Get(), _hudR[i].Get(), D3D12_RESOURCE_STATE_COMMON,
                         env.dumpDir + std::format(L"\\f{:06}_hudsrc", next));
+        if (i < _mvR.size() && _mvR[i] && _mvTag[i] == next)
+        {
+            UINT rows = 0;
+            UINT64 rowBytes = 0;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+            _rdev->GetCopyableFootprints(&_mvDesc[i], 0, 1, 0, &fp, &rows, &rowBytes, nullptr);
+            DumpBuffer(_rdev.Get(), _gameQueue.Get(), _mvR[i].Get(), fp.Footprint.RowPitch, rowBytes, rows,
+                       env.dumpDir + std::format(L"\\f{:06}_mvsrc", next));
+        }
     }
     if (_lost)
         return PresentFallback(sync, flags);
+    EncodeMotion(i, next);
     _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
 
     {
@@ -1492,7 +1687,7 @@ void ProxySwapChain::Send(const Job& j)
         nl = 0;
     }
     SlotMeta meta {};
-    double tileShare = -1;
+    double tileShare = -1, mvShare = -1;
     if (_rxList[s])
     {
         std::lock_guard cg(_capM);
@@ -1574,9 +1769,30 @@ void ProxySwapChain::Send(const Job& j)
                 send(_hudR[i].Get(), _hudOffset);
             if (meta.mv)
             {
-                send(_mvR[i].Get(), _mvOffset);
+                if (_mvPackTag[i] == g && _mvPacked[i])
+                {
+                    // the packed size is on the CPU once the game's work of the frame is done
+                    WaitFence(_rgameFence.Get(), j.gameValue, 500);
+                    UINT32* p = nullptr;
+                    D3D12_RANGE r { 4 * SIZE_T(i), 4 * SIZE_T(i) + 4 };
+                    if (_rgameFence->GetCompletedValue() >= j.gameValue && SUCCEEDED(_mvTotalRb->Map(0, &r, (void**) &p)))
+                    {
+                        const UINT64 bytes = p[i];
+                        D3D12_RANGE none { 0, 0 };
+                        _mvTotalRb->Unmap(0, &none);
+                        if (bytes > 0 && bytes < _mvR[i]->GetDesc().Width && bytes <= _mvCap)
+                        {
+                            c->CopyBufferRegion(_slotR[s].Get(), _mvOffset, _mvPacked[i].Get(), 0, bytes);
+                            meta.mvPacked = true;
+                            meta.mvBytes = bytes;
+                            mvShare = double(bytes) / double(_mvR[i]->GetDesc().Width);
+                        }
+                    }
+                }
+                if (!meta.mvPacked)
+                    c->CopyBufferRegion(_slotR[s].Get(), _mvOffset, _mvR[i].Get(), 0, _mvR[i]->GetDesc().Width);
                 meta.g = _mvConst[i];
-                meta.mvDesc = _mvR[i]->GetDesc();
+                meta.mvDesc = _mvDesc[i];
             }
             if (!onGame)
             {
@@ -1622,6 +1838,64 @@ void ProxySwapChain::Send(const Job& j)
     }
     if (tileShare >= 0)
         st.hudTileShare = Ema(st.hudTileShare, tileShare);
+    if (meta.mv)
+        st.mvShare = Ema(st.mvShare, meta.mvPacked ? mvShare : 1.0);
+}
+
+// Display queue progress (readback, survives a removal): [0] ingest, [1] network, [2] UI composite, as frame ids
+void ProxySwapChain::Mark(ID3D12GraphicsCommandList* c, UINT what, UINT64 g)
+{
+    ComPtr<ID3D12GraphicsCommandList2> c2;
+    if (!_markRb || FAILED(c->QueryInterface(IID_PPV_ARGS(&c2))))
+        return;
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER p { _markRb->GetGPUVirtualAddress() + 4 * what, UINT(g) };
+    D3D12_WRITEBUFFERIMMEDIATE_MODE m = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+    c2->WriteBufferImmediate(1, &p, &m);
+}
+
+void ProxySwapChain::LogMarks(UINT64 g)
+{
+    const volatile UINT* p = _markMapped;
+    if (!p)
+        return;
+    const UINT a = p[0], b = p[1], c = p[2];
+    Log(1, std::format("display queue progress at frame {}: ingest {} network {} UI composite {}", g, a, b, c));
+}
+
+// Render thread: packs the frame's motion vectors on the game queue, ahead of the frame's fence
+void ProxySwapChain::EncodeMotion(UINT i, UINT64 g)
+{
+    if (!_mvPackR || !_encList || !_mvTotal || !_mvTotalRb || (Perf().skip.load() & 256))
+        return;
+    std::lock_guard cg(_capM);
+    if (!_wantMv || i >= _mvR.size() || _mvTag[i] != g || !_mvR[i] || !_mvPacked[i])
+        return;
+    const UINT n = UINT(_encCount++ % 4);
+    WaitFence(_rgameFence.Get(), _encValue[n], 500);
+    if (_rgameFence->GetCompletedValue() < _encValue[n])
+        return;
+    _encAlloc[n]->Reset();
+    auto* c = _encList.Get();
+    c->Reset(_encAlloc[n].Get(), nullptr);
+    const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_BARRIER b[3] = { Tr(_mvR[i].Get(), D3D12_RESOURCE_STATE_COMMON, ns),
+                                    Tr(_mvPacked[i].Get(), D3D12_RESOURCE_STATE_COMMON, ua),
+                                    Tr(_mvTotal.Get(), D3D12_RESOURCE_STATE_COMMON, ua) };
+    c->ResourceBarrier(3, b);
+    _mvPackR->Encode(c, n, _mvR[i].Get(), UINT(_mvDesc[i].Width), _mvDesc[i].Height, _mvPacked[i].Get(), _mvTotal.Get());
+    D3D12_RESOURCE_BARRIER a[3] = { Tr(_mvR[i].Get(), ns, D3D12_RESOURCE_STATE_COMMON),
+                                    Tr(_mvPacked[i].Get(), ua, D3D12_RESOURCE_STATE_COMMON),
+                                    Tr(_mvTotal.Get(), ua, D3D12_RESOURCE_STATE_COPY_SOURCE) };
+    c->ResourceBarrier(3, a);
+    c->CopyBufferRegion(_mvTotalRb.Get(), 4 * UINT64(i), _mvTotal.Get(), 4 * UINT64(n), 4);
+    auto z = Tr(_mvTotal.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    c->ResourceBarrier(1, &z);
+    if (FAILED(c->Close()))
+        return;
+    ID3D12CommandList* l[] = { c };
+    _gameQueue->ExecuteCommandLists(1, l);
+    _encValue[n] = _rgameValue + 1; // the frame's fence, signalled next
+    _mvPackTag[i] = g;
 }
 
 // Display card gone: the game keeps its back buffers, a swapchain on the render card's queue presents copies of them
@@ -1744,6 +2018,10 @@ ProxySwapChain::~ProxySwapChain()
     _diff = nullptr;
     delete _scatter;
     _scatter = nullptr;
+    delete _mvPackR;
+    _mvPackR = nullptr;
+    delete _mvPackD;
+    _mvPackD = nullptr;
     _real.Reset();
     if (_waitable)
         CloseHandle(_waitable);

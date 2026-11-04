@@ -59,6 +59,7 @@
     <ClInclude Include="src\mgpu\MgpuComposite.h" />
     <ClInclude Include="src\mgpu\MgpuCore.h" />
     <ClInclude Include="src\mgpu\MgpuSwapChain.h" />
+    <ClInclude Include="src\mgpu\MvPack.h" />
     <ClInclude Include="third_party\lmxxf\LmxxfNrApi.h" />
   </ItemGroup>
   <ItemGroup>
@@ -71,6 +72,7 @@
     <ClCompile Include="src\mgpu\MgpuDump.cpp" />
     <ClCompile Include="src\mgpu\MgpuGpuLoad.cpp" />
     <ClCompile Include="src\mgpu\MgpuSwapChain.cpp" />
+    <ClCompile Include="src\mgpu\MvPack.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

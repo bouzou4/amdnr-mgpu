@@ -114,6 +114,7 @@ struct Stats
     bool outputHdr = false;
     uint32_t colorSpace = 0; // the game's SetColorSpace1
     double hudTileShare = -1; // share of HUD-less tiles sent (they differ from the back buffer)
+    double mvShare = -1;      // packed motion vector bytes over the raw size
 };
 
 void Configure(const Settings& s, const Env& e);
@@ -171,4 +172,7 @@ std::mutex& StatsMutex();
 void StartLoadSampler();
 bool DumpTexture(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* tex, D3D12_RESOURCE_STATES state,
                  const std::wstring& base);
+// base.raw: rows x rowBytes of a buffer laid out at rowPitch (in COMMON)
+bool DumpBuffer(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* buf, UINT64 rowPitch, UINT64 rowBytes,
+                UINT rows, const std::wstring& base);
 } // namespace Mgpu
