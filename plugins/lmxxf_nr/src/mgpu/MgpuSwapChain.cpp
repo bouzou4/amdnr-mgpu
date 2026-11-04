@@ -690,6 +690,22 @@ static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
     CloseHandle(e);
 }
 
+// Before a slot's allocators are reset: its previous work must be done (a 500 ms cap reset them in flight)
+static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what)
+{
+    if (!f || f->GetCompletedValue() >= v)
+        return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int k = 0; k < 10 && f->GetCompletedValue() < v; ++k)
+        WaitFence(f, v, 1000);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const bool done = f->GetCompletedValue() >= v;
+    static std::atomic<int> logged { 0 };
+    if ((ms > 400 || !done) && logged++ < 20)
+        Log(1, std::format("{}: slot reuse waited {:.0f} ms for {} (done {})", what, ms, v, done));
+    return done;
+}
+
 HRESULT ProxySwapChain::CreatePerf()
 {
     HRESULT hr;
@@ -1075,7 +1091,7 @@ void ProxySwapChain::PresenterLoop()
         }
 
         // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
-        WaitFence(_dFence.Get(), slotDisplayValue[s], 500);
+        WaitReuse(_dFence.Get(), slotDisplayValue[s], "display");
         double ingestMs = -1;
         if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
@@ -1679,7 +1695,7 @@ void ProxySwapChain::Send(const Job& j)
     UINT nl = (skip & 1) ? 0 : 1;
     // the slot's previous send lists must be done before their allocators are reset
     if (g > K)
-        WaitFence(_filledR.Get(), g - K, 500);
+        WaitReuse(_filledR.Get(), g - K, "send");
     if (onGame)
     {
         _rgAlloc[s]->Reset();
