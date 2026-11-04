@@ -6,7 +6,11 @@
 
 #include <imgui/imgui.h>
 
+#include <d3d12.h>
 #include <dxgi1_2.h>
+
+class IFeature;
+struct NVSDK_NGX_Parameter;
 
 // OptiScaler side of plugin_sdk/optiscaler_plugin.h
 class PluginApi
@@ -29,9 +33,12 @@ class PluginApi
     // Draws a registered tab inside of the menu, colorMap adjusts colors for the HDR menu
     static void DrawTab(size_t index, float menuScale, ImVec4 (*colorMap)(const ImVec4&));
 
-    // Upscale callbacks of the plugins, around a D3D12 evaluate
+    // Upscale callbacks of the plugins, around a D3D12 evaluate (also the D3D11 / Vulkan bridges' one)
     static bool HasUpscaleCallbacks();
     static void RunUpscaleCallbacks(bool after, OptiUpscaleFrame* frame);
+    // Fills frame from an evaluate's NGX parameters, which hold the D3D12 resources the feature evaluates
+    static void FillUpscaleFrame(OptiUpscaleFrame& frame, IFeature* feature, NVSDK_NGX_Parameter* params,
+                                 ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue);
 
     struct OverlayLine
     {
