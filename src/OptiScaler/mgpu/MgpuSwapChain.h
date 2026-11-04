@@ -144,5 +144,6 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT _presentCount = 0;
     std::chrono::steady_clock::time_point _lastRender {}, _lastDisplay {};
     bool _broken = false;
+    std::atomic<UINT64> _dumpFrom { 0 }, _dumpTo { 0 }; // frame ids [from, to) to dump
 };
 } // namespace Mgpu

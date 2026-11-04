@@ -21,6 +21,7 @@ if(MSVC)
 endif()
 
 add_subdirectory(gpu_pref_probe)
+add_subdirectory(mgpu_harness)
 
 # sl_tap needs the Streamline and FFX API headers: scripts/fetch_streamline_headers.ps1, scripts/fetch_ffx_headers.ps1.
 if(EXISTS ${PROJECT_SOURCE_DIR}/third_party/streamline/include/sl.h AND EXISTS ${PROJECT_SOURCE_DIR}/third_party/ffx/Kits/FidelityFX/api/include/ffx_api.h)

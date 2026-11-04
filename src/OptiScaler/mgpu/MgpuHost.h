@@ -8,7 +8,7 @@ namespace MgpuHost
 {
 // D3D12CreateDevice hook
 bool InternalDeviceCreate();
-IUnknown* AdapterForDevice(IUnknown* adapter);
+IUnknown* AdapterForDevice(IUnknown* adapter, void* caller);
 bool IsRenderAdapter(const LUID& luid);
 
 // Swapchain hook: true = the display card presents, so the game gets a proxy (no FG swapchain).

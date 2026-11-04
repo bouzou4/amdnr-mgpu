@@ -89,13 +89,22 @@ static void BuildTopology()
         ComPtr<IDXGIFactory1> f;
         f.Attach(s_env.createFactory());
         if (!f)
+        {
+            Log(2, "no DXGI factory");
             return;
+        }
         ComPtr<IDXGIAdapter1> a;
-        for (UINT i = 0; f->EnumAdapters1(i, &a) == S_OK; ++i, a.Reset())
+        HRESULT he = S_OK;
+        UINT i = 0;
+        for (; (he = f->EnumAdapters1(i, &a)) == S_OK; ++i, a.Reset())
         {
             DXGI_ADAPTER_DESC1 d {};
-            if (a->GetDesc1(&d) != S_OK || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+            HRESULT hd = a->GetDesc1(&d);
+            if (hd != S_OK || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+            {
+                Log(0, std::format("adapter {} skipped (desc {:X}, flags {:X})", i, (uint32_t) hd, d.Flags));
                 continue;
+            }
             Cand x { a, {} };
             x.v.name = Narrow(d.Description);
             x.v.luid = d.AdapterLuid;
@@ -107,11 +116,12 @@ static void BuildTopology()
                 o.Reset();
                 x.v.outputs++;
             }
-            Log(0, std::format("adapter {} '{}' bus {} outputs {} luid {:08X}:{:08X}", i, x.v.name, x.v.bus,
+            Log(0, std::format("adapter {}: '{}' bus {} outputs {} luid {:08X}:{:08X}", i, x.v.name, x.v.bus,
                                x.v.outputs, (uint32_t) d.AdapterLuid.HighPart, d.AdapterLuid.LowPart));
             if (x.v.bus >= 0)
                 c.push_back(x);
         }
+        Log(0, std::format("{} adapters enumerated (last {:X})", i, (uint32_t) he));
     };
     if (s_env.noSpoof)
         s_env.noSpoof(scan);

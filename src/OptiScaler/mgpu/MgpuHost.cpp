@@ -82,11 +82,22 @@ static void EnsureConfigured()
                        e.createFactory = []() -> IDXGIFactory1*
                        {
                            DxgiProxy::Init();
-                           IDXGIFactory* f = nullptr;
-                           if (!DxgiProxy::CreateDxgiFactory_() ||
-                               DxgiProxy::CreateDxgiFactory_()(__uuidof(IDXGIFactory1), &f) != S_OK)
-                               return nullptr;
-                           return (IDXGIFactory1*) f;
+                           IDXGIFactory1* f = nullptr;
+                           HRESULT hr = E_FAIL;
+                           if (auto fn = DxgiProxy::CreateDxgiFactory1_())
+                               hr = fn(__uuidof(IDXGIFactory1), &f);
+                           if (FAILED(hr) || !f)
+                           {
+                               // the system dxgi.dll directly
+                               wchar_t sys[MAX_PATH];
+                               GetSystemDirectoryW(sys, MAX_PATH);
+                               HMODULE m = LoadLibraryW((std::wstring(sys) + L"\\dxgi.dll").c_str());
+                               using PFN = HRESULT(WINAPI*)(REFIID, void**);
+                               auto fn = m ? (PFN) GetProcAddress(m, "CreateDXGIFactory1") : nullptr;
+                               hr = fn ? fn(__uuidof(IDXGIFactory1), (void**) &f) : E_NOINTERFACE;
+                           }
+                           LOG_INFO("[MGPU] factory {:X} -> {:X}", (size_t) f, (uint32_t) hr);
+                           return SUCCEEDED(hr) ? f : nullptr;
                        };
                        e.noSpoof = [](const std::function<void()>& fn)
                        {
@@ -96,15 +107,39 @@ static void EnsureConfigured()
                        e.nrFrame = NrFrame;
                        e.nrWanted = NrWanted;
                        e.nrStatus = [] { return AmdFinalImage::Status(); };
+                       e.dumpDir = (Util::DllPath().parent_path() / L"mgpu_dumps").wstring();
                        Mgpu::Configure(ReadSettings(), e);
                    });
 }
 
 bool InternalDeviceCreate() { return Mgpu::InternalCreate(); }
 
-IUnknown* AdapterForDevice(IUnknown* adapter)
+// Devices DXGI, D3D12 or OptiScaler create for themselves stay where they were asked for.
+static bool SystemCaller(void* caller)
+{
+    HMODULE m = nullptr;
+    if (!caller || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCWSTR) caller, &m))
+        return false;
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR) &SystemCaller, &self);
+    if (m == self)
+        return true;
+    wchar_t p[MAX_PATH];
+    if (!GetModuleFileNameW(m, p, MAX_PATH))
+        return false;
+    std::wstring n = std::filesystem::path(p).filename().wstring();
+    for (auto& ch : n)
+        ch = towlower(ch);
+    return n == L"dxgi.dll" || n == L"d3d12.dll" || n == L"d3d12core.dll" || n == L"d3d11.dll" || n == L"dxcore.dll";
+}
+
+IUnknown* AdapterForDevice(IUnknown* adapter, void* caller)
 {
     EnsureConfigured();
+    if (SystemCaller(caller))
+        return adapter;
     return Mgpu::RedirectAdapter(adapter);
 }
 

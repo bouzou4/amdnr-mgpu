@@ -1,0 +1,5 @@
+add_executable(mgpu_harness main.cpp)
+target_link_libraries(mgpu_harness PRIVATE d3d12 dxgi gdi32 user32)
+if(MSVC)
+  target_compile_options(mgpu_harness PRIVATE /W3 /permissive- /utf-8)
+endif()

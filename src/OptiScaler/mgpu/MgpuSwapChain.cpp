@@ -428,12 +428,19 @@ void ProxySwapChain::PresenterLoop()
             ID3D12CommandList* l[] = { _dList[s * _realCount + m].Get() };
             _dq->ExecuteCommandLists(1, l);
             _dq->Signal(_releasedD.Get(), g);
+            const bool dump = g >= _dumpFrom && g < _dumpTo;
+            if (dump)
+                DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                            env.dumpDir + std::format(L"\\f{:06}_ingest", g));
             if (env.nrWanted && env.nrWanted() && env.nrFrame)
             {
                 auto t0 = std::chrono::steady_clock::now();
                 env.nrFrame(_ddev.Get(), _dq.Get(), _realBb[m].Get());
                 nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             }
+            if (dump && nrMs > 0)
+                DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                            env.dumpDir + std::format(L"\\f{:06}_display", g));
             BOOL fs = FALSE;
             _real->GetFullscreenState(&fs, nullptr);
             UINT pf = flags & ~(UINT) DXGI_PRESENT_ALLOW_TEARING;
@@ -470,6 +477,11 @@ void ProxySwapChain::PresenterLoop()
         if (nrMs > 0)
             st.nrMs = Ema(st.nrMs, nrMs);
         st.ringDepth = UINT(_scheduled - g);
+        if (st.presented % 600 == 0)
+            Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
+                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {}",
+                               st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
+                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped));
     }
 }
 
@@ -478,6 +490,30 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     if (flags & DXGI_PRESENT_TEST)
         return S_OK;
     const UINT i = _bbIndex;
+    const auto& env = CurrentEnv();
+    const UINT64 next = _scheduled + 1;
+    if (!env.dumpDir.empty() && next % 30 == 0)
+    {
+        const std::wstring trig = env.dumpDir + L"\\mgpu_dump.trigger";
+        if (GetFileAttributesW(trig.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            UINT64 n = 1;
+            if (FILE* fp = _wfopen(trig.c_str(), L"r"))
+            {
+                unsigned long long v = 0;
+                if (fscanf(fp, "%llu", &v) == 1 && v > 0 && v < 100)
+                    n = v;
+                fclose(fp);
+            }
+            DeleteFileW(trig.c_str());
+            _dumpFrom = next + 1;
+            _dumpTo = next + 1 + n;
+            Log(0, std::format("dumping frames {}..{}", next + 1, next + n));
+        }
+    }
+    if (next >= _dumpFrom && next < _dumpTo)
+        DumpTexture(_rdev.Get(), _gameQueue.Get(), _bb[i].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                    env.dumpDir + std::format(L"\\f{:06}_render", next));
     _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
 
     double sendMs = -1;

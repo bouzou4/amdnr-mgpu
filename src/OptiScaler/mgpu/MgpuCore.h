@@ -30,6 +30,7 @@ struct Env
     std::function<bool(ID3D12Device*, ID3D12CommandQueue*, ID3D12Resource* target)> nrFrame;
     std::function<bool()> nrWanted;
     std::function<std::string()> nrStatus;
+    std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it
 };
 
 struct AdapterView
@@ -92,4 +93,6 @@ ID3D12CommandQueue* DisplayQueue();
 Stats& MutableStats();
 std::mutex& StatsMutex();
 void StartLoadSampler();
+bool DumpTexture(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* tex, D3D12_RESOURCE_STATES state,
+                 const std::wstring& base);
 } // namespace Mgpu
