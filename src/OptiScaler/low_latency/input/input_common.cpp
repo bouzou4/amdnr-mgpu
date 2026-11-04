@@ -612,8 +612,45 @@ InputResult InputCommon::set_low_latency_tech(IUnknown* pDevice, LowLatencyMode 
     return InputResult::Ok;
 }
 
+// Latency measurement: OPTI_LL_CSV names a file for every marker and sleep (QPC)
+static void ll_trace(const char* what, uint64_t a, uint64_t b)
+{
+    static FILE* fp = []() -> FILE*
+    {
+        char path[MAX_PATH] {};
+        if (!GetEnvironmentVariableA("OPTI_LL_CSV", path, MAX_PATH))
+        {
+            // games started by a launcher: the path in opti_ll_csv.txt beside the exe
+            char exe[MAX_PATH] {};
+            GetModuleFileNameA(nullptr, exe, MAX_PATH);
+            std::string f = exe;
+            f = f.substr(0, f.find_last_of("\\/") + 1) + "opti_ll_csv.txt";
+            FILE* in = fopen(f.c_str(), "r");
+            if (!in)
+                return nullptr;
+            const bool ok = fgets(path, MAX_PATH, in) != nullptr;
+            fclose(in);
+            if (!ok)
+                return nullptr;
+            path[strcspn(path, "\r\n")] = 0;
+        }
+        return fopen((std::string(path) + "." + std::to_string(GetCurrentProcessId())).c_str(), "w");
+    }();
+    if (!fp)
+        return;
+    static std::mutex m;
+    static uint32_t n = 0;
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    std::scoped_lock lock(m);
+    fprintf(fp, "%s,%lld,%llu,%llu\n", what, t.QuadPart, a, b);
+    if (++n % 64 == 0)
+        fflush(fp);
+}
+
 InputResult InputCommon::sleep(const InputContext& inputContext, IUnknown* pDevice, std::optional<uint32_t> frame_id)
 {
+    ll_trace("sleep_call", (uint64_t) inputContext.caller, 0);
     if (!update_low_latency_tech(pDevice, register_call(inputContext, pDevice)))
         return InputResult::LowLatencyUpdateFail;
 
@@ -625,7 +662,9 @@ InputResult InputCommon::sleep(const InputContext& inputContext, IUnknown* pDevi
     if (auto current_tech = currently_active_tech.load())
     {
         const auto start = std::chrono::steady_clock::now();
+        ll_trace("sleep_start", (uint64_t) activeOutput, 0);
         current_tech->sleep(frame_id);
+        ll_trace("sleep_end", (uint64_t) activeOutput, 0);
         last_sleep_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
     else
@@ -647,6 +686,8 @@ InputResult InputCommon::set_marker(const InputContext& inputContext, IUnknown* 
 
     if (!marker_supported(inputContext.markerMode, marker_params.marker_type))
         return InputResult::InputNotSupported;
+
+    ll_trace("marker", (uint64_t) marker_params.marker_type, marker_params.frame_id);
 
     // Some games send a frame's marker twice (The Witcher 3 ends its render submit again after present), the first
     // one is the right one. Frame id 0 is what inputs without frame ids send.

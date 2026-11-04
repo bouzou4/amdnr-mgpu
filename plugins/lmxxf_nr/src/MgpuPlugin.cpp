@@ -229,6 +229,8 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.temporal = api->GetBool(plugin, "MgpuMotionVectors", true);
     s.uiGate = std::clamp(api->GetFloat(plugin, "MgpuUiGate", 0.90f), 0.0f, 1.0f);
     s.maxLead = (unsigned) std::clamp(api->GetInt(plugin, "MgpuMaxFramesAhead", 1), 1, 3);
+    s.lowLatency = std::clamp(api->GetInt(plugin, "MgpuLowLatency", 2), 0, 2);
+    s.earlySend = api->GetBool(plugin, "MgpuEarlySend", false);
     // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
     s.dred = std::clamp(api->GetInt(plugin, "MgpuDred", api->GetBool(plugin, "MgpuDred", false) ? 1 : 0), 0, 2);
     s.forwardOutputs = api->GetBool(plugin, "MgpuForwardOutputs", true);
@@ -253,6 +255,11 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     };
     e.nrFrame = NrFrame;
     e.nrSettle = [] { DisplayEngine().SettleOwn(); };
+    e.hookExecute = [](ID3D12Device* d)
+    {
+        extern bool InstallQueueHook(ID3D12Device * device);
+        InstallQueueHook(d);
+    };
     e.nrQuiesce = [] { DisplayEngine().Quiesce(); };
     e.nrIdle = [](const char* why) { DisplayEngine().SeqIdle(why); };
     e.nrWanted = [] { return Engine().Settings().enabled; };

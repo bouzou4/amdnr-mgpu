@@ -2,6 +2,7 @@
 // display card, which owns the real flip-model swapchain on the game's window.
 #pragma once
 #include "MgpuCore.h"
+#include "MgpuLatency.h"
 #include <wrl/client.h>
 #include <atomic>
 #include <condition_variable>
@@ -212,5 +213,9 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     bool _wholeFallback = false;
     std::chrono::steady_clock::time_point _lastNr {};
     UINT64 _lastMvW = 0, _lastMvH = 0;
+    RenderClock _clock; // render card frame completions (low latency)
+    Pacer _pacer;
+    int _llMode = -1; // MgpuLowLatency, switchable by trigger
+    bool _earlySend = false;
 };
 } // namespace Mgpu

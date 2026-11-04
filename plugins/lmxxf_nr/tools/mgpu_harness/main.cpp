@@ -8,6 +8,10 @@
 //   --resize  ResizeBuffers to half size at <at> s, back to full 4 s later (the window follows)
 //   --minimize  from <at> s: minimise (no activation) for 4 s, restore, ResizeBuffers at the same size after each
 //               step (as CONTROL does); --cycles repeats it every 10 s, --minpause stops presenting while minimised
+//   Latency rig: --gpu-ms <ms> compute load per frame, --cpu-ms <ms> busy "simulation" after the input sample,
+//   --al2 (Anti-Lag 2 called directly) or --reflex (Reflex through nvapi64.dll, markers included),
+//   --phase <s> low latency off/on alternating every <s> s (off first), --waitable (latency 1 waitable object),
+//   --csv <path> per frame: sample, present and GPU done times (QPC)
 #include <windows.h>
 #include <d3dkmthk.h>
 #include <dxgi1_6.h>
@@ -17,11 +21,54 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <d3dcompiler.h>
+#include "../../../../src/external/AntiLag2-SDK/ffx_antilag2_dx12.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+
+// nvapi's Reflex calls, by interface id (nvapi_interface.h)
+namespace nv
+{
+struct SleepMode
+{
+    uint32_t version;
+    uint8_t lowLatency, boost;
+    uint32_t minIntervalUs;
+    uint8_t markers, minQueue;
+    uint8_t rsvd[30];
+};
+struct Marker
+{
+    uint32_t version;
+    uint64_t frameId;
+    int type;
+    uint64_t rsvd0;
+    uint8_t rsvd[56];
+};
+using Qi = void* (*) (uint32_t);
+using Init = int (*)();
+using SetSleepMode = int (*)(IUnknown*, SleepMode*);
+using Sleep = int (*)(IUnknown*);
+using SetMarker = int (*)(IUnknown*, Marker*);
+} // namespace nv
+
+static const char* kLoadHlsl = R"(
+RWByteAddressBuffer o : register(u0);
+cbuffer C : register(b0) { uint iters; };
+[numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID)
+{
+    float a = id.x * 1e-6, b = 1.0001;
+    for (uint i = 0; i < iters; ++i) { a = a * b + 0.5; b = b * 0.99999 + a * 1e-9; }
+    o.Store((id.x & 0x3FFFF) * 4, asuint(a + b));
+}
+)";
 
 using Microsoft::WRL::ComPtr;
 
@@ -55,6 +102,9 @@ int main(int argc, char** argv)
     double seconds = 10.0, fseAt = -1, resizeAt = -1, minAt = -1;
     int cycles = 1;
     bool nullAdapter = false, minPause = false, fseHold = false;
+    bool useAl2 = false, useReflex = false, useWaitable = false;
+    double gpuMs = 0, cpuMs = 0, phase = 0;
+    const char* csvPath = nullptr;
     const char* format = "sdr";
     for (int i = 1; i < argc; ++i)
     {
@@ -74,6 +124,20 @@ int main(int argc, char** argv)
             fseHold = true;
         else if (!strcmp(argv[i], "--minpause"))
             minPause = true;
+        else if (!strcmp(argv[i], "--gpu-ms") && i + 1 < argc)
+            gpuMs = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cpu-ms") && i + 1 < argc)
+            cpuMs = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--phase") && i + 1 < argc)
+            phase = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--csv") && i + 1 < argc)
+            csvPath = argv[++i];
+        else if (!strcmp(argv[i], "--al2"))
+            useAl2 = true;
+        else if (!strcmp(argv[i], "--reflex"))
+            useReflex = true;
+        else if (!strcmp(argv[i], "--waitable"))
+            useWaitable = true;
         else
             seconds = atof(argv[i]);
     }
@@ -145,7 +209,7 @@ int main(int argc, char** argv)
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 3;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | (useWaitable ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0);
     ComPtr<IDXGISwapChain1> sc1;
     hr = f->CreateSwapChainForHwnd(q.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
     printf("CreateSwapChainForHwnd %08lx %dx%d fmt %d\n", hr, W, H, (int) fmt);
@@ -224,14 +288,205 @@ int main(int argc, char** argv)
         views();
     };
 
+    HANDLE waitable = nullptr;
+    if (useWaitable)
+    {
+        hr = sc->SetMaximumFrameLatency(1);
+        waitable = sc->GetFrameLatencyWaitableObject();
+        printf("waitable %p SetMaximumFrameLatency(1) %08lx\n", waitable, hr);
+    }
+
+    // GPU load: a compute loop, calibrated to gpuMs with timestamps
+    ComPtr<ID3D12RootSignature> rs;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12Resource> loadBuf;
+    UINT iters = 0;
+    const UINT groups = 4096;
+    if (gpuMs > 0)
+    {
+        ComPtr<ID3DBlob> cs, err, rsb;
+        if (FAILED(D3DCompile(kLoadHlsl, strlen(kLoadHlsl), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err)))
+        {
+            printf("load shader: %s\n", err ? (const char*) err->GetBufferPointer() : "?");
+            return 5;
+        }
+        D3D12_ROOT_PARAMETER rp[2] {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.Num32BitValues = 1;
+        D3D12_ROOT_SIGNATURE_DESC rd { 2, rp };
+        D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
+        dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(), IID_PPV_ARGS(&rs));
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};
+        pd.pRootSignature = rs.Get();
+        pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+        dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
+        D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC bd {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = 1 << 20;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                     IID_PPV_ARGS(&loadBuf));
+        ComPtr<ID3D12QueryHeap> qh;
+        D3D12_QUERY_HEAP_DESC qd2 { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2 };
+        dev->CreateQueryHeap(&qd2, IID_PPV_ARGS(&qh));
+        D3D12_HEAP_PROPERTIES rh { D3D12_HEAP_TYPE_READBACK };
+        bd.Width = 16;
+        bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        ComPtr<ID3D12Resource> rb;
+        dev->CreateCommittedResource(&rh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                     IID_PPV_ARGS(&rb));
+        ComPtr<ID3D12CommandAllocator> ca;
+        ComPtr<ID3D12GraphicsCommandList> cc;
+        dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ca));
+        dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ca.Get(), nullptr, IID_PPV_ARGS(&cc));
+        cc->Close();
+        ComPtr<ID3D12Fence> cf;
+        dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&cf));
+        UINT64 freq = 0;
+        q->GetTimestampFrequency(&freq);
+        UINT n = 2000;
+        for (int pass = 0; pass < 6; ++pass)
+        {
+            ca->Reset();
+            cc->Reset(ca.Get(), pso.Get());
+            cc->SetComputeRootSignature(rs.Get());
+            cc->SetComputeRootUnorderedAccessView(0, loadBuf->GetGPUVirtualAddress());
+            cc->SetComputeRoot32BitConstant(1, n, 0);
+            cc->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            cc->Dispatch(groups, 1, 1);
+            cc->EndQuery(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            cc->ResolveQueryData(qh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, rb.Get(), 0);
+            cc->Close();
+            ID3D12CommandList* l[] = { cc.Get() };
+            q->ExecuteCommandLists(1, l);
+            q->Signal(cf.Get(), pass + 1);
+            HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            cf->SetEventOnCompletion(pass + 1, e);
+            WaitForSingleObject(e, 5000);
+            CloseHandle(e);
+            UINT64* p = nullptr;
+            rb->Map(0, nullptr, (void**) &p);
+            const double ms = double(p[1] - p[0]) * 1000.0 / double(freq);
+            rb->Unmap(0, nullptr);
+            printf("load calibration: %u iters %.3f ms\n", n, ms);
+            if (ms > 0.05)
+                n = UINT((std::max)(1.0, double(n) * gpuMs / ms));
+        }
+        iters = n;
+    }
+
+    // Anti-Lag 2 directly, or Reflex through nvapi64.dll (OptiScaler's fakenvapi on AMD)
+    AMD::AntiLag2DX12::Context al2 {};
+    if (useAl2)
+    {
+        LoadLibraryW(L"amdxc64.dll");
+        hr = AMD::AntiLag2DX12::Initialize(&al2, dev.Get());
+        printf("AntiLag2 Initialize %08lx\n", hr);
+    }
+    nv::SetSleepMode nvSleepMode = nullptr;
+    nv::Sleep nvSleep = nullptr;
+    nv::SetMarker nvMarker = nullptr;
+    if (useReflex)
+    {
+        HMODULE nvm = LoadLibraryW(L"nvapi64.dll");
+        auto qi = nvm ? (nv::Qi) GetProcAddress(nvm, "nvapi_QueryInterface") : nullptr;
+        if (qi)
+        {
+            auto init = (nv::Init) qi(0x0150e828);
+            printf("NvAPI_Initialize %d\n", init ? init() : -999);
+            nvSleepMode = (nv::SetSleepMode) qi(0xac1ca9e0);
+            nvSleep = (nv::Sleep) qi(0x852cd1d2);
+            nvMarker = (nv::SetMarker) qi(0xd9984c05);
+        }
+        printf("Reflex: nvapi %p sleep mode %p sleep %p marker %p\n", nvm, nvSleepMode, nvSleep, nvMarker);
+    }
+    bool llOn = false, llSet = false;
+    auto setLowLatency = [&](bool on)
+    {
+        if (llSet && on == llOn)
+            return;
+        llSet = true;
+        llOn = on;
+        if (nvSleepMode)
+        {
+            nv::SleepMode m {};
+            m.version = sizeof(m) | (1 << 16);
+            m.lowLatency = on;
+            m.markers = 1;
+            printf("Reflex low latency %d: %d\n", (int) on, nvSleepMode(dev.Get(), &m));
+        }
+        if (useAl2)
+            printf("AntiLag2 %d\n", (int) on);
+    };
+    auto marker = [&](UINT64 id, int type)
+    {
+        if (!nvMarker)
+            return;
+        nv::Marker m {};
+        m.version = sizeof(m) | (1 << 16);
+        m.frameId = id;
+        m.type = type;
+        nvMarker(dev.Get(), &m);
+    };
+
+    // Per frame QPC times; GPU done from a watcher thread on the frame's fence value
+    struct FrameTimes
+    {
+        LONGLONG sample = 0, present = 0, presented = 0;
+        std::atomic<LONGLONG> gpu { 0 };
+        bool ll = false;
+    };
+    std::vector<FrameTimes> times(csvPath ? 20000 : 0);
+    std::atomic<UINT64> watchTo { 0 };
+    std::atomic<bool> watchStop { false };
+    std::thread watcher;
+
     LARGE_INTEGER fq, t0, t;
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&t0);
+    auto qpc = []
+    {
+        LARGE_INTEGER x;
+        QueryPerformanceCounter(&x);
+        return x.QuadPart;
+    };
     UINT64 frames = 0, failed = 0;
     int fseStep = 0, resizeStep = 0, minStep = 0;
     bool minimized = false;
     BOOL fs = FALSE;
     const float k = fp16 ? 4.0f : 1.0f; // scRGB: 1.0 = 80 nits
+    std::vector<UINT64> frameValue(times.size());
+    if (csvPath)
+    {
+        watcher = std::thread(
+            [&]
+            {
+                HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                UINT64 f = 0;
+                while (!watchStop)
+                {
+                    if (f >= watchTo.load())
+                    {
+                        Sleep(0);
+                        continue;
+                    }
+                    const UINT64 val = frameValue[f];
+                    if (fence->GetCompletedValue() < val)
+                    {
+                        fence->SetEventOnCompletion(val, e);
+                        if (WaitForSingleObject(e, 500) != WAIT_OBJECT_0)
+                            continue;
+                    }
+                    times[f].gpu = qpc();
+                    ++f;
+                }
+            });
+    }
     for (;;)
     {
         MSG m;
@@ -293,6 +548,27 @@ int main(int argc, char** argv)
             fence->SetEventOnCompletion(fv[i], ev);
             WaitForSingleObject(ev, 1000);
         }
+        if (waitable)
+            WaitForSingleObjectEx(waitable, 1000, TRUE);
+        const bool wantLl = phase > 0 ? (int(el / phase) & 1) != 0 : (useAl2 || useReflex);
+        setLowLatency(wantLl);
+        if (nvSleep)
+        {
+            nvSleep(dev.Get());
+            marker(frames + 1, 0); // SIMULATION_START
+            marker(frames + 1, 6); // INPUT_SAMPLE
+        }
+        if (useAl2 && al2.m_pAntiLagAPI)
+            AMD::AntiLag2DX12::Update(&al2, llOn, 0);
+        const LONGLONG tSample = qpc();
+        if (cpuMs > 0)
+        {
+            const LONGLONG until = tSample + LONGLONG(cpuMs * 1e-3 * double(fq.QuadPart));
+            while (qpc() < until)
+                ;
+        }
+        marker(frames + 1, 1); // SIMULATION_END
+        marker(frames + 1, 2); // RENDERSUBMIT_START
         al[i]->Reset();
         cl->Reset(al[i].Get(), nullptr);
         D3D12_RESOURCE_BARRIER b {};
@@ -303,6 +579,14 @@ int main(int argc, char** argv)
         h.ptr += i * inc;
         float bg[4] = { 0.1f, 0.12f, 0.2f, 1 };
         cl->ClearRenderTargetView(h, bg, 0, nullptr);
+        if (iters)
+        {
+            cl->SetPipelineState(pso.Get());
+            cl->SetComputeRootSignature(rs.Get());
+            cl->SetComputeRootUnorderedAccessView(0, loadBuf->GetGPUVirtualAddress());
+            cl->SetComputeRoot32BitConstant(1, iters, 0);
+            cl->Dispatch(groups, 1, 1);
+        }
         // Moving bars: position from the frame count, so dumps can be matched frame by frame.
         for (int j = 0; j < 8; ++j)
         {
@@ -323,16 +607,48 @@ int main(int argc, char** argv)
         cl->Close();
         ID3D12CommandList* ls[] = { cl.Get() };
         q->ExecuteCommandLists(1, ls);
+        marker(frames + 1, 3); // RENDERSUBMIT_END
+        marker(frames + 1, 4); // PRESENT_START
+        const LONGLONG tPresent = qpc();
         hr = sc->Present(0, fs ? 0 : DXGI_PRESENT_ALLOW_TEARING);
+        const LONGLONG tPresented = qpc();
+        marker(frames + 1, 5); // PRESENT_END
         if (FAILED(hr) && failed++ < 5)
             printf("Present %08lx at frame %llu\n", hr, frames);
         q->Signal(fence.Get(), ++v);
         fv[i] = v;
+        if (frames < times.size())
+        {
+            auto& ft = times[frames];
+            ft.sample = tSample;
+            ft.present = tPresent;
+            ft.presented = tPresented;
+            ft.ll = llOn;
+            frameValue[frames] = v;
+            watchTo = frames + 1;
+        }
         ++frames;
     }
     QueryPerformanceCounter(&t);
     double el = double(t.QuadPart - t0.QuadPart) / fq.QuadPart;
     printf("frames=%llu seconds=%.2f fps=%.1f failed=%llu\n", frames, el, frames / el, failed);
+    if (csvPath)
+    {
+        idle();
+        Sleep(100);
+        watchStop = true;
+        watcher.join();
+        if (FILE* fp = fopen(csvPath, "w"))
+        {
+            fprintf(fp, "# qpc_freq=%lld gpu_ms=%.2f cpu_ms=%.2f iters=%u al2=%d reflex=%d waitable=%d\n", fq.QuadPart,
+                    gpuMs, cpuMs, iters, (int) useAl2, (int) useReflex, (int) useWaitable);
+            fprintf(fp, "frame,ll,sample,present,presented,gpu_done\n");
+            for (UINT64 f = 0; f < (std::min<UINT64>)(frames, times.size()); ++f)
+                fprintf(fp, "%llu,%d,%lld,%lld,%lld,%lld\n", f, (int) times[f].ll, times[f].sample, times[f].present,
+                        times[f].presented, times[f].gpu.load());
+            fclose(fp);
+        }
+    }
     if (fs)
         sc->SetFullscreenState(FALSE, nullptr);
     idle();

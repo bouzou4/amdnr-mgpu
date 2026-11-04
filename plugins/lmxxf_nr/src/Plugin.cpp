@@ -4,6 +4,7 @@
 #include "Nr.h"
 #include "Presets.h"
 #include "mgpu/MgpuCore.h"
+#include "mgpu/MgpuLatency.h"
 
 #include <detours/detours.h>
 
@@ -45,6 +46,7 @@ std::atomic<int> g_eclInFlight { 0 }; // calls inside the detour, waited out bef
 void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
 {
     g_eclInFlight++;
+    Mgpu::Latency::NoteExecute(queue);
     Engine().OnExecute(queue, count, lists);
     g_eclInFlight--;
 }
