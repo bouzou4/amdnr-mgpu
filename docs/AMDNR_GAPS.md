@@ -60,7 +60,7 @@ Edits to published AMDNR files: the raw-literal split in `dlssnr/amd/TemporalSta
 | `inputs/FG/Upscaler_Inputs_Dx12.cpp` | `CaptureInfo::Upscaler` -> `UpscalerPass` (AMDNR renamed the enumerator). | |
 | `proxies/XeFG_Proxy.h` | `NativeModule`, `NativePath`, `NoteInitResult`, `InitFailedAt`, `InitFailedCode` stubs. | Native-XeFG detection (a game's own `libxess_fg.dll` keeps its own FG) and the init-failure readout. |
 | `proxies/FfxApi_Proxy.h` | `IsDenoiserApiImplementedDx12()` returns false, `DenoiserApiGenerationDx12()` returns `Unsupported`, enum `FfxDenoiserApiGeneration`. | The Ray Regeneration 1.2 ABI check. |
-| `spoofing/Dxgi_Spoofing.cpp` (upstream, not modified by AMDNR's snapshot) | Upstream `8f2a9435` (2026-10-23) backported: `GetDesc1` keeps the real AMD vendor id for `amdxcffx64.dll`. Without it the driver's FSR 4 provider sees the spoofed NVIDIA adapter and refuses, and the FFX Upscaler list has only 3.1.6 and 2.3.4. | 0.3.5.8R13 lists four providers (SDK `4.1.2`, driver `4.1.2 *`, `3.1.6`, `2.3.4`) because it lists the driver provider next to the SDK's itself (the newer upstream `FSR4DriverProvider`). This base lists three: `4.1.2 *`, `3.1.6`, `2.3.4`, so an `[FSR] UpscalerIndex` saved by R13 points one entry further down here (R13's 1 = `4.1.2 *`, here 0). |
+| `spoofing/Dxgi_Spoofing.cpp` (upstream, not modified by AMDNR's snapshot) | Upstream's file. `mgpu/base` backported `8f2a9435`; `mgpu/base-next` has it from upstream (6.2): `GetDesc1` keeps the real AMD vendor id for `amdxcffx64.dll`, so the driver's FSR 4 provider does not refuse the spoofed adapter. The FFX Upscaler list is now R13's: `4.1.2` (SDK), `4.1.2 *` (driver, upstream `FSR4DriverProvider`), `3.1.6`, `2.3.4` (Satisfactory probe log, `FFX upscaler provider 0..3`). An `[FSR] UpscalerIndex` saved by R13 means the same entry here again; one saved by `mgpu/base` (0 = `4.1.2 *`) now selects the SDK `4.1.2`. | |
 | `shaders/output_scaling/OS_Dx12.cpp` | none (upstream) | AMDNR's dispatch-size fix (`dlssnr/README.md`): only matters when NR calls Output Scaling, which the AMD path does not. |
 | Everything else in `inputs/`, `proxies/`, `shaders/`, `low_latency/` | upstream | Unknown until AMDNR publishes; diff the 0.5.0 tree against `c983a500`. |
 
@@ -191,3 +191,16 @@ Branch `mgpu/base-next` is `mgpu/base` plus `git subtree pull --prefix=src --squ
 - FPS overlay presets, reworked frametime reporting, and the upscale ratio on the overlay.
 - Per-game defaults are split from quirks (`GameConfigs.cpp`). CONTROL Resonant gets `SimulateWaitableObject`, OTA off and no `FGPreserveSwapChain` default.
 - Fixes to GPU detection and FSR 4 availability, plus many crash fixes: DLSSG on Vulkan and D3D11, RTSS, swapchains with more than 8 buffers, and two D3D11-on-12 upscalers at once.
+
+### 6.7 Verification
+
+- Build: `mgpu/scripts/build.ps1` (VS 2022 v143, Release x64) links `OptiScaler.dll` with no errors.
+- Probe (Satisfactory, D3D12, no input, the main menu scene, about 2 minutes, the previous `dxgi.dll` restored byte-exact afterwards):
+  - FFX upscaler providers 0..3: `4.1.2`, `4.1.2 *`, `3.1.6`, `2.3.4`.
+  - lmxxf: `modules_ok=208`, HIP device matched by LUID, network 1920x1080, `hip_ms` mean 11.25 (max 15.7) over the first 600 frames.
+  - `AMD neural: NR look Full Model Look, placement after upscaling (the look)`.
+  - Clean exit (`Clean exit recorded`), no crash.
+- A second probe added the plugin PoC (`mgpu/plugin-poc`) in `OptiScaler\plugins\` with `[Plugins] LoadAsiPlugins=true`.
+  - It loaded and registered its tab.
+  - It logged every DX12 upscaler evaluate's inputs: colour 2304x1296, output 3840x2160, depth, MVs, exposure, jitter, MV scale.
+  - Alongside it, the fork's own NR ran unchanged: `hip_ms` mean 11.68.

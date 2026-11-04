@@ -163,7 +163,7 @@ PRs 1 and 3 are enough to ship the single-GPU plugin cleanly; 2 adds terminal pl
 
 Build: `mgpu/plugin_poc/build.ps1` (VS 2022, v143, Release x64; parallelism = logical threads - 2). Output: `x64/plugin_poc/NrPlugin.asi`; it imports only `KERNEL32.dll`.
 
-Install: `<folder of OptiScaler's dll>/plugins/NrPlugin.asi`, and in `OptiScaler.ini`:
+Install: `<MainDllPath>/plugins/NrPlugin.asi`, and in `OptiScaler.ini` (below). `MainDllPath` is the `OptiScaler\` libraries folder next to the game's exe when it exists (`[Libraries] OptiDllPath`, default `OptiScaler`), otherwise the exe folder. With the usual install that is `<game exe folder>/OptiScaler/plugins/`.
 
 ```ini
 [Plugins]
