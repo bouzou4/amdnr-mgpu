@@ -2,6 +2,7 @@
 #include "input_system_internal.h"
 
 #include <array>
+#include <atomic>
 #include <vector>
 #include <hidusage.h>
 
@@ -800,8 +801,135 @@ void SanitizeRawKeyboardLocked(RAWINPUT& input)
     keyboard.ExtraInformation = 0;
 }
 
+// Rig Enter: <exe dir>\OptiScaler_enter.trigger arms one synthetic Enter (key state, posted WM_INPUT with a marker
+// handle, raw input buffer) for start-up screens that read raw input only. Nothing reaches the OS input stream.
+namespace
+{
+constexpr ULONGLONG RigEnterHoldMs = 150;
+constexpr UINT_PTR RigRawDown = 0x0E17E401;
+constexpr UINT_PTR RigRawUp = 0x0E17E402;
+std::atomic<ULONGLONG> gRigPollTick { 0 };
+std::atomic<ULONGLONG> gRigDownTick { 0 };
+std::atomic<int> gRigBufferPending { 0 }; // 1 down, 2 up, 0 none
+std::atomic<int> gRigServed { 0 };
+
+const std::wstring& RigTriggerPath()
+{
+    static const std::wstring path = []
+    {
+        wchar_t exe[MAX_PATH] {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring p(exe);
+        return p.substr(0, p.find_last_of(L"\\/") + 1) + L"OptiScaler_enter.trigger";
+    }();
+    return path;
+}
+
+void FillRigKeyboard(RAWINPUT& input, bool down)
+{
+    input = {};
+    input.header.dwType = RIM_TYPEKEYBOARD;
+    input.header.dwSize = sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD);
+    input.header.wParam = RIM_INPUT;
+    input.data.keyboard.MakeCode = 0x1C;
+    input.data.keyboard.Flags = down ? RI_KEY_MAKE : RI_KEY_BREAK;
+    input.data.keyboard.VKey = VK_RETURN;
+    input.data.keyboard.Message = down ? WM_KEYDOWN : WM_KEYUP;
+}
+
+void RigServed(const char* path)
+{
+    if (gRigServed.fetch_add(1) < 16)
+        LOG_INFO("OptiInput rig Enter consumed via {}", path);
+}
+} // namespace
+
+void RigEnterPoll()
+{
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG last = gRigPollTick.load();
+
+    if (now - last < 250 || !gRigPollTick.compare_exchange_strong(last, now))
+        return;
+
+    ULONGLONG down = gRigDownTick.load();
+
+    if (down != 0)
+    {
+        if (now - down >= RigEnterHoldMs && gRigDownTick.compare_exchange_strong(down, 0))
+        {
+            gRigBufferPending = 2;
+            HWND hwnd = nullptr;
+            {
+                std::unique_lock lock(_state.Mutex);
+                hwnd = _state.RawKeyboardTargetHwnd ? _state.RawKeyboardTargetHwnd : _state.TargetHwnd;
+            }
+            if (hwnd)
+                PostMessageW(hwnd, WM_INPUT, RIM_INPUT, static_cast<LPARAM>(RigRawUp));
+        }
+        return;
+    }
+
+    if (GetFileAttributesW(RigTriggerPath().c_str()) == INVALID_FILE_ATTRIBUTES || !DeleteFileW(RigTriggerPath().c_str()))
+        return;
+
+    HWND hwnd = nullptr;
+    bool rawKeyboard = false;
+    bool gameInput = false;
+    {
+        std::unique_lock lock(_state.Mutex);
+        rawKeyboard = _state.RawKeyboardRegistered;
+        gameInput = _state.GameInputInterfaceSeen;
+        hwnd = _state.RawKeyboardTargetHwnd ? _state.RawKeyboardTargetHwnd : _state.TargetHwnd;
+    }
+
+    gRigDownTick = now;
+    gRigBufferPending = 1;
+    gRigServed = 0;
+    LOG_INFO("OptiInput rig Enter armed hwnd:{} rawKeyboard:{} gameInput:{}", static_cast<void*>(hwnd), rawKeyboard,
+             gameInput);
+
+    if (hwnd)
+        PostMessageW(hwnd, WM_INPUT, RIM_INPUT, static_cast<LPARAM>(RigRawDown));
+}
+
+bool RigEnterKeyDown(int vk)
+{
+    if (vk != VK_RETURN || gRigDownTick.load() == 0)
+        return false;
+
+    RigServed("key state");
+    return true;
+}
+
 UINT WINAPI hkGetRawInputData(HRAWINPUT rawInput, UINT command, LPVOID data, PUINT size, UINT headerSize)
 {
+    const auto handle = reinterpret_cast<UINT_PTR>(rawInput);
+
+    if ((handle == RigRawDown || handle == RigRawUp) && size != nullptr && headerSize == sizeof(RAWINPUTHEADER))
+    {
+        RAWINPUT input;
+        FillRigKeyboard(input, handle == RigRawDown);
+        const UINT need = command == RID_HEADER ? sizeof(RAWINPUTHEADER) : input.header.dwSize;
+
+        if (data == nullptr)
+        {
+            *size = need;
+            return 0;
+        }
+
+        if (*size < need)
+        {
+            *size = need;
+            return static_cast<UINT>(-1);
+        }
+
+        memcpy(data, &input, need);
+        if (command == RID_INPUT)
+            RigServed(handle == RigRawDown ? "WM_INPUT down" : "WM_INPUT up");
+        return need;
+    }
+
     const UINT result = o_GetRawInputData(rawInput, command, data, size, headerSize);
 
     if (result == static_cast<UINT>(-1))
@@ -850,7 +978,18 @@ UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize)
         return result;
 
     if (result == 0)
+    {
+        int pending = gRigBufferPending.load();
+        if ((pending == 1 || pending == 2) && data != nullptr && headerSize == sizeof(RAWINPUTHEADER) &&
+            bufferSize >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
+            gRigBufferPending.compare_exchange_strong(pending, pending == 1 ? 3 : 0))
+        {
+            FillRigKeyboard(*data, pending == 1);
+            RigServed(pending == 1 ? "raw buffer down" : "raw buffer up");
+            return 1;
+        }
         return result;
+    }
 
     if (data == nullptr || bufferSize == 0)
         return result;

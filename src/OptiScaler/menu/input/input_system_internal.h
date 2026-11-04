@@ -582,6 +582,8 @@ RawInputSanitizeDecision GetRawInputSanitizeDecisionLocked(HRAWINPUT rawInput, c
 void ApplyRawInputSanitizeActionLocked(RAWINPUT& input, RawSanitizeAction action, USHORT allowedMouseButtonUpFlags);
 void RecordRawInputSanitizeCounterLocked(const RAWINPUT& input, RawSanitizeAction action);
 bool IsRawInputPacketReadable(const RAWINPUT& input, UINT availableSize);
+void RigEnterPoll();
+bool RigEnterKeyDown(int vk);
 void SanitizeRawMouseAllLocked(RAWINPUT& input);
 void SanitizeRawMouseKeepAllowedButtonUpsLocked(RAWINPUT& input, USHORT allowedButtonUpFlags);
 void SanitizeRawKeyboardLocked(RAWINPUT& input);
