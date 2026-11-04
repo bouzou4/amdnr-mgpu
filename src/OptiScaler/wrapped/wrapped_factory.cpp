@@ -2,6 +2,7 @@
 #include "wrapped_factory.h"
 
 #include <hooks/DxgiFactory_WrappedCalls.h>
+#include <plugins/PluginApi.h>
 
 #include <detours/detours.h>
 
@@ -384,6 +385,9 @@ HRESULT __stdcall WrappedIDXGIFactory7::CreateSwapChainForComposition(IUnknown* 
 {
     if (_real2 == nullptr)
         return E_NOTIMPL;
+
+    if (PluginApi::HasSwapchainProvider())
+        LOG_WARN("Swapchain provider does not cover CreateSwapChainForComposition, creating it without the plugin");
 
     return _real2->CreateSwapChainForComposition(pDevice, pDesc, pRestrictToOutput, ppSwapChain);
 }

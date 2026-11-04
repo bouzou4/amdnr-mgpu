@@ -537,8 +537,8 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
                                       D3D12_COMMAND_LIST_TYPE_DIRECT);
         }
 
-        // Create FG SwapChain
-        if (!_skipFGSwapChainCreation)
+        // Create FG SwapChain, not when a plugin provides the swapchain
+        if (!_skipFGSwapChainCreation && !PluginApi::HasSwapchainProvider())
         {
             ScopedSkipFGSCCreation skipFGSCCreation {};
             FGSCResult = FGHooks::CreateSwapChain(realFactory, real, &localDesc, ppSwapChain);
@@ -682,7 +682,13 @@ HRESULT DxgiFactoryHooks::CreateSwapChain(IDXGIFactory* realFactory, IUnknown* p
 
         {
             ScopedSkipParentWrapping skipParentWrapping {};
-            result = o_CreateSwapChain(realFactory, pDevice, &localDesc, ppSwapChain);
+            // A plugin's swapchain (D3D12), wrapped below like a real one
+            result = E_NOTIMPL;
+            if (cq != nullptr)
+                result = PluginApi::ProvideSwapchainLegacy(realFactory, real, &localDesc, ppSwapChain);
+
+            if (result == E_NOTIMPL)
+                result = o_CreateSwapChain(realFactory, pDevice, &localDesc, ppSwapChain);
         }
 
         if (!_skipFGSwapChainCreation)
@@ -1232,6 +1238,9 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForCoreWindow(IDXGIFactory2* realFactor
                                       D3D12_COMMAND_LIST_TYPE_DIRECT);
     }
 
+    if (PluginApi::HasSwapchainProvider())
+        LOG_WARN("Swapchain provider does not cover CreateSwapChainForCoreWindow, creating it without the plugin");
+
     HRESULT result = E_FAIL;
     {
         ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
@@ -1430,8 +1439,8 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnkno
             WithDx12::SetD3D12Objects(State::Instance().currentD3D12Device, State::Instance().currentCommandQueue,
                                       D3D12_COMMAND_LIST_TYPE_DIRECT);
 
-        // Create FG SwapChain
-        if (!_skipFGSwapChainCreation)
+        // Create FG SwapChain, not when a plugin provides the swapchain
+        if (!_skipFGSwapChainCreation && !PluginApi::HasSwapchainProvider())
         {
             ScopedSkipFGSCCreation skipFGSCCreation {};
             FGSCResult = FGHooks::CreateSwapChain(realFactory, real, &localDesc, ppSwapChain);
@@ -1493,7 +1502,13 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChain(IDXGIFactory* realFactory, IUnkno
 
         {
             ScopedSkipParentWrapping skipParentWrapping {};
-            result = o_DLSSGCreateSwapChain(realFactory, pDevice, &localDesc, ppSwapChain);
+            // A plugin's swapchain (D3D12), wrapped below like a real one
+            result = E_NOTIMPL;
+            if (cq != nullptr)
+                result = PluginApi::ProvideSwapchainLegacy(realFactory, real, &localDesc, ppSwapChain);
+
+            if (result == E_NOTIMPL)
+                result = o_DLSSGCreateSwapChain(realFactory, pDevice, &localDesc, ppSwapChain);
         }
 
         if (!_skipFGSwapChainCreation)
@@ -1944,6 +1959,9 @@ HRESULT DxgiFactoryHooks::DLSSGCreateSwapChainForCoreWindow(IDXGIFactory2* realF
             WithDx12::SetD3D12Objects(State::Instance().currentD3D12Device, State::Instance().currentCommandQueue,
                                       D3D12_COMMAND_LIST_TYPE_DIRECT);
     }
+
+    if (PluginApi::HasSwapchainProvider())
+        LOG_WARN("Swapchain provider does not cover CreateSwapChainForCoreWindow, creating it without the plugin");
 
     HRESULT result = E_FAIL;
     {

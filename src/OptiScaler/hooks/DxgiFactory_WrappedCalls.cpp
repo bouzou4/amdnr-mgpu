@@ -22,6 +22,7 @@
 #include <magic_enum.hpp>
 #endif
 #include <misc/IdentifyGpu.h>
+#include <plugins/PluginApi.h>
 
 static bool ShouldCreateDx11wDx12Swapchain()
 {
@@ -215,8 +216,8 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChain(IDXGIFactory* realFactory, Wrap
                                       D3D12_COMMAND_LIST_TYPE_DIRECT);
         }
 
-        // Create FG SwapChain
-        if (!_skipFGSwapChainCreation)
+        // Create FG SwapChain, not when a plugin provides the swapchain
+        if (!_skipFGSwapChainCreation && !PluginApi::HasSwapchainProvider())
         {
             ScopedSkipFGSCCreation skipFGSCCreation {};
             FGSCResult = FGHooks::CreateSwapChain(wrappedFactory, real, &localDesc, ppSwapChain);
@@ -356,7 +357,13 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChain(IDXGIFactory* realFactory, Wrap
 
         {
             ScopedSkipParentWrapping skipParentWrapping {};
-            result = realFactory->CreateSwapChain(pDevice, &localDesc, ppSwapChain);
+            // A plugin's swapchain (D3D12), wrapped below like a real one
+            result = E_NOTIMPL;
+            if (cq != nullptr)
+                result = PluginApi::ProvideSwapchainLegacy(realFactory, real, &localDesc, ppSwapChain);
+
+            if (result == E_NOTIMPL)
+                result = realFactory->CreateSwapChain(pDevice, &localDesc, ppSwapChain);
         }
 
         if (!_skipFGSwapChainCreation)
@@ -882,6 +889,9 @@ HRESULT DxgiFactoryWrappedCalls::CreateSwapChainForCoreWindow(IDXGIFactory2* rea
         realQ = (ID3D12CommandQueue*) pDevice;
 
     State::Instance().currentCommandQueue = realQ;
+
+    if (PluginApi::HasSwapchainProvider())
+        LOG_WARN("Swapchain provider does not cover CreateSwapChainForCoreWindow, creating it without the plugin");
 
     State::Instance().skipDxgiLoadChecks = true;
     auto result =

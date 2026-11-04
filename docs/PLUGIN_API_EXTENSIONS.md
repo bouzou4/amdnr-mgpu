@@ -149,11 +149,13 @@ int32_t (*CreateSwapChainForHwndUnhooked)(void* factory, void* device, void* hwn
 
 **Behaviour.**
 
-- One provider per process, registered in `OptiPluginInit`. In `DxgiFactoryHooks::CreateSwapChainForHwnd`, for a D3D12 queue: with a provider registered OptiScaler skips its FG swapchain and calls the provider where it would call the real factory, with its adjusted descriptions (V-sync override, tearing flag). `S_OK` + a swapchain: OptiScaler wraps it as `WrappedIDXGISwapChain4` exactly like a real one; `E_NOTIMPL`: it creates the swapchain itself, as before.
+- One provider per process, registered in `OptiPluginInit`. In `DxgiFactoryHooks::CreateSwapChainForHwnd` and the legacy `IDXGIFactory::CreateSwapChain` (hooked, DLSSG-hooked and wrapped-factory paths), for a D3D12 queue: with a provider registered OptiScaler skips its FG swapchain and calls the provider where it would call the real factory, with its adjusted descriptions (V-sync override, tearing flag). `S_OK` + a swapchain: OptiScaler wraps it as `WrappedIDXGISwapChain4` exactly like a real one; `E_NOTIMPL`: it creates the swapchain itself, as before.
+- Legacy `CreateSwapChain` reaches the provider in the same `desc1` + fullscreen desc + `hwnd` form: `BufferDesc` size/format, `SampleDesc`, `BufferUsage`, `BufferCount`, `SwapEffect` and `Flags` go to `desc1` (`Scaling` = `DXGI_SCALING_STRETCH`, `AlphaMode` unspecified); `RefreshRate`, `ScanlineOrdering`, `BufferDesc.Scaling` and `Windowed` go to the fullscreen desc, which is always passed; `hwnd` is `OutputWindow`. The provider's swapchain goes back to the game QI'd to `IDXGISwapChain`.
+- `CreateSwapChainForCoreWindow` and `CreateSwapChainForComposition` are not covered: with a provider registered they log a warning and create the swapchain without it.
 - `CreateSwapChainForHwndUnhooked` is the factory's real `CreateSwapChainForHwnd` (OptiScaler's saved original, no parent wrapping), for the provider's own real swapchain on another device.
 - SEH guarded; a crashing provider is removed and OptiScaler creates the swapchain.
 
 **What the plugin taught.**
 
 - Registering a provider turns OptiScaler's FG swapchain off for that process even when the provider then declines; FG output and a plugin presenter are exclusive anyway (the multi-GPU design suppresses FG output), and deciding later would mean building the FG swapchain first and discarding it.
-- `CreateSwapChainForHwnd` (D3D12) is the only path covered; `CreateSwapChain` and `CreateSwapChainForCoreWindow` would take the same call when a game needs them.
+- CONTROL creates its swapchain with the legacy `CreateSwapChain`: the device went to the render card but no proxy was made until that path called the provider too. CoreWindow and composition swapchains have no `HWND` for the provider's real swapchain; they stay uncovered until a game needs them.

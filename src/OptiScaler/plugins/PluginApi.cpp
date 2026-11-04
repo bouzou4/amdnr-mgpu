@@ -1117,3 +1117,53 @@ HRESULT PluginApi::ProvideSwapchain(IDXGIFactory2* factory, IUnknown* queue, HWN
     LOG_INFO("[{}] Swapchain provider: {:X}", p.plugin->name, (uint32_t) result);
     return (HRESULT) result;
 }
+
+HRESULT PluginApi::ProvideSwapchainLegacy(IDXGIFactory* factory, IUnknown* queue, const DXGI_SWAP_CHAIN_DESC* desc,
+                                          IDXGISwapChain** swapChain)
+{
+    if (factory == nullptr || queue == nullptr || desc == nullptr || swapChain == nullptr || !HasSwapchainProvider())
+        return E_NOTIMPL;
+
+    IDXGIFactory2* factory2 = nullptr;
+    if (factory->QueryInterface(IID_PPV_ARGS(&factory2)) != S_OK || factory2 == nullptr)
+    {
+        LOG_WARN("Legacy CreateSwapChain: no IDXGIFactory2, swapchain provider skipped");
+        return E_NOTIMPL;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 desc1 {};
+    desc1.Width = desc->BufferDesc.Width;
+    desc1.Height = desc->BufferDesc.Height;
+    desc1.Format = desc->BufferDesc.Format;
+    desc1.SampleDesc = desc->SampleDesc;
+    desc1.BufferUsage = desc->BufferUsage;
+    desc1.BufferCount = desc->BufferCount;
+    desc1.Scaling = DXGI_SCALING_STRETCH; // legacy swapchains stretch to the window
+    desc1.SwapEffect = desc->SwapEffect;
+    desc1.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    desc1.Flags = desc->Flags;
+
+    // Mode fields and Windowed move to the fullscreen desc
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs {};
+    fs.RefreshRate = desc->BufferDesc.RefreshRate;
+    fs.ScanlineOrdering = desc->BufferDesc.ScanlineOrdering;
+    fs.Scaling = desc->BufferDesc.Scaling;
+    fs.Windowed = desc->Windowed;
+
+    LOG_INFO("Legacy CreateSwapChain -> swapchain provider: {}x{} fmt {} count {} hwnd {:X} windowed {}", desc1.Width,
+             desc1.Height, (UINT) desc1.Format, desc1.BufferCount, (size_t) desc->OutputWindow, desc->Windowed);
+
+    IDXGISwapChain1* sc1 = nullptr;
+    auto result = ProvideSwapchain(factory2, queue, desc->OutputWindow, &desc1, &fs, nullptr, &sc1);
+    factory2->Release();
+
+    if (result != S_OK)
+        return result;
+
+    if (sc1->QueryInterface(IID_PPV_ARGS(swapChain)) == S_OK && *swapChain != nullptr)
+        sc1->Release();
+    else
+        *swapChain = sc1; // IDXGISwapChain1 is an IDXGISwapChain
+
+    return S_OK;
+}

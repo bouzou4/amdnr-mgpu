@@ -57,4 +57,7 @@ class PluginApi
     static HRESULT ProvideSwapchain(IDXGIFactory2* factory, IUnknown* queue, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreenDesc, IDXGIOutput* restrictToOutput,
                                     IDXGISwapChain1** swapChain);
+    // Legacy IDXGIFactory::CreateSwapChain through the same provider; E_NOTIMPL when none or declined
+    static HRESULT ProvideSwapchainLegacy(IDXGIFactory* factory, IUnknown* queue, const DXGI_SWAP_CHAIN_DESC* desc,
+                                          IDXGISwapChain** swapChain);
 };
