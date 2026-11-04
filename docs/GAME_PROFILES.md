@@ -41,7 +41,7 @@ What a game needs from the plugin differs per title: where the HUD-less colour c
 
 - Read at start from `lmxxf_nr_profiles.ini` beside `lmxxf_nr.asi` (`Autoconfig.cpp`). A second section for the same exe is named `<exe>|<tag>` and carries a `Path=`.
 - Keys read at run time: `Placement`, `Preset` (`MgpuPreset` with `MultiGpu`), `WholeFrameFallback`, `Exposure` (`game` = on, `auto` = off), `HdrPaperWhite`, plus the plain plugin keys `Model`, `NetworkSize`, `MultiPass`, `Temporal`, `Style`, `Strength`, `MotionVectors`, `MgpuHudless`. Other keys (`Source`, `UpscaleColour`, `HdrGuardMedian`, `Quirks`) are logged as not used by this build.
-- `Host.*` keys are not applied: there is no installer any more (OptiScaler's own setup runs instead), and the plugin API has no access to other sections. The default upscaler (`auto`, FSR 4 on RDNA 4) worked for Satisfactory without `Host.Upscalers.Dx12Upscaler=ffx`.
+- `Host.*` keys are not applied: there is no installer any more (OptiScaler's own setup runs instead), and the plugin API has no access to other sections. Satisfactory ran NR with the stock `Dx12Upscaler=auto` (upscale callbacks at 2304x1296 render size), so the seed's `Host.Upscalers.Dx12Upscaler=ffx` is not needed there.
 - A profile `Preset` is skipped when the user set any of the four rows it would override.
 
 ## Later
