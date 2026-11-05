@@ -1687,7 +1687,8 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         Barrier(list, in.dst, in.dstState, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(in.dst, _termOut.Get());
         Barrier(list, in.dst, D3D12_RESOURCE_STATE_COPY_DEST, in.dstState);
-        MaybeDump(list, enh, in.dst, in.dstState);
+        // whole frame: the source copy pairs the result with this frame's feed
+        MaybeDump(list, enh, in.dst, in.dstState, in.src == in.dst ? _termCopy.Get() : nullptr);
     };
 
     _motion = {};
