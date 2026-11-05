@@ -8,7 +8,10 @@ Texture2D<float4> Enh : register(t1);
 Texture2D<float4> Fed : register(t2);
 Texture2D<float4> Aux : register(t3); // motion vectors (Apply), HUD-less colour (ApplyTerminal), game exposure (Stats)
 Texture2D<float4> Norm : register(t4); // Stats' output: x net units per scene unit, y share fed above the guard
+Texture2D<float4> Hist : register(t5);  // edit stabiliser: last frame's accumulated edit ratio (rgb) and guide (a)
+Texture2D<float4> Motion : register(t6); // motion vectors for the history (MvUvScale / MvToUv)
 RWTexture2D<float4> Dst : register(u0);
+RWTexture2D<float4> HistOut : register(u1);
 SamplerState Lin : register(s0);
 SamplerState Pt : register(s1);
 
@@ -29,6 +32,9 @@ cbuffer C : register(b0)
     float PaperWhite; // 2 and 3: linear value of paper white
     uint UseNorm;     // Norm bound (upscale placements): the guard can bypass Apply
     float ExpoMul;    // Stats: game exposure * ExpoMul = net units per scene unit (1 / pre-exposure); 0 = auto
+    float ColorStrength; // 0: network luma on the game's chroma, 1: the network's colour edit as it is
+    uint UpMode;         // edit upsample: 0 bilinear + feed residual, 1 guided (EditGuided)
+    uint HistMode;       // guided edit stabiliser: 0 off, 1 history reset (write only), 2 accumulate; | 4 Motion bound
 };
 
 static const float kGuard = 1.5; // fed median above this after mapping: bypass
@@ -151,9 +157,102 @@ void Stats(uint3 gt : SV_GroupThreadID)
         Dst[uint2(0, 0)] = float4(scale, gsHigh[0] / 4096.0, autoScale, 0);
 }
 
-float3 Edit(float2 uv)
+// Bilinear t at uv plus the feed pixel's residual: the box of the target pixels over a feed pixel is that pixel
+// (the feed's box filter undone; plain bilinear halves the edit at the feed's Nyquist)
+float3 Up(Texture2D<float4> t, float2 uvScale, float2 uv)
 {
-    return Enh.SampleLevel(Lin, uv * EnhUvScale, 0).rgb - Fed.SampleLevel(Lin, uv * FedUvScale, 0).rgb;
+    float2 fs;
+    Fed.GetDimensions(fs.x, fs.y);
+    fs *= FedUvScale;
+    float2 ci = (floor(uv * fs) + 0.5) / fs;
+    float2 q = max(0.5 / fs - 0.5 / float2(Size), 0);
+    float3 box = t.SampleLevel(Lin, (ci + float2(-q.x, -q.y)) * uvScale, 0).rgb +
+                 t.SampleLevel(Lin, (ci + float2(q.x, -q.y)) * uvScale, 0).rgb +
+                 t.SampleLevel(Lin, (ci + float2(-q.x, q.y)) * uvScale, 0).rgb +
+                 t.SampleLevel(Lin, (ci + float2(q.x, q.y)) * uvScale, 0).rgb;
+    return t.SampleLevel(Lin, uv * uvScale, 0).rgb + t.SampleLevel(Pt, ci * uvScale, 0).rgb - box * 0.25;
+}
+
+// Guided upsample: the edit as a ratio to the feed colour, joint bilateral over 3x3 feed pixels (distance and the
+// guide luma of this pixel against each feed pixel), times this pixel's own colour
+static const float kRatioK = 0.01;
+static const float kRangeSigma = 0.08;
+static const float kSpaceSigma = 0.6; // feed pixels
+float Guide(float3 n) { return sqrt(Luma(saturate(n))); }
+// Edit stabiliser: the guided ratio accumulated at the target size. The history follows the motion vectors and is
+// dropped off screen or where the guide changed; it is clamped to the ratio's spread over the 3x3 feed pixels
+static const float kStabAlpha = 0.1;
+static const float kStabGuideTau = 0.04;
+static const float kStabSd = 1.0;
+static const float kStabBias = 0.02;
+float3 Stabilise(uint2 px, float3 r, float3 sd, float g)
+{
+    float3 o = r;
+    if ((HistMode & 3) == 2)
+    {
+        float2 uv = (px + 0.5) / Size, q = uv;
+        if (HistMode & 4)
+            q += Motion.SampleLevel(Pt, uv * MvUvScale, 0).xy * MvToUv;
+        if (all(q >= 0) && all(q <= 1))
+        {
+            float4 h = Hist.SampleLevel(Lin, q, 0);
+            float k = saturate(1 - abs(g - h.a) / kStabGuideTau);
+            float3 b = kStabSd * sd + kStabBias;
+            if (all(isfinite(h)))
+                o = lerp(r, clamp(h.rgb, r - b, r + b), (1 - kStabAlpha) * k);
+        }
+    }
+    if (HistMode & 3)
+        HistOut[px] = float4(o, g);
+    return o;
+}
+
+float3 EditGuided(float2 uv, float3 c, float2 fs, uint2 px)
+{
+    float3 n = ToNet(max(ToLinear(c), 0));
+    float g = Guide(n);
+    float2 p = uv * fs - 0.5;
+    int2 b = int2(uv * fs);
+    float3 acc = 0, acc2 = 0;
+    float accL = 0, ws = 0;
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+        [unroll] for (int dx = -1; dx <= 1; dx++)
+        {
+            int2 q = clamp(b + int2(dx, dy), 0, int2(fs) - 1);
+            float3 f = Fed.Load(int3(q, 0)).rgb, en = Enh.Load(int3(q, 0)).rgb;
+            float2 d = (q - p) / kSpaceSigma;
+            float dg = (Guide(f) - g) / kRangeSigma;
+            float w = exp(-0.5 * (dot(d, d) + dg * dg)) + 1e-8;
+            float3 r = clamp((en - f) / (f + kRatioK), -1, 4);
+            acc += w * r;
+            acc2 += w * r * r;
+            if (ColorStrength < 1)
+                accL += w * clamp((Luma(en) + 1e-3) / (Luma(f) + 1e-3), 0, 4);
+            ws += w;
+        }
+    float3 r = acc / ws;
+    if (HistMode != 0)
+        r = Stabilise(px, r, sqrt(max(acc2 / ws - r * r, 0)), g);
+    float3 e = r * (n + kRatioK);
+    if (ColorStrength >= 1)
+        return e;
+    return lerp(n * (accL / ws - 1), e, saturate(ColorStrength));
+}
+
+// Network space edit at uv for colour c: below ColorStrength 1 part of it is the network's luma ratio on c's own chroma
+float3 Edit(float2 uv, float3 c, uint2 px)
+{
+    float2 fs;
+    Fed.GetDimensions(fs.x, fs.y);
+    fs = floor(fs * FedUvScale + 0.5);
+    if (UpMode == 1 && any(fs < float2(Size))) // feed at the target size: the edit as it is
+        return EditGuided(uv, c, fs, px);
+    float3 enh = Up(Enh, EnhUvScale, uv), fed = Up(Fed, FedUvScale, uv);
+    float3 e = enh - fed;
+    if (ColorStrength >= 1)
+        return e;
+    float r = clamp((Luma(enh) + 1e-3) / (Luma(fed) + 1e-3), 0, 4);
+    return lerp(ToNet(max(ToLinear(c), 0)) * (r - 1), e, saturate(ColorStrength));
 }
 
 // The network's edit (Enh - Fed), moved by the motion vectors when it is a frame old, added to Src in linear
@@ -172,7 +271,7 @@ void Apply(uint3 id : SV_DispatchThreadID)
         prev = -1; // guard: bypassed
     if (all(prev >= 0) && all(prev <= 1))
     {
-        float3 e = Edit(prev);
+        float3 e = Edit(prev, c.rgb, id.xy);
         if (all(isfinite(e)) && all(isfinite(c.rgb)))
             o.rgb = AddEdit(c.rgb, Strength * e);
     }
@@ -190,7 +289,7 @@ void ApplyTerminal(uint3 id : SV_DispatchThreadID)
     float3 h = Aux[id.xy].rgb;
     float3 d = abs(b.rgb - h);
     float ui = smoothstep(UiLow, UiHigh, max(d.r, max(d.g, d.b)));
-    float3 e = Edit(uv);
+    float3 e = Edit(uv, b.rgb, id.xy);
     float3 o = b.rgb;
     if (ui < 1 && all(isfinite(e)))
         o = lerp(AddEdit(b.rgb, Strength * e), b.rgb, ui);
@@ -213,8 +312,11 @@ struct ShaderConstants
     float paperWhite;
     uint32_t useNorm;
     float expoMul;
+    float colorStrength;
+    uint32_t upMode;
+    uint32_t histMode;
 };
-static_assert(sizeof(ShaderConstants) == 80);
+static_assert(sizeof(ShaderConstants) == 92);
 
 // Flicker meter, tools/seq_metrics.py on the GPU: per pixel of the feed, the change of the network's answer against
 // the change of its input (display encoding), on still pixels and on visible moving pixels (warped with the vectors).

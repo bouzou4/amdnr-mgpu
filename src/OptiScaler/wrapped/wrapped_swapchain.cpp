@@ -537,7 +537,8 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         // Plugin present callbacks, D3D12 with frame generation off
         OptiPresentFrame pluginPresent {};
         const bool pluginPresentOn = PluginApi::HasPresentCallbacks() && cq != nullptr && device12 != nullptr &&
-                                     (fg == nullptr || !fg->IsActive() || fg->IsPaused());
+                                     (fg == nullptr || !fg->IsActive() || fg->IsPaused()) &&
+                                     !PluginApi::FgSwapchainPresenting();
 
         if (pluginPresentOn)
         {

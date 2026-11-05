@@ -6,7 +6,11 @@
 
 #include <imgui/imgui.h>
 
+#include <d3d12.h>
 #include <dxgi1_2.h>
+
+class IFeature;
+struct NVSDK_NGX_Parameter;
 
 // OptiScaler side of plugin_sdk/optiscaler_plugin.h
 class PluginApi
@@ -29,9 +33,12 @@ class PluginApi
     // Draws a registered tab inside of the menu, colorMap adjusts colors for the HDR menu
     static void DrawTab(size_t index, float menuScale, ImVec4 (*colorMap)(const ImVec4&));
 
-    // Upscale callbacks of the plugins, around a D3D12 evaluate
+    // Upscale callbacks of the plugins, around a D3D12 evaluate (also the D3D11 / Vulkan bridges' one)
     static bool HasUpscaleCallbacks();
     static void RunUpscaleCallbacks(bool after, OptiUpscaleFrame* frame);
+    // Fills frame from an evaluate's NGX parameters, which hold the D3D12 resources the feature evaluates
+    static void FillUpscaleFrame(OptiUpscaleFrame& frame, IFeature* feature, NVSDK_NGX_Parameter* params,
+                                 ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue);
 
     struct OverlayLine
     {
@@ -50,6 +57,11 @@ class PluginApi
     static void SetGameFg(const char* source, ID3D12Resource* hudless, uint32_t hudlessState, bool generating);
     // The game's HUD-less colour for this present (consumed), and whether the game's FG generates frames now
     static ID3D12Resource* TakeGameHudless(uint32_t* state, bool* generating);
+    // The same at the game's Present on its own FG swapchain (paired with this frame there, generating or not)
+    static ID3D12Resource* PeekGameHudless(uint32_t* state, bool* generating);
+    // Present callbacks ran at the game's FG swapchain Present: the presents it makes are not called back again
+    static void NoteFgSwapchainPresent();
+    static bool FgSwapchainPresenting();
     static void RunPresentCallbacks(OptiPresentFrame* frame);
 
     // Adapter override and unhooked device creation (D3D12CreateDevice hooks)

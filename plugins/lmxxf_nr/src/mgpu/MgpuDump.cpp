@@ -1,6 +1,7 @@
 // Frame dumps for the image checks: a texture to .raw (tight rows) and an 8-bit .bmp.
 #include "MgpuCommon.h"
 #include "MgpuCore.h"
+#include "../GpuWait.h"
 
 #include <wrl/client.h>
 #include <fstream>
@@ -61,10 +62,13 @@ bool DumpTexture(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* tex, 
     ID3D12CommandList* ls[] = { l.Get() };
     q->ExecuteCommandLists(1, ls);
     q->Signal(f.Get(), 1);
-    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    f->SetEventOnCompletion(1, e);
-    WaitForSingleObject(e, 5000);
-    CloseHandle(e);
+    if (!GpuWaitDone(f.Get(), 1))
+    {
+        // still running: the list, allocator and readback must outlive it
+        static std::vector<ComPtr<IUnknown>> s_kept;
+        s_kept.push_back(rb), s_kept.push_back(a), s_kept.push_back(l), s_kept.push_back(f);
+        return false;
+    }
     uint8_t* p = nullptr;
     if (FAILED(rb->Map(0, nullptr, (void**) &p)))
         return false;

@@ -17,6 +17,7 @@
 #include <magic_enum.hpp>
 
 #include <plugins/PluginApi.h>
+#include <detours/detours.h>
 
 static std::unordered_map<ffxContext, ffxCreateContextDescUpscale> _initParams;
 static std::unordered_map<ffxContext, NVSDK_NGX_Parameter*> _nvParams;
@@ -195,6 +196,149 @@ static std::optional<float> GetQualityOverrideRatioFfx(const uint32_t input)
     return output;
 }
 
+// The game's own FG swapchain: plugin present callbacks run at the game's Present there, before its frame generation
+// reads the back buffer and the HUD-less colour, so generated frames come from what the plugins wrote
+namespace
+{
+using PFN_FgPresent = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using PFN_FgPresent1 = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+PFN_FgPresent o_FgPresent = nullptr;
+PFN_FgPresent1 o_FgPresent1 = nullptr;
+std::mutex _fgScMutex;
+IDXGISwapChain* _fgSc = nullptr;      // not owned, compared only
+ID3D12CommandQueue* _fgQueue = nullptr; // the game queue FFX presents with
+
+void RunFgSwapchainCallbacks(IDXGISwapChain* sc, UINT syncInterval, UINT flags)
+{
+    static uint64_t frameId = 0;
+    ID3D12CommandQueue* queue = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(_fgScMutex);
+        if (sc != _fgSc)
+            return;
+        queue = _fgQueue;
+    }
+    if (queue == nullptr || (flags & DXGI_PRESENT_TEST) || State::Instance().isShuttingDown ||
+        !PluginApi::HasPresentCallbacks())
+        return;
+
+    ID3D12Device* device = nullptr;
+    IDXGISwapChain3* sc3 = nullptr;
+    ID3D12Resource* buffer = nullptr;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))))
+        return;
+    if (sc->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+    {
+        sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer));
+        sc3->Release();
+    }
+    if (buffer != nullptr)
+    {
+        const auto d = buffer->GetDesc();
+        OptiPresentFrame f {};
+        f.size = sizeof(f);
+        f.api = OptiApi_D3D12;
+        f.device = device;
+        f.queue = queue;
+        f.swapchain = sc;
+        f.backBuffer = buffer;
+        f.backBufferState = D3D12_RESOURCE_STATE_PRESENT;
+        f.colorSpace = State::Instance().outputColorSpace.dxgiColorSpace;
+        f.width = (uint32_t) d.Width;
+        f.height = d.Height;
+        f.format = d.Format;
+        uint32_t hudState = 0;
+        bool generating = false;
+        if (auto hud = PluginApi::PeekGameHudless(&hudState, &generating); hud != nullptr)
+        {
+            f.hudless = hud;
+            f.hudlessState = hudState;
+            f.hudlessSource = OptiHudless_FfxFG;
+        }
+        f.frameGeneration = generating ? OptiFrameGen_Game : OptiFrameGen_Off;
+        f.fgSwapchain = 1;
+        f.syncInterval = syncInterval;
+        f.presentFlags = flags;
+        f.frameId = ++frameId;
+        f.upscaleFrameId = PluginApi::LastUpscaleFrameId();
+        PluginApi::NoteFgSwapchainPresent();
+        f.phase = OptiPresent_BeforeOverlay;
+        PluginApi::RunPresentCallbacks(&f);
+        f.phase = OptiPresent_AfterOverlay;
+        PluginApi::RunPresentCallbacks(&f);
+        buffer->Release();
+    }
+    device->Release();
+}
+
+HRESULT STDMETHODCALLTYPE hkFgPresent(IDXGISwapChain* sc, UINT syncInterval, UINT flags)
+{
+    RunFgSwapchainCallbacks(sc, syncInterval, flags);
+    return o_FgPresent(sc, syncInterval, flags);
+}
+
+HRESULT STDMETHODCALLTYPE hkFgPresent1(IDXGISwapChain1* sc, UINT syncInterval, UINT flags,
+                                       const DXGI_PRESENT_PARAMETERS* params)
+{
+    RunFgSwapchainCallbacks(sc, syncInterval, flags);
+    return o_FgPresent1(sc, syncInterval, flags, params);
+}
+
+void HookGameFgSwapchain(ffxCreateContextDescHeader* desc)
+{
+    IDXGISwapChain4* sc = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    if (desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12)
+    {
+        auto d = reinterpret_cast<ffxCreateContextDescFrameGenerationSwapChainWrapDX12*>(desc);
+        sc = d->swapchain ? *d->swapchain : nullptr;
+        queue = d->gameQueue;
+    }
+    else if (desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12)
+    {
+        auto d = reinterpret_cast<ffxCreateContextDescFrameGenerationSwapChainNewDX12*>(desc);
+        sc = d->swapchain ? *d->swapchain : nullptr;
+        queue = d->gameQueue;
+    }
+    else if (desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12)
+    {
+        auto d = reinterpret_cast<ffxCreateContextDescFrameGenerationSwapChainForHwndDX12*>(desc);
+        sc = d->swapchain ? *d->swapchain : nullptr;
+        queue = d->gameQueue;
+    }
+    if (sc == nullptr || queue == nullptr || !PluginApi::HasPresentCallbacks())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(_fgScMutex);
+        _fgSc = sc;
+        _fgQueue = queue;
+    }
+    if (o_FgPresent != nullptr)
+    {
+        LOG_INFO("Plugin present: the game's FG swapchain {:X} (queue {:X})", (size_t) sc, (size_t) queue);
+        return;
+    }
+    void** vt = *reinterpret_cast<void***>(sc);
+    o_FgPresent = reinterpret_cast<PFN_FgPresent>(vt[8]);
+    o_FgPresent1 = reinterpret_cast<PFN_FgPresent1>(vt[22]);
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&(PVOID&) o_FgPresent, hkFgPresent);
+    DetourAttach(&(PVOID&) o_FgPresent1, hkFgPresent1);
+    if (const auto r = DetourTransactionCommit(); r != NO_ERROR)
+    {
+        LOG_ERROR("Plugin present: hooking the game's FG swapchain failed: {:X}", r);
+        o_FgPresent = nullptr;
+        o_FgPresent1 = nullptr;
+        std::lock_guard<std::mutex> lock(_fgScMutex);
+        _fgSc = nullptr;
+        return;
+    }
+    LOG_INFO("Plugin present: callbacks at the game's FG swapchain {:X} Present (queue {:X})", (size_t) sc,
+             (size_t) queue);
+}
+} // namespace
+
 ffxReturnCode_t ffxCreateContext_Dx12(ffxContext* context, ffxCreateContextDescHeader* desc,
                                       const ffxAllocationCallbacks* memCb)
 {
@@ -257,6 +401,9 @@ ffxReturnCode_t ffxCreateContext_Dx12(ffxContext* context, ffxCreateContextDescH
 
         LOG_DEBUG("D3D12_CreateContext result: {:X} ({}), context: {:X}", (UINT) ffxApiResult,
                   FfxApiProxy::ReturnCodeToString(ffxApiResult), (size_t) *context);
+
+        if (ffxApiResult == FFX_API_RETURN_OK && isFgType)
+            HookGameFgSwapchain(desc);
 
         if (!upscaleContext)
             return ffxApiResult;

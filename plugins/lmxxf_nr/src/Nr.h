@@ -42,8 +42,18 @@ struct NrSettings
     int32_t passes = 1; // Full only: DLSS5_MULTI_PASS 1..3, the network run N times per frame
     int32_t Passes() const { return model == 0 ? passes : 1; }
     bool History() const { return temporal && Passes() <= 2; } // 3 passes: the runtime's history needs no prediction
-    int32_t style = 0; // NVIDIA NGX style, 0 = NVIDIA's default look
+    // NVIDIA NGX style, 0 = NVIDIA's default look; < 0 auto (option): 2 before / after upscaling (a third of style 0's
+    // tone shift on scene colour, as much detail), 0 at the display placements
+    int32_t style = 0;
+    bool display = false; // the multi-GPU display engine (presented frames)
+    int32_t Style() const { return style >= 0 ? style : placement == Placement::Terminal || display ? 0 : 2; }
     float strength = 1.0f;
+    // Network colour share: 1 its colour change as it is (faithful), 0 its luma on the game's chroma; < 0 auto (option):
+    // 0 before / after upscaling, 1 at the display placements
+    float colorStrength = 1.0f;
+    float ColorStrength(bool preTonemap) const { return colorStrength >= 0 ? colorStrength : preTonemap ? 0.0f : 1.0f; }
+    int32_t upsample = 1; // feed-size edit to the target: 0 bilinear + feed residual, 1 guided by the target colour
+    bool stabilise = true; // guided edit: temporal accumulation at the target size (EditStabilise)
     float uiLow = 0.004f;  // terminal: back buffer vs HUD-less difference where UI starts (encoded units)
     float uiHigh = 0.02f;  // and where it is fully UI
     bool motion = true; // move the one frame old edit with the motion vectors
@@ -78,9 +88,19 @@ struct NrStats
     // Flicker meter, seq_metrics units: answer change minus input change, mean of the last frames (NAN: none)
     float flkStatic = NAN, flkMc = NAN;
     uint32_t flkFrames = 0;
+    uint32_t gameApi = OptiApi_D3D12; // of the last upscale callback; D3D11 / Vulkan come through the D3D12 bridge
 };
 
 // One lmxxf session on the game's device, driven from the upscale callbacks
+// One apply dispatch's stabiliser views: last history (srv), this frame's (uav), the vectors it follows
+struct StabBind
+{
+    ID3D12Resource* hist = nullptr;
+    ID3D12Resource* out = nullptr;
+    ID3D12Resource* motion = nullptr;
+    DXGI_FORMAT motionFmt = DXGI_FORMAT_R16G16_FLOAT;
+};
+
 class NrEngine
 {
   public:
@@ -110,11 +130,13 @@ class NrEngine
         float mvScaleX = 1, mvScaleY = 1;
         bool reset = false;
         bool waitAnswer = false;
+        double* waitMs = nullptr; // out: CPU wait for the network answer
         uint32_t encoding = 1; // 0 linear, 1 sRGB, 2 PQ, 3 scRGB
     };
     bool RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in);
-    void SettleOwn(); // before presenting a RunOwn frame: its network answer is done
+    bool SettleOwn(); // before presenting a RunOwn frame: its network answer is done (false: never present it)
     void SeqIdle(const char* why); // no NR this frame: logs why a requested sequence dump waits (rate-limited)
+    bool Shutdown(); // hot reload: GPU idle, worker joined, session destroyed; false if a game list holds our work
     void Quiesce();   // CPU wait for all queued network work: its inputs may be freed after
     // Leaves the session alone: the game card's engine while the display card runs NR
     void SetSuspended(bool s) { _suspended = s; }
@@ -157,7 +179,7 @@ class NrEngine
     void ApplyEnv();
     void Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, const ShaderConstants& c,
                   ID3D12Resource* const srv[4], const DXGI_FORMAT srvFmt[4], ID3D12Resource* uav, DXGI_FORMAT uavFmt,
-                  uint32_t w, uint32_t h, ID3D12Resource* norm = nullptr);
+                  uint32_t w, uint32_t h, ID3D12Resource* norm = nullptr, const StabBind* stab = nullptr);
 
     Runtime _rt;
     std::mutex _mutex; // every runtime call, the job state and the stats
@@ -194,13 +216,18 @@ class NrEngine
     ID3D12GraphicsCommandList* NextOwnList(uint32_t* slot);
     void SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12GraphicsCommandList* list, uint64_t wait);
     uint64_t _answerWait = 0;
+    bool _ownCpuWait = false; // RunOwn (display card): HIP answers awaited on the CPU, no queue waits on HIP
+    bool _ownStuck = false;   // an answer never came: the frame's lists were dropped, its Present must be too
+    double _ownWaitMs = 0;    // this RunOwn's CPU waits on HIP answers
     bool EnsureCopies(const D3D12_RESOURCE_DESC& d);
     // Frame dump on <dumpDir>\lmxxf_nr_dump.trigger: the network output, what it was fed, and the result
     void MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result = nullptr,
                    D3D12_RESOURCE_STATES resultState = D3D12_RESOURCE_STATE_COPY_SOURCE, ID3D12Resource* source = nullptr,
-                   ID3D12Resource* hudless = nullptr);
+                   ID3D12Resource* hudless = nullptr, ID3D12Resource* hudResult = nullptr,
+                   D3D12_RESOURCE_STATES hudResultState = D3D12_RESOURCE_STATE_COMMON);
     void FinishDump();
-    ComPtr<ID3D12Resource> _dumpTex[5];
+    bool EnsureHudCopies(const D3D12_RESOURCE_DESC& d);
+    ComPtr<ID3D12Resource> _dumpTex[6];
     bool _dumpArmed = false;
     uint64_t _dumpGameValue = 0, _dumpOwnValue = 0;
     uint32_t _dumpCount = 0;
@@ -214,10 +241,20 @@ class NrEngine
     uint64_t _presentValue[kPresentLists] = {};
     uint64_t _presentCounter = 0;
     ComPtr<ID3D12Resource> _termCopy, _termOut;
+    ComPtr<ID3D12Resource> _hudCopy, _hudOut; // the game's FG swapchain: its HUD-less input before / after the edit
     uint64_t _hudlessMissing = 0;
     uint32_t _hudlessStreak = 0; // presents in a row without a usable HUD-less colour
     ComPtr<ID3D12DescriptorHeap> _heap;
     uint32_t _heapCursor = 0, _heapStride = 0;
+
+    // Guided edit stabiliser: accumulated ratio + guide at the target size, ping-pong
+    ComPtr<ID3D12Resource> _stab[2];
+    uint32_t _stabCur = 0;
+    bool _stabValid = false;
+    // Binds the stabiliser for one apply dispatch: c.histMode, srv/uav pair; flip after the main dispatch only
+    bool StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t h, bool reset, ShaderConstants& c,
+                     ID3D12Resource* motion, StabBind& b);
+    void StabFinish(ID3D12GraphicsCommandList* list, const StabBind& b);
 
     ComPtr<ID3D12Resource> _feed;     // network input, RGBA16F
     ComPtr<ID3D12Resource> _srcCopy;  // after upscaling: copy of the output

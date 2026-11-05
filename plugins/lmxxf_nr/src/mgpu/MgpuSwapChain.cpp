@@ -1,6 +1,8 @@
 #include "MgpuCommon.h"
 #include "MgpuSwapChain.h"
 #include "MgpuComposite.h"
+#include "../GpuWait.h"
+#include "MgpuLatency.h"
 
 #include <format>
 
@@ -12,6 +14,7 @@ std::mutex& StatsMutex() { return s_statsMutex; }
 static inline UINT64 AlignUp(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 static inline double Ema(double prev, double v) { return prev <= 0 ? v : prev * 0.95 + v * 0.05; }
 static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms);
+static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what, const bool* stop = nullptr, const bool* lost = nullptr);
 
 static std::atomic<ProxySwapChain*> s_active { nullptr };
 ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
@@ -216,6 +219,11 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
         return hr;
     StartPresenter();
     s_active = this;
+    if (Latency::On() && CurrentEnv().hookExecute)
+    {
+        Latency::SetGameQueue(_gameQueue.Get());
+        CurrentEnv().hookExecute(_rdev.Get());
+    }
     {
         std::lock_guard g(StatsMutex());
         MutableStats().presenter = true;
@@ -571,7 +579,8 @@ HRESULT ProxySwapChain::CreateIngestLists()
 HRESULT ProxySwapChain::RenewReal()
 {
     _dq->Signal(_dFence.Get(), ++_dValue);
-    WaitFence(_dFence.Get(), _dValue, 2000);
+    if (!GpuWaitDone(_dFence.Get(), _dValue))
+        return DXGI_ERROR_WAS_STILL_DRAWING; // the lists may still run: no resize now
     _dList.clear();
     _dAlloc.clear();
     _realBb.clear();
@@ -745,15 +754,52 @@ static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
     CloseHandle(e);
 }
 
+// Before a slot's allocators are reset: its previous work must be done. No fixed cap (a 500 ms cap reset them in
+// flight); false only on stop / device loss / 60 s, and the caller then skips the reuse.
+static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what, const bool* stop, const bool* lost)
+{
+    struct C { const bool *stop, *lost; } c { stop, lost };
+    double ms = 0;
+    const bool done = GpuWaitDone(f, v, 60000, [](void* x) {
+        auto* c = static_cast<C*>(x);
+        return (c->stop && *c->stop) || (c->lost && *c->lost); }, &c, &ms);
+    static std::atomic<int> logged { 0 };
+    if ((ms > 400 || !done) && logged++ < 20)
+        Log(done ? 1 : 2, std::format("{}: slot reuse waited {:.0f} ms for {} (done {})", what, ms, v, done));
+    return done;
+}
+
+// CPU wait for frame g's send (the render card's cross-adapter fence). false: stop / lost / 60 s, retry the loop.
+bool ProxySwapChain::WaitSend(UINT64 g)
+{
+    double ms = 0;
+    const bool done = GpuWaitDone(_filledD.Get(), g, 60000, [](void* x) {
+        auto* p = static_cast<ProxySwapChain*>(x);
+        return p->_stop || p->_lost; }, this, &ms);
+    {
+        std::lock_guard sg(StatsMutex());
+        auto& st = MutableStats();
+        if (ms > 250)
+            st.sendStalls++;
+        else
+            st.sendWaitMs = Ema(st.sendWaitMs, ms); // hitches stay out of the per-frame figure
+    }
+    if ((ms > 250 || !done) && _sendStallLogs++ < 30)
+        Log(done ? 1 : 2, std::format("frame {}: send landed after {:.0f} ms (render card hitch), nothing queued on the "
+                                      "display card meanwhile (done {})", g, ms, done));
+    return done;
+}
+
 void ProxySwapChain::DrainRender()
 {
     if (_gameQueue && _rgameFence)
     {
         _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
-        WaitFence(_rgameFence.Get(), _rgameValue, 3000);
+        GpuWaitDone(_rgameFence.Get(), _rgameValue);
     }
-    if (!_lost)
-        WaitFence(_filledR.Get(), _scheduled, 3000);
+    if (!_lost && !GpuWaitDone(_filledR.Get(), _scheduled, 60000,
+                               [](void* x) { return static_cast<ProxySwapChain*>(x)->_lost; }, this))
+        Log(2, "drain: the send queue did not finish in 60 s");
 }
 
 // Diagnostics: logs the first point after a resize where the display device is found removed
@@ -785,7 +831,7 @@ void ProxySwapChain::StopPresenter()
     if (_dq && _dFence)
     {
         _dq->Signal(_dFence.Get(), ++_dValue);
-        WaitFence(_dFence.Get(), _dValue, 3000);
+        GpuWaitDone(_dFence.Get(), _dValue);
     }
     // the network may still read this side's motion vectors on its own queue
     if (CurrentEnv().nrQuiesce)
@@ -843,6 +889,11 @@ void ProxySwapChain::PresenterLoop()
             }
         }
 
+        // The send lands before anything of this frame is queued: no display queue waits on the render card's fence
+        // (a hitch held submitted work there for seconds; a Present behind it hung the display card)
+        if (!WaitSend(g))
+            continue;
+
         // Minimised or occluded (an exclusive fullscreen left by DXGI): nothing goes to the real back buffers until a
         // test present says the window shows again. A present on them then hung the display card (DEVICE_HUNG).
         if (_occluded || IsIconic(_hwnd))
@@ -853,7 +904,6 @@ void ProxySwapChain::PresenterLoop()
                 if (!_occluded)
                     Log(0, std::format("window minimised or occluded at frame {}: frames dropped until it shows", g));
                 _occluded = true;
-                _dq->Wait(_filledD.Get(), g);
                 _dq->Signal(_releasedD.Get(), g);
                 _dq->Signal(_dFence.Get(), ++_dValue);
                 slotDisplayValue[s] = _dValue;
@@ -875,7 +925,9 @@ void ProxySwapChain::PresenterLoop()
         }
 
         // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
-        WaitFence(_dFence.Get(), slotDisplayValue[s], 500);
+        // not done (stop or 60 s): the slot is not reused, the loop comes back to the same frame
+        if (!WaitReuse(_dFence.Get(), slotDisplayValue[s], "display", &_stop))
+            continue;
         double ingestMs = -1;
         if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
@@ -899,14 +951,13 @@ void ProxySwapChain::PresenterLoop()
         }
         slotCounted[s] = false;
 
-        double nrMs = 0;
+        double nrMs = 0, nrAnswerMs = -1;
         bool hudFrame = false;
         HRESULT hr;
         UINT pfUsed = 0;
         {
             // no _scMutex: in exclusive fullscreen Present can wait on the window thread, which may be in a proxy call
             const UINT m = _real->GetCurrentBackBufferIndex();
-            _dq->Wait(_filledD.Get(), g);
             ID3D12CommandList* l[2] = { _dList[s * _realCount + m].Get(), nullptr };
             UINT nl = 1;
             const bool haveHud = meta.hud && _hudD && _ui;
@@ -1030,7 +1081,9 @@ void ProxySwapChain::PresenterLoop()
             {
                 NrInput in;
                 const auto now = std::chrono::steady_clock::now();
-                const bool gap = _lastNr.time_since_epoch().count() &&
+                // a frame dump's stall is not a pause: no history reset (the dumped frames would show a reset frame)
+                const bool dumpStall = g >= _dumpFrom && g <= _dumpTo;
+                const bool gap = _lastNr.time_since_epoch().count() && !dumpStall &&
                                  std::chrono::duration<double, std::milli>(now - _lastNr).count() > 250.0;
                 _lastNr = now;
                 if (haveMv)
@@ -1061,8 +1114,12 @@ void ProxySwapChain::PresenterLoop()
                 }
                 ID3D12GraphicsCommandList* c = nullptr;
                 auto t0 = std::chrono::steady_clock::now();
+                double answerMs = 0;
+                in.answerWaitMs = &answerMs;
                 const bool wrote = env.nrFrame(_ddev.Get(), _dq.Get(), in);
-                nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                // nr stays record + submit time; the CPU wait for the answer is reported on its own
+                nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - answerMs;
+                nrAnswerMs = answerMs;
                 if (useHud)
                 {
                     c = prepUi();
@@ -1099,8 +1156,24 @@ void ProxySwapChain::PresenterLoop()
             if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
-            if (env.nrSettle)
-                env.nrSettle();
+            bool settled = !env.nrSettle || env.nrSettle();
+            // Present only on an idle display queue (bounded): never a Present behind work that may not finish
+            double idleMs = -1;
+            if (settled && CurrentSettings().presentIdle)
+            {
+                _dq->Signal(_dFence.Get(), ++_dValue);
+                if (!GpuWaitDone(_dFence.Get(), _dValue, kPresentIdleMs, nullptr, nullptr, &idleMs))
+                {
+                    settled = false;
+                    _lastIdleMs = -2;
+                    if (_idleSkips++ < 20)
+                        Log(2, std::format("frame {}: display queue not idle after {:.0f} ms: Present skipped", g, idleMs));
+                }
+                else if (idleMs > 100 && _idleSlow++ < 20)
+                    Log(1, std::format("frame {}: display queue idle after {:.0f} ms before the Present", g, idleMs));
+            }
+            if (settled)
+                _lastIdleMs = idleMs;
             if (probe)
             {
                 _dq->Signal(_dFence.Get(), ++_dValue);
@@ -1115,7 +1188,8 @@ void ProxySwapChain::PresenterLoop()
                 pf |= DXGI_PRESENT_ALLOW_TEARING;
             pfUsed = pf;
             const auto tp = std::chrono::steady_clock::now();
-            hr = _real->Present(sync, pf);
+            // an unfinished network answer: never queue the Present behind its wait
+            hr = settled ? _real->Present(sync, pf) : S_OK;
             const double presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
             if (presentMs > 250 || hr != _lastPresentHr)
                 Log(presentMs > 250 ? 1 : 0, std::format("real Present {:X} in {:.0f} ms (frame {})", (uint32_t) hr, presentMs, g));
@@ -1129,7 +1203,11 @@ void ProxySwapChain::PresenterLoop()
                 Log(1, "Present with tearing refused during a fullscreen change: tearing off until the next one");
                 hr = _real->Present(sync, pf & ~(UINT) DXGI_PRESENT_ALLOW_TEARING);
             }
+            Latency::Mark(g, Latency::RealPresent);
             _dq->Signal(_dFence.Get(), ++_dValue);
+            Latency::Watch(_dFence.Get(), _dValue, g, Latency::DisplayDone);
+            for (UINT64 f = _consumed + 1; skipped && f < g; ++f)
+                Latency::Skipped(f);
             slotDisplayValue[s] = _dValue;
         }
         if (hr == DXGI_ERROR_INVALID_CALL && SUCCEEDED(_ddev->GetDeviceRemovedReason()) && _renewals < 8)
@@ -1146,9 +1224,10 @@ void ProxySwapChain::PresenterLoop()
                 DXGI_SWAP_CHAIN_FULLSCREEN_DESC fd {};
                 _real->GetDesc1(&rd);
                 _real->GetFullscreenDesc(&fd);
-                Log(2, std::format("real Present({}, {:X}) failed {:X}: fullscreen {}, {}x{} fmt {} flags {:X}, windowed {}",
+                Log(2, std::format("real Present({}, {:X}) failed {:X}: fullscreen {}, {}x{} fmt {} flags {:X}, windowed {}, "
+                                   "queue idle before it {} ({:.0f} ms)",
                                    sync, pfUsed, (uint32_t) hr, (int) _fsCached, rd.Width, rd.Height, (int) rd.Format,
-                                   rd.Flags, fd.Windowed));
+                                   rd.Flags, fd.Windowed, _lastIdleMs >= 0 ? "yes" : _lastIdleMs < -1.5 ? "no" : "unchecked", _lastIdleMs));
             }
             LogDeviceRemoved(_ddev.Get(), "display");
             const HRESULT why = _ddev->GetDeviceRemovedReason();
@@ -1207,14 +1286,17 @@ void ProxySwapChain::PresenterLoop()
         }
         if (nrMs > 0)
             st.nrMs = Ema(st.nrMs, nrMs);
+        if (nrAnswerMs >= 0 && nrAnswerMs < 250)
+            st.answerWaitMs = Ema(st.answerWaitMs, nrAnswerMs);
         st.ringDepth = UINT(_scheduled - g);
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
                                "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
-                               "hudless {} missed {} ui {:.2f}% gate {} motion {}",
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {}",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
                                st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
-                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames));
+                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
+                               st.sendWaitMs, st.answerWaitMs, st.sendStalls));
     }
 }
 
@@ -1222,6 +1304,8 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
 {
     if (flags & DXGI_PRESENT_TEST)
         return _occluded && !_lost ? DXGI_STATUS_OCCLUDED : S_OK;
+    LARGE_INTEGER tEntry;
+    QueryPerformanceCounter(&tEntry);
     const auto& env = CurrentEnv();
     if (env.onPresent)
         env.onPresent();
@@ -1235,6 +1319,8 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     }
     const UINT i = _bbIndex;
     const UINT64 next = _scheduled + 1;
+    if (!_lost)
+        Latency::Mark(next, Latency::Present);
     if (!env.dumpDir.empty() && next % 30 == 0)
     {
         const std::wstring trig = env.dumpDir + L"\\mgpu_dump.trigger";
@@ -1279,13 +1365,48 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     if (_lost)
         return PresentFallback(sync, flags);
     _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
+    Latency::Watch(_rgameFence.Get(), _rgameValue, next, Latency::GameDone);
+    if (_llMode < 0)
+    {
+        _llMode = CurrentSettings().lowLatency;
+        _earlySend = CurrentSettings().earlySend;
+    }
+    if (!env.dumpDir.empty() && next % 30 == 0)
+    {
+        // <dumpDir>\mgpu_ll.trigger: switch MgpuLowLatency live (0-2 inside)
+        const std::wstring trig = env.dumpDir + L"\\mgpu_ll.trigger";
+        if (FILE* fp = _wfopen(trig.c_str(), L"r"))
+        {
+            int v = -1;
+            if (fscanf(fp, "%d", &v) == 1 && v >= 0 && v <= 2)
+                _llMode = v;
+            fclose(fp);
+            DeleteFileW(trig.c_str());
+            Log(0, std::format("low latency mode {} from the trigger at frame {}", _llMode, next));
+        }
+        const std::wstring es = env.dumpDir + L"\\mgpu_es.trigger";
+        if (FILE* fp = _wfopen(es.c_str(), L"r"))
+        {
+            int v = -1;
+            if (fscanf(fp, "%d", &v) == 1 && v >= 0 && v <= 1)
+                _earlySend = v != 0;
+            fclose(fp);
+            DeleteFileW(es.c_str());
+            Log(0, std::format("early send {} from the trigger at frame {}", _earlySend, next));
+        }
+    }
+    if (_llMode)
+        _clock.Push(_rgameFence.Get(), _rgameValue);
 
     double sendMs = -1;
     {
         std::unique_lock lk(_m);
         // Bound the lead over the display card ([Mgpu] MaxFramesAhead, default 1).
         const UINT64 lead = (std::max)(1u, CurrentSettings().maxLead);
-        _cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return _scheduled < _consumed + lead || _stop; });
+        // Early send: the copy goes to the GPU before the lead wait (the slot's last reader is done: consumed >= g - 2)
+        const bool early = _earlySend && lead == 1;
+        if (!early)
+            _cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return _scheduled < _consumed + lead || _stop; });
         const UINT64 g = _scheduled + 1;
         const UINT s = UINT(g % K);
         if (g > K && _filledR->GetCompletedValue() >= g - K && _rQuery)
@@ -1301,11 +1422,11 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             std::lock_guard cg(_capM);
             meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g;
             meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g;
+            // the slot's previous send list must be done before its allocator is reset: else no extras this frame
+            if ((meta.hud || meta.mv) && g > K && !WaitReuse(_filledR.Get(), g - K, "send", &_stop, &_lost))
+                meta.hud = meta.mv = false;
             if (meta.hud || meta.mv)
             {
-                // the slot's previous send list must be done before its allocator is reset
-                if (g > K)
-                    WaitFence(_filledR.Get(), g - K, 500);
                 _rxAlloc[s]->Reset();
                 auto* c = _rxList[s].Get();
                 c->Reset(_rxAlloc[s].Get(), nullptr);
@@ -1334,6 +1455,10 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         _meta[s] = meta;
         _rcopy->ExecuteCommandLists(nl, l);
         _rcopy->Signal(_filledR.Get(), g);
+        Latency::Mark(g, Latency::Submit);
+        Latency::Watch(_filledR.Get(), g, g, Latency::Sent);
+        if (early)
+            _cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return _scheduled < _consumed + lead || _stop; });
         _sync[s] = sync;
         _flags[s] = flags;
         _tSched[s] = std::chrono::steady_clock::now();
@@ -1350,6 +1475,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     if (_bbFrame[_bbIndex])
         _gameQueue->Wait(_filledR.Get(), _bbFrame[_bbIndex]);
     _presentCount++;
+    const double slept = _pacer.Pace(_llMode, _clock, _rgameValue, tEntry.QuadPart);
 
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard sg(StatsMutex());
@@ -1363,6 +1489,9 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         st.sendMs = Ema(st.sendMs, sendMs);
         st.sendGBs = double(_payloadBytes) / (st.sendMs * 1e6);
     }
+    if (_llMode && _presentCount % 600 == 0)
+        Log(0, std::format("low latency {}: render queue {:.2f} ms, pacing sleep {:.2f} ms (last {:.2f})",
+                           _llMode, _pacer.QueueMs(), _pacer.SleepMs(), slept));
     return S_OK;
 }
 

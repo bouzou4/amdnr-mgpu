@@ -2,6 +2,7 @@
 // display card, which owns the real flip-model swapchain on the game's window.
 #pragma once
 #include "MgpuCore.h"
+#include "MgpuLatency.h"
 #include <wrl/client.h>
 #include <atomic>
 #include <condition_variable>
@@ -96,6 +97,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     void StopPresenter();
     void PresenterLoop();
     void DrainRender();
+    bool WaitSend(UINT64 g);
     HRESULT DoPresent(UINT sync, UINT flags);
 
     static constexpr UINT K = 3; // ring slots
@@ -157,6 +159,9 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     std::mutex _scMutex; // serialises the game's calls on the real swapchain (not the presenter's Present)
     std::atomic<BOOL> _fsCached { FALSE };
     UINT _presentFails = 0, _renewals = 0;
+    UINT _sendStallLogs = 0, _idleSkips = 0, _idleSlow = 0;
+    double _lastIdleMs = -1;
+    static constexpr DWORD kPresentIdleMs = 1000; // under TdrDelay (2 s)
     std::atomic<bool> _tearingOff { false };
     std::mutex _fsM;
     ComPtr<IDXGIOutput> _fsOutput;
@@ -212,5 +217,9 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     bool _wholeFallback = false;
     std::chrono::steady_clock::time_point _lastNr {};
     UINT64 _lastMvW = 0, _lastMvH = 0;
+    RenderClock _clock; // render card frame completions (low latency)
+    Pacer _pacer;
+    int _llMode = -1; // MgpuLowLatency, switchable by trigger
+    bool _earlySend = false;
 };
 } // namespace Mgpu

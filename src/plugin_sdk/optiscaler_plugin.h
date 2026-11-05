@@ -65,6 +65,8 @@ extern "C"
     typedef enum OptiGraphicsApi
     {
         OptiApi_D3D12 = 1,
+        OptiApi_D3D11 = 2,
+        OptiApi_Vulkan = 3,
     } OptiGraphicsApi;
 
     typedef enum OptiUpscaleFlags
@@ -77,6 +79,8 @@ extern "C"
         OptiUpscale_AutoExposure = 1 << 5,       // no exposure texture, the upscaler computes it
         OptiUpscale_RayReconstruction = 1 << 6,  // the evaluate also denoises (DLSS-D / FSR Ray Regeneration)
         OptiUpscale_StatesAssumed = 1 << 7,      // *State fields are the API's convention, not set by the game config
+        OptiUpscale_Bridged = 1 << 8,            // the game renders with gameApi; device, list, queue and resources
+                                                 // are OptiScaler's D3D12 bridge, the list is submitted after the evaluate
     } OptiUpscaleFlags;
 
     // One upscaler evaluate. Resources are ID3D12Resource*, NULL when the game doesn't provide them.
@@ -114,6 +118,7 @@ extern "C"
         // Before callbacks only: set to an ID3D12Resource* (render size or larger, colorState, shader readable) to
         // use it as the upscaler's color for this evaluate. The last plugin that sets it wins.
         void* colorOverride;
+        uint32_t gameApi; // OptiGraphicsApi the game renders with (appended)
     } OptiUpscaleFrame;
 
     // before runs ahead of the upscaler, after runs once it has recorded into frame->commandList
@@ -166,6 +171,9 @@ extern "C"
         uint64_t upscaleFrameId; // OptiUpscaleFrame::frameId of the last evaluate, 0 when none
         uint32_t hudlessSource;  // OptiHudlessSource of hudless (appended)
         uint32_t frameGeneration; // OptiFrameGen: generated frames are presented between the game's (appended)
+        // 1: the game's Present on its own FG swapchain, before that FG reads backBuffer and hudless (this frame's
+        // FG input): edits to both reach the frames it generates; its presents are not called back (appended)
+        uint32_t fgSwapchain;
     } OptiPresentFrame;
 
     typedef enum OptiHudlessSource
@@ -288,7 +296,8 @@ extern "C"
         // Upscale callbacks, added after version 1 (check with OPTI_API_HAS) -------------------------------------
 
         // Calls before / after (either can be NULL) on the render thread around every upscaler evaluate,
-        // D3D12 for now (native D3D12 inputs). One registration per plugin, a second one replaces the first.
+        // on D3D12 lists: the game's, or the D3D11 / Vulkan bridge's (OptiUpscale_Bridged).
+        // One registration per plugin, a second one replaces the first.
         bool (*RegisterUpscaleCallbacks)(OptiPlugin* plugin, OptiUpscaleFn before, OptiUpscaleFn after, void* userData);
         // Rebinds the root signatures, root arguments and (with ExtendedStateRestore) descriptor heaps and pipeline
         // state the game had set on commandList before the evaluate. Does nothing when the game config has root

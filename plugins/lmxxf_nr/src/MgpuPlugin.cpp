@@ -2,8 +2,10 @@
 // Multi-GPU mode: the game renders on one card, the other card presents and runs NR. The mgpu/ modules do the work;
 // this file connects them to the plugin API (adapter override, swapchain provider, present and upscale callbacks).
 #include "MgpuPlugin.h"
+#include "Autoconfig.h"
 #include "Nr.h"
 #include "mgpu/MgpuCore.h"
+#include "GpuWait.h"
 
 #include <detours/detours.h>
 #include <intrin.h>
@@ -146,6 +148,7 @@ bool NrFrame(ID3D12Device* d, ID3D12CommandQueue* q, const Mgpu::NrInput& in)
     f.mvScaleY = in.guides.mvScaleY;
     f.reset = in.reset;
     f.waitAnswer = in.waitAnswer;
+    f.waitMs = in.answerWaitMs;
     f.encoding = Encoding(g_colorSpace);
     return DisplayEngine().RunOwn(d, q, f);
 }
@@ -178,11 +181,9 @@ void CaptureHudless(OptiPresentFrame* f)
         g_cap.list->Close();
     }
     const uint32_t s = uint32_t(g_cap.counter % 4);
-    if (g_cap.fence->GetCompletedValue() < g_cap.value[s])
-    {
-        g_cap.fence->SetEventOnCompletion(g_cap.value[s], g_cap.event);
-        WaitForSingleObject(g_cap.event, 500);
-    }
+    // the slot's capture list must be done before its allocator is reset: else no capture this frame
+    if (!GpuWaitDone(g_cap.fence.Get(), g_cap.value[s]))
+        return Log(OptiLog_Warn, "[mgpu] HUD-less capture skipped: its list from 4 frames ago is not done");
     g_cap.alloc[s]->Reset();
     g_cap.list->Reset(g_cap.alloc[s].Get(), nullptr);
     Mgpu::CaptureHudless(g_cap.list.Get(), static_cast<ID3D12Resource*>(f->hudless),
@@ -210,7 +211,7 @@ bool MgpuFallback() { return g_on && Mgpu::GetStats().fallback; }
 bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& dumpDir)
 {
     Mgpu::Settings s;
-    s.enabled = api->GetBool(plugin, "MultiGpu", false);
+    s.enabled = g_keys.Bool("MultiGpu", false);
     if (!s.enabled)
         return false;
     if (!OPTI_API_HAS(api, RegisterAdapterOverride) || !OPTI_API_HAS(api, RegisterSwapchainProvider) ||
@@ -219,19 +220,22 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
         Log(OptiLog_Error, "multi-GPU needs the adapter override and swapchain provider API: off");
         return false;
     }
-    s.renderBus = api->GetInt(plugin, "MgpuRenderBus", -1);
-    s.displayBus = api->GetInt(plugin, "MgpuDisplayBus", -1);
-    s.hudless = api->GetBool(plugin, "MgpuHudless", true);
-    s.wholeFrameFallback = api->GetBool(plugin, "WholeFrameFallback", true);
-    s.presenter = api->GetBool(plugin, "MgpuPresenter", true);
-    s.fallbackInline = api->GetBool(plugin, "MgpuFallbackInline", true);
-    s.nrEveryFrame = api->GetBool(plugin, "MgpuNrEveryFrame", true);
-    s.temporal = api->GetBool(plugin, "MgpuMotionVectors", true);
-    s.uiGate = std::clamp(api->GetFloat(plugin, "MgpuUiGate", 0.90f), 0.0f, 1.0f);
-    s.maxLead = (unsigned) std::clamp(api->GetInt(plugin, "MgpuMaxFramesAhead", 1), 1, 3);
+    s.renderBus = g_keys.Int("MgpuRenderBus", -1);
+    s.displayBus = g_keys.Int("MgpuDisplayBus", -1);
+    s.hudless = g_keys.Bool("MgpuHudless", true);
+    s.wholeFrameFallback = g_keys.Bool("WholeFrameFallback", true);
+    s.presenter = g_keys.Bool("MgpuPresenter", true);
+    s.fallbackInline = g_keys.Bool("MgpuFallbackInline", true);
+    s.nrEveryFrame = g_keys.Bool("MgpuNrEveryFrame", true);
+    s.temporal = g_keys.Bool("MgpuMotionVectors", true);
+    s.uiGate = std::clamp(g_keys.Float("MgpuUiGate", 0.90f), 0.0f, 1.0f);
+    s.maxLead = (unsigned) std::clamp(g_keys.Int("MgpuMaxFramesAhead", 1), 1, 3);
+    s.lowLatency = std::clamp(g_keys.Int("MgpuLowLatency", 2), 0, 2);
+    s.earlySend = g_keys.Bool("MgpuEarlySend", false);
+    s.presentIdle = g_keys.Bool("MgpuPresentIdle", false);
     // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
-    s.dred = std::clamp(api->GetInt(plugin, "MgpuDred", api->GetBool(plugin, "MgpuDred", false) ? 1 : 0), 0, 2);
-    s.forwardOutputs = api->GetBool(plugin, "MgpuForwardOutputs", true);
+    s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", false) ? 1 : 0), 0, 2);
+    s.forwardOutputs = g_keys.Bool("MgpuForwardOutputs", true);
 
     g_dir = dumpDir;
     Mgpu::Env e;
@@ -252,7 +256,12 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
             fn();
     };
     e.nrFrame = NrFrame;
-    e.nrSettle = [] { DisplayEngine().SettleOwn(); };
+    e.nrSettle = [] { return DisplayEngine().SettleOwn(); };
+    e.hookExecute = [](ID3D12Device* d)
+    {
+        extern bool InstallQueueHook(ID3D12Device * device);
+        InstallQueueHook(d);
+    };
     e.nrQuiesce = [] { DisplayEngine().Quiesce(); };
     e.nrIdle = [](const char* why) { DisplayEngine().SeqIdle(why); };
     e.nrWanted = [] { return Engine().Settings().enabled; };
@@ -330,8 +339,8 @@ void MgpuDrawTab(const OptiPluginApi* api)
                      s.nrEveryFrame ? "on" : "off", s.temporal ? "on" : "off", s.maxLead));
     line(std::format("Frame {}x{}, render {:.2f} ms, display {:.2f} ms, added latency {:.2f} ms", st.width, st.height,
                      st.renderFrameMs, st.displayFrameMs, st.latencyMs));
-    line(std::format("Send {:.2f} ms ({:.1f} GB/s), ingest {:.2f} ms ({:.1f} GB/s)", st.sendMs, st.sendGBs, st.ingestMs,
-                     st.ingestGBs));
+    line(std::format("Send {:.2f} ms ({:.1f} GB/s), ingest {:.2f} ms ({:.1f} GB/s), CPU waits send {:.2f} ms answer {:.2f} ms",
+                     st.sendMs, st.sendGBs, st.ingestMs, st.ingestGBs, st.sendWaitMs, st.answerWaitMs));
     line(std::format("Frames sent {}, presented {}, skipped {}", st.produced, st.presented, st.skipped));
     if (s.hudless)
         line(std::format("HUD-less frames {}, missed {}, UI {:.1f}% of pixels, gate trips {}", st.hudlessFrames,

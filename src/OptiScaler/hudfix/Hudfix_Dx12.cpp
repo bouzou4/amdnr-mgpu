@@ -705,6 +705,9 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
             }
         }
 
+        if (pluginOnly && !PluginPickAccept({ resource->buffer, resource->captureInfo }, upscaleCounter))
+            break;
+
         if (!CheckCapture(fIndex))
             break;
 
@@ -901,6 +904,7 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
                          resource->height, (UINT) resource->format);
             _pluginHudless = _captureBuffer[fIndex];
             _pluginHudlessFrame = upscaleCounter;
+            PluginPickTaken({ resource->buffer, resource->captureInfo }, upscaleCounter);
         }
 
         if (s.fgCaptureResources)
@@ -969,6 +973,74 @@ bool Hudfix_Dx12::PluginOnly()
 
     auto fg = State::Instance().currentFG;
     return fg == nullptr || !fg->IsActive() || !Config::Instance()->IsFGEnabled();
+}
+
+// Test rigs switch the sticky pick live: <exe>\OptiScaler_hudless_sticky.txt "0" / "1" (absent: the ini)
+static bool StickyOn()
+{
+    static int n = 0, live = -1;
+    if (n++ % 30 == 0)
+    {
+        live = -1;
+        if (FILE* f = _wfopen((Util::ExePath().parent_path() / L"OptiScaler_hudless_sticky.txt").c_str(), L"rb"))
+        {
+            const int c = fgetc(f);
+            fclose(f);
+            live = c == '0' ? 0 : c == '1' ? 1 : -1;
+        }
+    }
+    return live >= 0 ? live == 1 : Config::Instance()->FGPluginHudlessSticky.value_or_default();
+}
+
+bool Hudfix_Dx12::PluginPickAccept(const PickSig& sig, UINT64 frame)
+{
+    if (!_stickyValid || sig == _stickySig)
+    {
+        if (_stickyValid)
+            _stickyLastSeen = frame;
+        return true;
+    }
+    if (!StickyOn())
+        return true;
+    if (frame - _stickyLastSeen > 3) // the game's chain changed: learn again
+    {
+        LOG_INFO("Plugin HUD-less: sticky pick {:X} ({}->{}) not offered for {} frames: released",
+                 (size_t) _stickySig.buffer, GetSourceString(_stickySig.captureInfo & 0xFF),
+                 GetDispatchString(_stickySig.captureInfo & 0xFF00), frame - _stickyLastSeen);
+        _stickyValid = false;
+        _pickHistoryCount = 0;
+        return true;
+    }
+    if (_pickRejects++ % 600 == 0)
+        LOG_INFO("Plugin HUD-less: skipped {:X} ({}->{}) for sticky {:X}, {} skips", (size_t) sig.buffer,
+                 GetSourceString(sig.captureInfo & 0xFF), GetDispatchString(sig.captureInfo & 0xFF00),
+                 (size_t) _stickySig.buffer, _pickRejects);
+    return false;
+}
+
+void Hudfix_Dx12::PluginPickTaken(const PickSig& sig, UINT64 frame)
+{
+    if (!(sig == _lastPick) && _pickChanges++ < 40)
+        LOG_INFO("Plugin HUD-less: pick {:X} ({}->{}) at frame {}, was {:X} ({}->{})", (size_t) sig.buffer,
+                 GetSourceString(sig.captureInfo & 0xFF), GetDispatchString(sig.captureInfo & 0xFF00), frame,
+                 (size_t) _lastPick.buffer, GetSourceString(_lastPick.captureInfo & 0xFF),
+                 GetDispatchString(_lastPick.captureInfo & 0xFF00));
+    _lastPick = sig;
+    _pickHistory[_pickHistoryCount++ % 32] = sig;
+    if (_stickyValid || _pickHistoryCount < 32)
+        return;
+    UINT same = 0;
+    for (const auto& h : _pickHistory)
+        same += h == sig;
+    if (same >= 18)
+    {
+        _stickyValid = true;
+        _stickySig = sig;
+        _stickyLastSeen = frame;
+        LOG_INFO("Plugin HUD-less: sticky pick {:X} ({}->{}), {}/32 of the last picks{}", (size_t) sig.buffer,
+                 GetSourceString(sig.captureInfo & 0xFF), GetDispatchString(sig.captureInfo & 0xFF00), same,
+                 StickyOn() ? "" : " (sticky off: log only)");
+    }
 }
 
 ID3D12Resource* Hudfix_Dx12::PluginHudless(UINT64* frame)

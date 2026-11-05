@@ -656,6 +656,7 @@ class Config
     CustomOptional<bool, SoftDefault> FGDisableHUDFix { false };
     CustomOptional<bool> FGHUDFix { false };
     CustomOptional<int> FGHUDLimit { 1 };
+    CustomOptional<bool> FGPluginHudlessSticky { true };
     CustomOptional<bool> FGHUDFixExtended { false };
     CustomOptional<bool> FGHUDFixUITexture { true };
     CustomOptional<bool, NoDefault> FGHUDFixUIUnblend;

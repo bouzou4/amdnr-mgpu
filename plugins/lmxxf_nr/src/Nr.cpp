@@ -11,6 +11,7 @@
 #include <d3dcompiler.h>
 
 #include "mgpu/MgpuCore.h"
+#include "GpuWait.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -22,7 +23,7 @@ namespace
 {
 constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr uint32_t kHeapSlots = 64;
-constexpr uint32_t kSlotDescriptors = 6;
+constexpr uint32_t kSlotDescriptors = 9; // t0-t6, u0-u1
 
 DXGI_FORMAT ViewFormat(DXGI_FORMAT f)
 {
@@ -154,16 +155,21 @@ bool NrEngine::LoadRuntime(const RuntimePaths& paths)
     if (_rt.Load(paths))
     {
         Log(OptiLog_Info,
-            "runtime %ls (%s, assets %ls, %zu exports, %s table %u bytes, max input %ux%u, hip_ready %u, history %u, "
-            "native %d); env: free_res %d, style %d, multi_pass %d",
-            _rt.dllPath.c_str(), _rt.LayoutName(), _rt.assets.c_str(), _rt.exports, _rt.hasTimings ? "full" : "v1",
+            "runtime %ls (%s, from %s, assets %ls, %zu modules hashed, %zu exports, %s table %u bytes, max input %ux%u, "
+            "hip_ready %u, history %u, native %d); env: free_res %d, style %d, multi_pass %d",
+            _rt.dllPath.c_str(), _rt.LayoutName(), _rt.source.c_str(), _rt.assets.c_str(), _rt.hashed, _rt.exports,
+            _rt.hasTimings ? "full" : "v1",
             _rt.tableSize, _rt.caps.max_input_width, _rt.caps.max_input_height, _rt.caps.hip_ready,
             _rt.caps.history_supported, _rt.Native(), _rt.envFreeRes, _rt.envStyle, _rt.envMultiPass);
+        for (const auto& s : _rt.searched)
+            Log(OptiLog_Info, "  skipped %s", s.c_str());
         return true;
     }
     _stats.state = "no runtime";
     _stats.error = _rt.error;
     Log(OptiLog_Warn, "%s", _rt.error.c_str());
+    for (const auto& s : _rt.searched)
+        Log(OptiLog_Warn, "  searched %s", s.c_str());
     return false;
 }
 
@@ -172,7 +178,7 @@ void NrEngine::Configure(const NrSettings& s)
     std::lock_guard lock(_mutex);
     _settings = s;
     // A history session drops adaptive ViT reuse: toggling history rebuilds it off the render thread
-    _dirty = s.size != _active.size || s.model != _active.model || s.style != _active.style ||
+    _dirty = s.size != _active.size || s.model != _active.model || s.Style() != _active.Style() ||
              s.Passes() != _active.Passes() || (_rt.Native() && s.History() != _active.History());
 }
 
@@ -239,7 +245,7 @@ void NrEngine::ApplyEnv()
     if (_rt.envStyle)
     {
         const char* styles[] = { "0", "1", "2" };
-        SetRuntimeEnv("DLSS5_STYLE", styles[std::clamp(_settings.style, 0, 2)]);
+        SetRuntimeEnv("DLSS5_STYLE", styles[std::clamp(_settings.Style(), 0, 2)]);
     }
     if (_rt.envMultiPass)
     {
@@ -324,8 +330,8 @@ bool NrEngine::CreatePipelines()
     }
 
     D3D12_DESCRIPTOR_RANGE ranges[2] {};
-    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0 };
-    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7, 0, 0, 0 };
+    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0 };
     D3D12_ROOT_PARAMETER params[3] {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = { 0, 0, sizeof(ShaderConstants) / 4 };
@@ -385,7 +391,7 @@ bool NrEngine::CreatePipelines()
 
 void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, const ShaderConstants& c,
                         ID3D12Resource* const srv[4], const DXGI_FORMAT srvFmt[4], ID3D12Resource* uav,
-                        DXGI_FORMAT uavFmt, uint32_t w, uint32_t h, ID3D12Resource* norm)
+                        DXGI_FORMAT uavFmt, uint32_t w, uint32_t h, ID3D12Resource* norm, const StabBind* stab)
 {
     // A ring of descriptor slots, the GPU is never kHeapSlots dispatches behind
     const uint32_t slot = (_heapCursor++ % kHeapSlots) * kSlotDescriptors;
@@ -412,10 +418,22 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
         sd.Texture2D.MipLevels = 1;
         _device->CreateShaderResourceView(norm, &sd, { cpu.ptr + SIZE_T(4) * _heapStride });
     }
+    for (int i = 0; i < 2; i++)
+    {
+        ID3D12Resource* r = stab ? (i == 0 ? stab->hist : stab->motion) : nullptr;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd {};
+        sd.Format = r && i == 1 ? ViewFormat(stab->motionFmt) : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        _device->CreateShaderResourceView(r, &sd, { cpu.ptr + SIZE_T(5 + i) * _heapStride });
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC ud {};
     ud.Format = UavFormat(uavFmt);
     ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(5) * _heapStride });
+    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(7) * _heapStride });
+    ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    _device->CreateUnorderedAccessView(stab ? stab->out : nullptr, nullptr, &ud, { cpu.ptr + SIZE_T(8) * _heapStride });
 
     ID3D12DescriptorHeap* heaps[] = { _heap.Get() };
     list->SetDescriptorHeaps(1, heaps);
@@ -423,8 +441,39 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
     list->SetPipelineState(pso);
     list->SetComputeRoot32BitConstants(0, sizeof(ShaderConstants) / 4, &c, 0);
     list->SetComputeRootDescriptorTable(1, gpu);
-    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(5) * _heapStride });
+    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(7) * _heapStride });
     list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+}
+
+bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t h, bool reset, ShaderConstants& c,
+                           ID3D12Resource* motion, StabBind& b)
+{
+    c.histMode = 0;
+    if (!_settings.stabilise || _settings.upsample != 1)
+        return _stabValid = false;
+    if (!_stab[0] || _stab[0]->GetDesc().Width != w || _stab[0]->GetDesc().Height != h)
+    {
+        _stabValid = false;
+        for (auto& t : _stab)
+            if (!(t = Texture(_device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead)))
+                return false;
+        _stab[0]->SetName(L"lmxxf_nr edit history"), _stab[1]->SetName(L"lmxxf_nr edit history");
+    }
+    c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u);
+    b.hist = _stab[_stabCur].Get();
+    b.out = _stab[_stabCur ^ 1].Get();
+    b.motion = motion;
+    if (motion)
+        b.motionFmt = motion->GetDesc().Format;
+    Barrier(list, b.out, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    return true;
+}
+
+void NrEngine::StabFinish(ID3D12GraphicsCommandList* list, const StabBind& b)
+{
+    Barrier(list, b.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    _stabCur ^= 1;
+    _stabValid = true;
 }
 
 bool NrEngine::CreateSession()
@@ -594,11 +643,7 @@ void NrEngine::WaitIdle()
         if (q == nullptr)
             return;
         q->Signal(f, ++v);
-        if (f->GetCompletedValue() < v)
-        {
-            f->SetEventOnCompletion(v, _event);
-            WaitForSingleObject(_event, 10000);
-        }
+        GpuWaitDone(f, v); // before the session's resources go: until done or the device is gone
     };
     wait(_gameQueue.Get(), _gameFence.Get(), _gameValue);
     wait(_queue.Get(), _hipFence.Get(), _hipValue);
@@ -835,6 +880,16 @@ void NrEngine::OnUpscale(OptiUpscaleFrame* f, bool after)
     if (f->api != OptiApi_D3D12 || f->device == nullptr || f->commandList == nullptr || !RuntimeLoaded())
         return;
 
+    const uint32_t gameApi =
+        f->size >= offsetof(OptiUpscaleFrame, gameApi) + sizeof(f->gameApi) ? f->gameApi : uint32_t(OptiApi_D3D12);
+    if (gameApi != _stats.gameApi)
+    {
+        std::lock_guard lock(_mutex);
+        _stats.gameApi = gameApi;
+        Log(OptiLog_Info, "upscale callbacks: game API %u%s", gameApi,
+            (f->flags & OptiUpscale_Bridged) ? ", through OptiScaler's D3D12 bridge" : "");
+    }
+
     NrSettings s;
     {
         std::lock_guard lock(_mutex);
@@ -1044,6 +1099,8 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
     uint64_t wait = 0;
     ID3D12Resource* enh = nullptr;
     Consume(list, &wait, &enh);
+    if (f->flags & OptiUpscale_Reset)
+        _stabValid = false;
     if (enh != nullptr && !(f->flags & OptiUpscale_Reset))
     {
         const auto ed = enh->GetDesc();
@@ -1066,6 +1123,8 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
+        c.colorStrength = _settings.ColorStrength(true);
+        c.upMode = uint32_t(_settings.upsample);
         c.encoding = encoding;
         c.useNorm = norm != nullptr;
 
@@ -1074,8 +1133,12 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         ID3D12Resource* srv[4] = { src, enh, _feed.Get(), c.useMv ? mv : nullptr };
         const DXGI_FORMAT fmt[4] = { srcDesc.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                      mv ? mv->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT };
+        StabBind sb;
+        const bool stab = StabPrepare(list, w, h, false, c, c.useMv ? mv : nullptr, sb);
         Dispatch(list, _psoApply.Get(), c, srv, fmt, target, pre ? DXGI_FORMAT_R16G16B16A16_FLOAT : srcDesc.Format,
-                 w, h, norm);
+                 w, h, norm, stab ? &sb : nullptr);
+        if (stab)
+            StabFinish(list, sb);
         UavBarrier(list, target);
         Barrier(list, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, targetState);
         MaybeDump(list, enh, target, targetState, src);
@@ -1297,18 +1360,24 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     if (!s.enabled || s.placement != Placement::Terminal)
         return;
 
-    // The game's frame generation presents generated frames here too: whole frame on every present (consistent)
+    // The game's frame generation presents generated frames here too: whole frame on every present (consistent).
+    // At the game's Present on its FG swapchain the HUD-less colour is this frame's FG input: HUD-less NR, and the
+    // edit also goes onto that input so the generated frames are made from NR'd frames
     constexpr size_t kFgEnd = offsetof(OptiPresentFrame, frameGeneration) + sizeof(uint32_t);
-    const bool gameFg = f->size >= kFgEnd && f->frameGeneration != OptiFrameGen_Off;
+    constexpr size_t kFgScEnd = offsetof(OptiPresentFrame, fgSwapchain) + sizeof(uint32_t);
+    const bool fgSc = f->size >= kFgScEnd && f->fgSwapchain != 0;
+    const bool gameFg = f->size >= kFgEnd && f->frameGeneration != OptiFrameGen_Off && !fgSc;
     const uint32_t hudSource = f->size >= kFgEnd ? f->hudlessSource : OptiHudless_Hudfix;
     const bool haveHud = f->hudless != nullptr && !gameFg;
+    const bool editHud = haveHud && fgSc && hudSource == OptiHudless_FfxFG && f->frameGeneration != OptiFrameGen_Off;
     _hudlessStreak = haveHud ? 0 : _hudlessStreak + 1;
     // A lone missed pick keeps the HUD-less mode (no NR that frame); a run of them falls back
     const bool whole = !haveHud && s.wholeFrameFallback && (gameFg || _hudlessStreak > 30);
     {
         std::lock_guard lock(_mutex);
-        _stats.source = haveHud ? (hudSource == OptiHudless_FfxFG ? "HUD-less colour (the game's FSR FG input)"
-                                                                  : "HUD-less colour (OptiScaler HUDfix)")
+        _stats.source = haveHud ? (editHud ? "HUD-less colour at the game's FG swapchain (generated frames from NR'd frames)"
+                                   : hudSource == OptiHudless_FfxFG ? "HUD-less colour (the game's FSR FG input)"
+                                                                    : "HUD-less colour (OptiScaler HUDfix)")
                         : whole ? (gameFg ? "whole frame, UI included (the game's frame generation: every present)"
                                           : "whole frame, UI included (no HUD-less colour)")
                         : s.wholeFrameFallback ? "waiting for a HUD-less colour"
@@ -1367,6 +1436,19 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
                                                                                            : 1;
     _stats.encoding = encoding;
 
+    // The FG input is edited in place: the feed and the edit read its copy
+    ID3D12Resource* hudTarget = nullptr;
+    if (editHud && EnsureHudCopies(hud->GetDesc()))
+    {
+        hudTarget = hud;
+        Barrier(list, hud, hudState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(list, _hudCopy.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(_hudCopy.Get(), hud);
+        Barrier(list, _hudCopy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+        Barrier(list, hud, D3D12_RESOURCE_STATE_COPY_SOURCE, hudState);
+        hud = _hudCopy.Get();
+        hudState = kRead;
+    }
     Barrier(list, hud, hudState, kRead);
 
     uint64_t wait = 0;
@@ -1388,18 +1470,51 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
+        c.colorStrength = _settings.ColorStrength(false);
+        c.upMode = uint32_t(_settings.upsample);
         c.uiLow = _settings.uiLow;
         c.uiHigh = _settings.uiHigh;
         c.encoding = encoding;
         c.paperWhite = _settings.paperWhite / 80.0f;
         ID3D12Resource* srv[4] = { _termCopy.Get(), enh, _feed.Get(), hud };
         const DXGI_FORMAT fmt[4] = { bd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT, hud->GetDesc().Format };
-        Dispatch(list, _psoTerminal.Get(), c, srv, fmt, _termOut.Get(), bd.Format, w, h);
+        // the history follows this frame's vectors when the evaluate captured them (the edit itself is not moved)
+        const bool mv = _mvCopy && _mvCap.frameId != 0 && _mvCap.frameId == f->upscaleFrameId && _mvCap.w > 0;
+        if (mv)
+        {
+            const auto md = _mvCopy->GetDesc();
+            c.mvUvScaleX = float(_mvCap.w) / float(md.Width);
+            c.mvUvScaleY = float(_mvCap.h) / float(md.Height);
+            c.mvToUvX = _mvCap.scaleX / float(_mvCap.w);
+            c.mvToUvY = _mvCap.scaleY / float(_mvCap.h);
+        }
+        StabBind sb;
+        const bool stab = StabPrepare(list, w, h, mv && _mvCap.reset, c, mv ? _mvCopy.Get() : nullptr, sb);
+        Dispatch(list, _psoTerminal.Get(), c, srv, fmt, _termOut.Get(), bd.Format, w, h, nullptr, stab ? &sb : nullptr);
+        if (stab)
+            StabFinish(list, sb);
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(bb, _termOut.Get());
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
-        MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud);
+        if (hudTarget != nullptr)
+        {
+            // Same edit on the HUD-less input, all of it scene (no UI mask: it is compared with itself)
+            const auto hd = hud->GetDesc();
+            ID3D12Resource* hsrv[4] = { hud, enh, _feed.Get(), hud };
+            const DXGI_FORMAT hfmt[4] = { hd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT, hd.Format };
+            Barrier(list, _hudOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            StabBind hb = sb;
+            hb.out = nullptr; // reads the same history, writes none
+            Dispatch(list, _psoTerminal.Get(), c, hsrv, hfmt, _hudOut.Get(), hd.Format, w, h, nullptr,
+                     stab ? &hb : nullptr);
+            Barrier(list, _hudOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            const auto ts = D3D12_RESOURCE_STATES(f->hudlessState);
+            Barrier(list, hudTarget, ts, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(hudTarget, _hudOut.Get());
+            Barrier(list, hudTarget, D3D12_RESOURCE_STATE_COPY_DEST, ts);
+        }
+        MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud, hudTarget, D3D12_RESOURCE_STATES(f->hudlessState));
         Meter(list, enh, false);
     }
 
@@ -1446,10 +1561,11 @@ ID3D12GraphicsCommandList* NrEngine::NextOwnList(uint32_t* slot)
     if (!_presentList || !_presentFence)
         return nullptr;
     *slot = uint32_t(_presentCounter % kPresentLists);
-    if (_presentFence->GetCompletedValue() < _presentValue[*slot])
+    // the slot's list must be done before its allocator is reset: no fixed cap
+    if (!GpuWaitDone(_presentFence.Get(), _presentValue[*slot]))
     {
-        _presentFence->SetEventOnCompletion(_presentValue[*slot], _event);
-        WaitForSingleObject(_event, 1000);
+        Log(OptiLog_Warn, "NR (%ls): own list still in flight: frame skipped", name.c_str());
+        return nullptr;
     }
     _presentAlloc[*slot]->Reset();
     _presentList->Reset(_presentAlloc[*slot].Get(), nullptr);
@@ -1463,7 +1579,30 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
     list->Close();
     _ownQueue = queue;
     ID3D12CommandList* l[] = { list };
-    if (_pendingList.load() == list)
+    const bool pending = _pendingList.load() == list;
+    if (_ownCpuWait && wait != 0)
+    {
+        double ms = 0;
+        const bool done = GpuWaitDone(_hipFence.Get(), wait, 60000, nullptr, nullptr, &ms);
+        _ownWaitMs += ms;
+        std::lock_guard lock(_mutex);
+        if (!done)
+        {
+            // never executed: Consume cancels a recorded producer, the slot fence is signalled for reuse
+            Log(OptiLog_Error, "NR (%ls): network answer not done after %.0f ms: frame dropped", name.c_str(), ms);
+            _ownStuck = true;
+            if (pending)
+                _pendingList = nullptr, _pendingProducer = false, _pendingWait = 0;
+            queue->Signal(_presentFence.Get(), _presentValue[slot]);
+            return;
+        }
+        if (ms > 250)
+            Log(OptiLog_Warn, "NR (%ls): network answer took %.0f ms (CPU wait, nothing queued behind it)", name.c_str(), ms);
+        if (pending)
+            _pendingWait = 0;
+        wait = 0;
+    }
+    if (pending)
     {
         OnExecute(queue, 1, l);
     }
@@ -1476,16 +1615,20 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
     queue->Signal(_presentFence.Get(), _presentValue[slot]);
 }
 
-// A present queued behind the wait on the network page-faults the display device: present once it is done
-void NrEngine::SettleOwn()
+// A present queued behind the wait on the network page-faults the display device: present once it is done.
+// False: not done (device gone or 60 s), the caller must not present (a 1 s cap queued the Present behind the wait).
+bool NrEngine::SettleOwn()
 {
     const uint64_t value = _answerWait;
     _answerWait = 0;
+    if (std::exchange(_ownStuck, false))
+        return false;
     if (value == 0 || !_hipFence || _hipFence->GetCompletedValue() >= value)
-        return;
-    static thread_local HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (e && SUCCEEDED(_hipFence->SetEventOnCompletion(value, e)))
-        WaitForSingleObject(e, 1000);
+        return true;
+    const bool done = GpuWaitDone(_hipFence.Get(), value);
+    if (!done)
+        Log(OptiLog_Error, "NR (%ls): network answer not done: present skipped", name.c_str());
+    return done;
 }
 
 void NrEngine::Quiesce()
@@ -1494,6 +1637,33 @@ void NrEngine::Quiesce()
         return;
     std::lock_guard lock(_mutex);
     WaitIdle();
+}
+
+bool NrEngine::Shutdown()
+{
+    if (_worker.joinable())
+        _worker.join();
+    for (int i = 0; i < 2000 && _pendingList.load() != nullptr; i++)
+        Sleep(1);
+    std::lock_guard lock(_mutex);
+    if (_pendingList.load() != nullptr)
+        return Log(OptiLog_Warn, "hot reload: a game list with NR work is not submitted yet"), false;
+    if (_ctx != nullptr)
+        DrainJob();
+    if (_event != nullptr)
+    {
+        WaitIdle();
+        if (_presentFence)
+            GpuWaitDone(_presentFence.Get(), _presentCounter); // the present lists before they are freed
+    }
+    if (_ctx != nullptr)
+    {
+        _rt.api.Drain(_ctx);
+        _rt.api.Destroy(_ctx);
+        _ctx = nullptr;
+    }
+    _state = State::Idle;
+    return true;
 }
 
 bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
@@ -1515,10 +1685,29 @@ bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
     return true;
 }
 
+bool NrEngine::EnsureHudCopies(const D3D12_RESOURCE_DESC& hd)
+{
+    if (_hudCopy && _hudCopy->GetDesc().Width == hd.Width && _hudCopy->GetDesc().Height == hd.Height &&
+        _hudCopy->GetDesc().Format == hd.Format)
+        return true;
+    _hudCopy = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, hd.Format, false, kRead);
+    _hudOut = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, UavFormat(hd.Format), true,
+                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (_hudCopy && _hudOut)
+        return true;
+    _hudCopy.Reset();
+    _hudOut.Reset();
+    Log(OptiLog_Warn, "HUD-less copies failed for format %d: generated frames without NR", (int) hd.Format);
+    return false;
+}
+
 bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in)
 {
     if (!RuntimeLoaded() || in.src == nullptr || in.dst == nullptr || !Settings().enabled)
         return false;
+    _ownCpuWait = true;
+    _ownWaitMs = 0;
+    struct WaitOut { const OwnFrame& f; const double& v; ~WaitOut() { if (f.waitMs) *f.waitMs = v; } } waitOut { in, _ownWaitMs };
     const auto sd = in.src->GetDesc();
     const uint32_t w = (uint32_t) sd.Width, h = sd.Height;
     if (!Begin(device, queue, w, h))
@@ -1565,35 +1754,43 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         ShaderConstants c {};
         c.sizeX = w;
         c.sizeY = h;
-        if (motion && in.motion != nullptr && in.motionW > 0 && in.motionH > 0)
+        const bool mv = in.motion != nullptr && in.motionW > 0 && in.motionH > 0;
+        if (mv)
         {
             const auto md = in.motion->GetDesc();
             c.mvUvScaleX = float(in.motionW) / float(md.Width);
             c.mvUvScaleY = float(in.motionH) / float(md.Height);
             c.mvToUvX = in.mvScaleX / float(in.motionW);
             c.mvToUvY = in.mvScaleY / float(in.motionH);
-            c.useMv = 1;
+            c.useMv = motion ? 1 : 0;
         }
         c.enhUvScaleX = float(_feedW) / float(ed.Width);
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
+        c.colorStrength = _settings.ColorStrength(false);
+        c.upMode = uint32_t(_settings.upsample);
         c.encoding = in.encoding;
         c.paperWhite = _settings.paperWhite / 80.0f;
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12Resource* srv[4] = { _termCopy.Get(), enh, _feed.Get(), c.useMv ? in.motion : nullptr };
         const DXGI_FORMAT fmt[4] = { sd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                      in.motion ? in.motion->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT };
-        if (c.useMv)
+        StabBind sb;
+        const bool stab = StabPrepare(list, w, h, in.reset, c, mv ? in.motion : nullptr, sb);
+        if (mv)
             Barrier(list, in.motion, in.motionState, kRead);
-        Dispatch(list, _psoApply.Get(), c, srv, fmt, _termOut.Get(), sd.Format, w, h);
-        if (c.useMv)
+        Dispatch(list, _psoApply.Get(), c, srv, fmt, _termOut.Get(), sd.Format, w, h, nullptr, stab ? &sb : nullptr);
+        if (stab)
+            StabFinish(list, sb);
+        if (mv)
             Barrier(list, in.motion, kRead, in.motionState);
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Barrier(list, in.dst, in.dstState, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(in.dst, _termOut.Get());
         Barrier(list, in.dst, D3D12_RESOURCE_STATE_COPY_DEST, in.dstState);
-        MaybeDump(list, enh, in.dst, in.dstState);
+        // whole frame: the source copy pairs the result with this frame's feed
+        MaybeDump(list, enh, in.dst, in.dstState, in.src == in.dst ? _termCopy.Get() : nullptr);
     };
 
     _motion = {};
@@ -1651,6 +1848,8 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         return false;
     copySource(list);
     Consume(list, &wait, &enh);
+    if (in.reset)
+        _stabValid = false;
     if (enh != nullptr && !in.reset)
     {
         apply(list, enh, true);
@@ -1666,7 +1865,8 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
 }
 
 void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result,
-                         D3D12_RESOURCE_STATES resultState, ID3D12Resource* source, ID3D12Resource* hudless)
+                         D3D12_RESOURCE_STATES resultState, ID3D12Resource* source, ID3D12Resource* hudless,
+                         ID3D12Resource* hudResult, D3D12_RESOURCE_STATES hudResultState)
 {
     if (_dumpArmed || dumpDir.empty() || enh == nullptr || (_dumpCount++ % 30) != 0)
         return;
@@ -1675,9 +1875,9 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
         return;
     DeleteFileW(trigger.c_str());
 
-    ID3D12Resource* src[5] = { enh, _feed.Get(), result, source, hudless };
-    const D3D12_RESOURCE_STATES st[5] = { kRead, kRead, resultState, kRead, kRead };
-    for (int i = 0; i < 5; i++)
+    ID3D12Resource* src[6] = { enh, _feed.Get(), result, source, hudless, hudResult };
+    const D3D12_RESOURCE_STATES st[6] = { kRead, kRead, resultState, kRead, kRead, hudResultState };
+    for (int i = 0; i < 6; i++)
     {
         if (src[i] == nullptr)
             continue;
@@ -1693,7 +1893,8 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
     _dumpArmed = true;
     _dumpGameValue = 0;
     _dumpOwnValue = _presentCounter; // own lists: done once the present fence reaches it
-    Log(OptiLog_Info, "dump recorded (%ls)", name.c_str());
+    Log(OptiLog_Info, "dump recorded (%ls): source fmt %u, encoding %u", name.c_str(),
+        source ? (unsigned) source->GetDesc().Format : 0u, (unsigned) _stats.encoding);
 }
 
 void NrEngine::Meter(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, bool jobMotionValid)
@@ -1915,8 +2116,7 @@ void NrEngine::SeqWrite()
         if (q == nullptr || !fence)
             continue;
         q->Signal(fence.Get(), ++v);
-        fence->SetEventOnCompletion(v, _event);
-        WaitForSingleObject(_event, 5000);
+        GpuWaitDone(fence.Get(), v); // the sequence's readbacks are read next
     }
 
     const std::wstring dir = dumpDir + L"\\seq_" + name + L"_" + std::to_wstring(GetTickCount64());
@@ -1977,8 +2177,8 @@ void NrEngine::FinishDump()
     const bool gameDone = _dumpGameValue != 0 && _gameFence->GetCompletedValue() >= _dumpGameValue;
     if (!ownDone && !gameDone)
         return;
-    const wchar_t* names[5] = { L"enh", L"fed", L"result", L"source", L"hudless" };
-    for (int i = 0; i < 5; i++)
+    const wchar_t* names[6] = { L"enh", L"fed", L"result", L"source", L"hudless", L"hudless_result" };
+    for (int i = 0; i < 6; i++)
     {
         if (_dumpTex[i])
             Mgpu::DumpTexture(_device.Get(), _queue.Get(), _dumpTex[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST,

@@ -24,6 +24,9 @@ struct Settings
     bool temporal = false;     // send the render card's motion vectors; NR keeps a network history
     double uiGate = 0.90;      // HUD-less: above this share of differing pixels the pair is wrong: no NR that frame
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
+    int lowLatency = 2;        // 1: Present throttles on the render card, 2: and paces the next frame (Pacer)
+    bool earlySend = false;    // the send copy is queued before the wait for the display card
+    bool presentIdle = false;  // the real Present goes only to an idle display queue (bounded CPU wait)
     int dred = 0;              // DRED on the display device: 1 breadcrumbs + page faults, 2 page faults only
     bool forwardOutputs = true; // the render adapter's EnumOutputs returns the display card's outputs
 };
@@ -54,6 +57,7 @@ struct NrInput
     Guides guides;     // scalars of the frame `motion` belongs to (resources not valid here)
     bool reset = false; // history must not be used (resize, gap, camera cut)
     bool waitAnswer = false;
+    double* answerWaitMs = nullptr; // out: CPU wait for the network answer inside nrFrame
 };
 
 struct Env
@@ -66,11 +70,12 @@ struct Env
     // NR on the display card, recorded and submitted on `queue`. True = wrote `in.dst`.
     std::function<bool(ID3D12Device*, ID3D12CommandQueue*, const NrInput& in)> nrFrame;
     std::function<bool()> nrWanted;
-    std::function<void()> nrSettle; // before the present of a frame nrFrame ran on
+    std::function<bool()> nrSettle; // before the present of a frame nrFrame ran on; false: do not present it
     std::function<void()> nrQuiesce; // NR's queued work is done: the resources it was given may be freed
     std::function<void(const char*)> nrIdle; // no NR this frame, and why (sequence dump requests log it)
     std::function<std::string()> nrStatus;
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
+    std::function<void(ID3D12Device*)> hookExecute; // latency probe: the game queue's submits
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it
 };
 
@@ -92,6 +97,7 @@ struct Stats
     uint64_t produced = 0, presented = 0, skipped = 0;
     double renderFrameMs = 0, displayFrameMs = 0;    // EMA of present-to-present
     double sendMs = 0, ingestMs = 0;                 // GPU time of the copy on each side
+    double sendWaitMs = 0, answerWaitMs = 0;         // presenter CPU waits: the send landing, the network answer
     double sendGBs = 0, ingestGBs = 0;
     double latencyMs = 0;                            // proxy Present -> real Present (CPU)
     double nrMs = 0;                                 // CPU time of the NR record+submit
@@ -99,7 +105,7 @@ struct Stats
     uint64_t slotBytes = 0;
     double renderBusy = -1, displayBusy = -1;        // 3D engine use %, -1 = unknown
     std::string nrStatus;
-    uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0;
+    uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0, sendStalls = 0;
     double uiShare = -1; // share of pixels the UI composite took from the back buffer, last measured
     std::string nrSource; // what NR runs on (HUD-less mode: the HUD-less colour or the whole-frame fallback)
     bool fallback = false; // display card lost: single-GPU passthrough, no NR

@@ -824,6 +824,7 @@ void ConsumeMessage(MSG* msg)
 
 BOOL WINAPI hkPeekMessageA(LPMSG msg, HWND hwnd, UINT messageFilterMin, UINT messageFilterMax, UINT removeMsg)
 {
+    RigEnterPoll();
     const BOOL result = o_PeekMessageA(msg, hwnd, messageFilterMin, messageFilterMax, removeMsg);
 
     if (!result || msg == nullptr)
@@ -843,6 +844,7 @@ BOOL WINAPI hkPeekMessageA(LPMSG msg, HWND hwnd, UINT messageFilterMin, UINT mes
 
 BOOL WINAPI hkPeekMessageW(LPMSG msg, HWND hwnd, UINT messageFilterMin, UINT messageFilterMax, UINT removeMsg)
 {
+    RigEnterPoll();
     const BOOL result = o_PeekMessageW(msg, hwnd, messageFilterMin, messageFilterMax, removeMsg);
 
     if (!result || msg == nullptr)
@@ -862,6 +864,7 @@ BOOL WINAPI hkPeekMessageW(LPMSG msg, HWND hwnd, UINT messageFilterMin, UINT mes
 
 BOOL WINAPI hkGetMessageA(LPMSG msg, HWND hwnd, UINT messageFilterMin, UINT messageFilterMax)
 {
+    RigEnterPoll();
     const BOOL result = o_GetMessageA(msg, hwnd, messageFilterMin, messageFilterMax);
 
     // GetMessage returns:
@@ -881,6 +884,7 @@ BOOL WINAPI hkGetMessageA(LPMSG msg, HWND hwnd, UINT messageFilterMin, UINT mess
 
 BOOL WINAPI hkGetMessageW(LPMSG msg, HWND hwnd, UINT messageFilterMin, UINT messageFilterMax)
 {
+    RigEnterPoll();
     const BOOL result = o_GetMessageW(msg, hwnd, messageFilterMin, messageFilterMax);
 
     if (result > 0 && msg != nullptr)
@@ -1052,6 +1056,9 @@ void WINAPI hkmouse_event(DWORD flags, DWORD dx, DWORD dy, DWORD data, ULONG_PTR
 
 SHORT WINAPI hkGetAsyncKeyState(int vk)
 {
+    if (RigEnterKeyDown(vk))
+        return static_cast<SHORT>(0x8001);
+
     if (ShouldBlockVirtualKey(vk))
     {
         {
@@ -1068,6 +1075,9 @@ SHORT WINAPI hkGetAsyncKeyState(int vk)
 
 SHORT WINAPI hkGetKeyState(int vk)
 {
+    if (RigEnterKeyDown(vk))
+        return static_cast<SHORT>(0x8000);
+
     if (ShouldBlockVirtualKey(vk))
     {
         {
