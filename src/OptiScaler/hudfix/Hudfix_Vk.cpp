@@ -564,7 +564,7 @@ static ComputeBindings* FindComputeBindings(VkCommandBuffer cmdBuffer, bool crea
 // Binding state is only needed while HUDFix can search
 static bool TracksBindings(VkPipelineBindPoint bindPoint)
 {
-    return bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE && HudfixEnabled();
+    return bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE && (HudfixEnabled() || VkPresentDx12::Wanted());
 }
 
 static void PushImages(VkCommandBuffer cmdBuffer, uint32_t set, const std::vector<SetUpdate>& updates)
@@ -667,7 +667,8 @@ static void CheckDispatch(VkCommandBuffer cmdBuffer)
 {
     // Bindings are only tracked with HUDFix enabled
     auto bindings = FindComputeBindings(cmdBuffer, false);
-    if (bindings == nullptr || !IsFGRunning())
+    const bool fgRunning = IsFGRunning();
+    if (bindings == nullptr || !(fgRunning || VkPresentDx12::HudlessSink(nullptr, nullptr)))
         return;
 
     std::vector<DescriptorImage> images;
@@ -693,7 +694,9 @@ static void CheckDispatch(VkCommandBuffer cmdBuffer)
         }
     }
 
-    CheckSwapchainWrite(cmdBuffer, images);
+    // UI texture unblending feeds FG only
+    if (fgRunning)
+        CheckSwapchainWrite(cmdBuffer, images);
 
     if (!IsSearching())
         return;

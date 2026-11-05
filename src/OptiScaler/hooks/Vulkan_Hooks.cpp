@@ -671,6 +671,11 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         HookDevice(*pDevice);
         Hudfix_Vk::HookDevice(*pDevice);
     }
+    else if (result == VK_SUCCESS && VkPresentDx12::Wanted())
+    {
+        // the plugin HUD-less search without FG
+        Hudfix_Vk::HookDevice(*pDevice);
+    }
 
     if (result == VK_SUCCESS && Config::Instance()->OverlayMenu.value_or_default())
     {
