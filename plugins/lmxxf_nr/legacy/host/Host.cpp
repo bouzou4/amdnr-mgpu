@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <fstream>
+#include <share.h>
 #include <string>
 
 const OptiPluginApi* g_api = nullptr;
@@ -65,8 +66,11 @@ NrSettings ReadSettings()
     s.size = (NetworkSize) std::clamp(IniInt(L"NetworkSize", 0), 0, 2);
     s.model = std::clamp(IniInt(L"Model", 1), 0, 1);
     s.passes = std::clamp(IniInt(L"MultiPass", 1), 1, 3);
-    s.style = std::clamp(IniInt(L"Style", 0), 0, 2);
+    s.style = std::clamp(IniInt(L"Style", 0), -1, 2);
     s.strength = std::clamp(IniFloat(L"Strength", 1.0f), 0.0f, 2.0f);
+    s.colorStrength = std::clamp(IniFloat(L"ColorStrength", 1.0f), -1.0f, 1.0f);
+    s.upsample = std::clamp(IniInt(L"EditUpsample", 1), 0, 1);
+    s.stabilise = IniInt(L"EditStabilise", 1) != 0;
     s.temporal = IniInt(L"Temporal", 1) != 0;
     s.meter = IniInt(L"FlickerMeter", 1) != 0;
     g_flow = std::clamp(IniInt(L"OpticalFlow", 2), 0, 2);
@@ -116,6 +120,34 @@ void PollSettings(NrSettings& s)
     Log(OptiLog_Info, "settings trigger: %s(flow %d, temporal %d)", applied.c_str(), g_flow, s.temporal);
 }
 
+// The proxy's menu / hotkeys (Legacy::Control): applied when its serial changes
+void ApplyControl(Legacy::Block* b, NrSettings& s)
+{
+    const uint32_t serial = b->ctl.serial;
+    if (serial == 0 || serial == b->hostSerial)
+        return;
+    MemoryBarrier();
+    const Legacy::Control c = b->ctl;
+    MemoryBarrier();
+    if (b->ctl.serial != serial)
+        return; // written meanwhile: next frame
+    s.model = std::clamp(c.model, 0, 1);
+    s.size = (NetworkSize) std::clamp(c.size, 0, 2);
+    s.passes = std::clamp(c.passes, 1, 3);
+    s.style = std::clamp(c.style, -1, 2);
+    s.temporal = c.temporal != 0;
+    s.upsample = std::clamp(c.upsample, 0, 1);
+    s.stabilise = c.stabilise != 0;
+    s.strength = std::clamp(c.strength, 0.0f, 2.0f);
+    s.colorStrength = std::clamp(c.colorStrength, -1.0f, 1.0f);
+    g_flow = std::clamp(c.flow, 0, 2);
+    Engine().Configure(s);
+    b->hostSerial = serial;
+    Log(OptiLog_Info, "menu settings %u: model %d size %d passes %d style %d temporal %d flow %d upsample %d stabilise %d "
+        "strength %.2f colour %.2f", serial, s.model, (int) s.size, s.passes, s.style, s.temporal, g_flow, s.upsample,
+        s.stabilise, s.strength, s.colorStrength);
+}
+
 template <typename T> T* Open(ID3D12Device* dev, const wchar_t* name)
 {
     HANDLE h = nullptr;
@@ -148,7 +180,7 @@ int wmain(int argc, wchar_t** argv)
         return 2;
     if (wcscmp(argv[1], L"--selftest") == 0)
     {
-        _wfopen_s(&g_log, (std::wstring(argv[3]) + L"\\selftest.log").c_str(), L"w");
+        g_log = _wfsopen((std::wstring(argv[3]) + L"\\selftest.log").c_str(), L"w", _SH_DENYNO);
         static OptiPluginApi api {};
         api.size = sizeof(api);
         api.Log = HostLog;
@@ -162,7 +194,7 @@ int wmain(int argc, wchar_t** argv)
     std::wstring logDir = IniStr(L"Legacy", L"LogDir");
     if (logDir.empty())
         logDir = g_ini.substr(0, g_ini.find_last_of(L"\\/"));
-    _wfopen_s(&g_log, (logDir + L"\\lmxxf_legacy_host.log").c_str(), L"w");
+    g_log = _wfsopen((logDir + L"\\lmxxf_legacy_host.log").c_str(), L"w", _SH_DENYNO); // tail-able while running
     static OptiPluginApi api {};
     api.size = sizeof(api);
     api.Log = HostLog;
@@ -216,9 +248,7 @@ int wmain(int argc, wchar_t** argv)
     if (!g_dumpDir.empty())
         CreateDirectoryW(g_dumpDir.c_str(), nullptr);
     RuntimePaths paths;
-    paths.extra = IniStr(L"Host", L"RuntimeDir");
-    paths.modules = IniStr(L"Host", L"ModulesDir");
-    paths.weights = IniStr(L"Host", L"WeightsDir");
+    paths.candidates.push_back({ IniStr(L"Host", L"RuntimeDir"), IniStr(L"Host", L"ModulesDir"), IniStr(L"Host", L"WeightsDir"), "ini" });
     NrSettings settings = ReadSettings();
     auto& nr = Engine();
     nr.name = L"legacy";
@@ -227,6 +257,12 @@ int wmain(int argc, wchar_t** argv)
     const bool loaded = nr.LoadRuntime(paths);
     Log(OptiLog_Info, "runtime %s, flow %d, temporal %d, model %d", loaded ? "loaded" : "NOT loaded", g_flow,
         settings.temporal, settings.model);
+    {
+        auto& rt = nr.GetRuntime();
+        block->caps = (rt.FreeRes() ? Legacy::kCapFreeRes : 0) | (rt.Models() ? Legacy::kCapModels : 0) |
+                      (rt.Styles() ? Legacy::kCapStyles : 0);
+    }
+    ApplyControl(block, settings);
 
     OpticalFlow of;
     const bool ofOk = of.Init(dev.Get(), queue.Get());
@@ -246,11 +282,11 @@ int wmain(int argc, wchar_t** argv)
 
     ComPtr<ID3D12Resource> frame;
     uint32_t generation = 0;
-    uint64_t last = 0, processed = 0, nrFrames = 0, mismatches = 0;
+    uint64_t last = 0, processed = 0, nrFrames = 0, passFrames = 0, mismatches = 0;
     block->hostState = loaded ? 1 : 2;
     MemoryBarrier();
     block->hostReady = 1;
-    ULONGLONG lastLog = GetTickCount64();
+    ULONGLONG lastLog = GetTickCount64(), lastPublish = 0;
     bool reset = true;
 
     while (WaitForSingleObject(game, 0) == WAIT_TIMEOUT)
@@ -294,6 +330,7 @@ int wmain(int argc, wchar_t** argv)
         if (block->reset)
             block->reset = 0, reset = true;
         PollSettings(settings);
+        ApplyControl(block, settings);
 
         if (frame)
         {
@@ -329,24 +366,40 @@ int wmain(int argc, wchar_t** argv)
             f.reset = reset;
             f.waitAnswer = true;
             f.encoding = 1;
+            double waitMs = 0;
+            f.waitMs = &waitMs;
             if (nr.RunOwn(dev.Get(), queue.Get(), f))
                 ++nrFrames, reset = false;
+            else
+                ++passFrames;
+            block->waitMs = (float) waitMs;
         }
         queue->Signal(fence.Get(), 2 * n);
         last = n;
         ++processed;
 
         const ULONGLONG now = GetTickCount64();
-        if (now - lastLog >= 4000)
+        if (now - lastPublish >= 500)
         {
             const auto st = nr.Stats();
             block->hostMs = st.hipMs;
             block->ofMs = of.GpuMs();
+            block->netMs = st.networkMs;
             block->flkStatic = st.flkStatic;
             block->flkMc = st.flkMc;
+            block->feedWidth = st.feedWidth;
+            block->feedHeight = st.feedHeight;
+            block->nrFrames = nrFrames;
+            block->passFrames = passFrames;
             block->hostState = st.state == "running" || nrFrames ? 1 : 2;
             snprintf(block->status, sizeof(block->status), "%s %ux%u", st.state.c_str(), st.feedWidth,
                      st.feedHeight);
+            snprintf(block->error, sizeof(block->error), "%s", st.error.c_str());
+            lastPublish = now;
+        }
+        if (now - lastLog >= 4000)
+        {
+            const auto st = nr.Stats();
             Log(OptiLog_Info,
                 "frames %llu, NR %llu, state %s %s, feed %ux%u, hip %.2f ms, net %.2f ms, of %.3f ms, flk still %.5f "
                 "moving %.5f (%u), temporal %d flow %d",

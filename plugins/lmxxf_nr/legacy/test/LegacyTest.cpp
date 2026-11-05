@@ -1,6 +1,7 @@
 // Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../../LICENSE.
 // x86 D3D9Ex title for the legacy pair without a game: squares moving 3 px per frame right on a hidden window.
-// Usage: lmxxf_legacy_test.exe <path to proxy d3d9.dll> [seconds] [width] [height] [pause ms]
+// Usage: lmxxf_legacy_test.exe <path to proxy d3d9.dll> [seconds] [width] [height] [pause ms] [keys]
+// keys: "ms:vk,ms:vk,..." key presses posted to the title's own window (the proxy's hotkeys and menu), no system input
 // pause ms: one present-free gap at a third of the run, like a game's level load
 #include <windows.h>
 #include <d3d9.h>
@@ -16,6 +17,17 @@ int wmain(int argc, wchar_t** argv)
     const UINT w = argc > 3 ? _wtoi(argv[3]) : 1280, h = argc > 4 ? _wtoi(argv[4]) : 720;
     const DWORD pauseMs = argc > 5 ? DWORD(_wtoi(argv[5])) : 0;
     bool paused = false;
+    struct Key { double at; UINT vk; bool sent; } keys[32] {};
+    int nKeys = 0;
+    for (const wchar_t* k = argc > 6 ? argv[6] : L""; *k && nKeys < 32;)
+    {
+        wchar_t* e = nullptr;
+        const double ms = wcstod(k, &e);
+        if (*e != L':')
+            break;
+        keys[nKeys++] = { ms / 1000.0, UINT(wcstoul(e + 1, &e, 0)), false };
+        k = *e == L',' ? e + 1 : e;
+    }
     HMODULE d3d9 = LoadLibraryW(argv[1]);
     auto create = d3d9 ? (HRESULT(WINAPI*)(UINT, IDirect3D9Ex**)) GetProcAddress(d3d9, "Direct3DCreate9Ex") : nullptr;
     if (!create)
@@ -55,6 +67,14 @@ int wmain(int argc, wchar_t** argv)
             break;
         if (pauseMs && !paused && double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart) >= seconds / 3)
             paused = true, Sleep(pauseMs);
+        for (int k = 0; k < nKeys; ++k)
+            if (!keys[k].sent && double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart) >= keys[k].at)
+            {
+                keys[k].sent = true;
+                PostMessageW(wnd, WM_KEYDOWN, keys[k].vk, 1);
+                PostMessageW(wnd, WM_KEYUP, keys[k].vk, 0xC0000001);
+                printf("key %u at %.2f s\n", keys[k].vk, keys[k].at);
+            }
         dev->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(70, 90, 110), 1.0f, 0);
         D3DRECT r[64];
         int n = 0;

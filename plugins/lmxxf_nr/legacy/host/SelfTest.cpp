@@ -245,9 +245,7 @@ int SelfTest(int argc, wchar_t** argv)
     nr.name = L"selftest";
     nr.Configure(s);
     RuntimePaths paths;
-    paths.extra = argv[7];
-    paths.modules = argv[8];
-    paths.weights = argv[9];
+    paths.candidates.push_back({ argv[7], argv[8], argv[9], "command line" });
     if (!nr.LoadRuntime(paths))
         return 6;
 

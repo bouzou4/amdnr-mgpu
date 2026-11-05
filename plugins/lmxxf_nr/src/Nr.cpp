@@ -449,7 +449,8 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
                            ID3D12Resource* motion, StabBind& b)
 {
     c.histMode = 0;
-    if (!_settings.stabilise || _settings.upsample != 1)
+    // Feed at the target size: Edit skips the guided path and never writes the history
+    if (!_settings.stabilise || _settings.upsample != 1 || (_feedW >= w && _feedH >= h))
         return _stabValid = false;
     if (!_stab[0] || _stab[0]->GetDesc().Width != w || _stab[0]->GetDesc().Height != h)
     {
