@@ -2001,6 +2001,16 @@ bool IFeature_VkwDx12::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevi
     if (IsInited())
         return true;
 
+    // Shared inputs are already NPSR and lack ALLOW_RENDER_TARGET/UAV: the UE RT/UAV overrides make Close fail
+    if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
+        State::Instance().gameEngine == GameEngineType::Unreal ||
+        State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+    {
+        LOG_INFO("Vulkan w/Dx12, disabling UE resource barrier overrides");
+        Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Config::Instance()->MVResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
     VulkanInstance = InInstance;
     VulkanPhysicalDevice = InPD;
     VulkanDevice = InDevice;
