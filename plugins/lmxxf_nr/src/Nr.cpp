@@ -11,6 +11,7 @@
 #include <d3dcompiler.h>
 
 #include "mgpu/MgpuCore.h"
+#include "GpuWait.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -599,11 +600,7 @@ void NrEngine::WaitIdle()
         if (q == nullptr)
             return;
         q->Signal(f, ++v);
-        if (f->GetCompletedValue() < v)
-        {
-            f->SetEventOnCompletion(v, _event);
-            WaitForSingleObject(_event, 10000);
-        }
+        GpuWaitDone(f, v); // before the session's resources go: until done or the device is gone
     };
     wait(_gameQueue.Get(), _gameFence.Get(), _gameValue);
     wait(_queue.Get(), _hipFence.Get(), _hipValue);
@@ -1496,15 +1493,10 @@ ID3D12GraphicsCommandList* NrEngine::NextOwnList(uint32_t* slot)
     if (!_presentList || !_presentFence)
         return nullptr;
     *slot = uint32_t(_presentCounter % kPresentLists);
-    // its last use must be done before the reset (a 1 s cap could reset a list still behind a slow network)
-    for (int k = 0; k < 10 && _presentFence->GetCompletedValue() < _presentValue[*slot]; ++k)
+    // the slot's list must be done before its allocator is reset: no fixed cap
+    if (!GpuWaitDone(_presentFence.Get(), _presentValue[*slot]))
     {
-        _presentFence->SetEventOnCompletion(_presentValue[*slot], _event);
-        WaitForSingleObject(_event, 1000);
-    }
-    if (_presentFence->GetCompletedValue() < _presentValue[*slot])
-    {
-        Log(OptiLog_Warn, "NR (%ls): own list still in flight after 10 s: frame skipped", name.c_str());
+        Log(OptiLog_Warn, "NR (%ls): own list still in flight: frame skipped", name.c_str());
         return nullptr;
     }
     _presentAlloc[*slot]->Reset();
@@ -1533,20 +1525,16 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
 }
 
 // A present queued behind the wait on the network page-faults the display device: present once it is done.
-// False: still not done after 10 s, the caller must not present (a 1 s cap queued the Present behind the wait).
+// False: not done (device gone or 60 s), the caller must not present (a 1 s cap queued the Present behind the wait).
 bool NrEngine::SettleOwn()
 {
     const uint64_t value = _answerWait;
     _answerWait = 0;
     if (value == 0 || !_hipFence || _hipFence->GetCompletedValue() >= value)
         return true;
-    static thread_local HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    for (int k = 0; k < 10 && e && _hipFence->GetCompletedValue() < value; ++k)
-        if (SUCCEEDED(_hipFence->SetEventOnCompletion(value, e)))
-            WaitForSingleObject(e, 1000);
-    const bool done = _hipFence->GetCompletedValue() >= value;
+    const bool done = GpuWaitDone(_hipFence.Get(), value);
     if (!done)
-        Log(OptiLog_Error, "NR (%ls): network answer not done after 10 s: present skipped", name.c_str());
+        Log(OptiLog_Error, "NR (%ls): network answer not done: present skipped", name.c_str());
     return done;
 }
 
@@ -1572,9 +1560,8 @@ bool NrEngine::Shutdown()
     if (_event != nullptr)
     {
         WaitIdle();
-        if (_presentFence && _presentFence->GetCompletedValue() < _presentCounter &&
-            SUCCEEDED(_presentFence->SetEventOnCompletion(_presentCounter, _event)))
-            WaitForSingleObject(_event, 5000);
+        if (_presentFence)
+            GpuWaitDone(_presentFence.Get(), _presentCounter); // the present lists before they are freed
     }
     if (_ctx != nullptr)
     {
@@ -2024,8 +2011,7 @@ void NrEngine::SeqWrite()
         if (q == nullptr || !fence)
             continue;
         q->Signal(fence.Get(), ++v);
-        fence->SetEventOnCompletion(v, _event);
-        WaitForSingleObject(_event, 5000);
+        GpuWaitDone(fence.Get(), v); // the sequence's readbacks are read next
     }
 
     const std::wstring dir = dumpDir + L"\\seq_" + name + L"_" + std::to_wstring(GetTickCount64());

@@ -5,6 +5,7 @@
 #include "Autoconfig.h"
 #include "Nr.h"
 #include "mgpu/MgpuCore.h"
+#include "GpuWait.h"
 
 #include <detours/detours.h>
 #include <intrin.h>
@@ -179,14 +180,9 @@ void CaptureHudless(OptiPresentFrame* f)
         g_cap.list->Close();
     }
     const uint32_t s = uint32_t(g_cap.counter % 4);
-    // the allocator's last list must be done before its reset: no cap that lets a hitch reset it in flight
-    for (int k = 0; k < 10 && g_cap.fence->GetCompletedValue() < g_cap.value[s]; ++k)
-    {
-        g_cap.fence->SetEventOnCompletion(g_cap.value[s], g_cap.event);
-        WaitForSingleObject(g_cap.event, 1000);
-    }
-    if (g_cap.fence->GetCompletedValue() < g_cap.value[s])
-        return Log(OptiLog_Warn, "[mgpu] HUD-less capture skipped: its list from 4 frames ago is not done after 10 s");
+    // the slot's capture list must be done before its allocator is reset: else no capture this frame
+    if (!GpuWaitDone(g_cap.fence.Get(), g_cap.value[s]))
+        return Log(OptiLog_Warn, "[mgpu] HUD-less capture skipped: its list from 4 frames ago is not done");
     g_cap.alloc[s]->Reset();
     g_cap.list->Reset(g_cap.alloc[s].Get(), nullptr);
     Mgpu::CaptureHudless(g_cap.list.Get(), static_cast<ID3D12Resource*>(f->hudless),

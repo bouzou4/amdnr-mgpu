@@ -1,6 +1,7 @@
 #include "MgpuCommon.h"
 #include "MgpuSwapChain.h"
 #include "MgpuComposite.h"
+#include "../GpuWait.h"
 #include "MgpuLatency.h"
 
 #include <format>
@@ -13,7 +14,7 @@ std::mutex& StatsMutex() { return s_statsMutex; }
 static inline UINT64 AlignUp(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 static inline double Ema(double prev, double v) { return prev <= 0 ? v : prev * 0.95 + v * 0.05; }
 static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms);
-static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what);
+static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what, const bool* stop = nullptr, const bool* lost = nullptr);
 
 static std::atomic<ProxySwapChain*> s_active { nullptr };
 ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
@@ -578,7 +579,8 @@ HRESULT ProxySwapChain::CreateIngestLists()
 HRESULT ProxySwapChain::RenewReal()
 {
     _dq->Signal(_dFence.Get(), ++_dValue);
-    WaitFence(_dFence.Get(), _dValue, 2000);
+    if (!GpuWaitDone(_dFence.Get(), _dValue))
+        return DXGI_ERROR_WAS_STILL_DRAWING; // the lists may still run: no resize now
     _dList.clear();
     _dAlloc.clear();
     _realBb.clear();
@@ -752,19 +754,18 @@ static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
     CloseHandle(e);
 }
 
-// Before a slot's allocators are reset: its previous work must be done (a 500 ms cap reset them in flight)
-static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what)
+// Before a slot's allocators are reset: its previous work must be done. No fixed cap (a 500 ms cap reset them in
+// flight); false only on stop / device loss / 60 s, and the caller then skips the reuse.
+static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what, const bool* stop, const bool* lost)
 {
-    if (!f || f->GetCompletedValue() >= v)
-        return true;
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int k = 0; k < 10 && f->GetCompletedValue() < v; ++k)
-        WaitFence(f, v, 1000);
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    const bool done = f->GetCompletedValue() >= v;
+    struct C { const bool *stop, *lost; } c { stop, lost };
+    double ms = 0;
+    const bool done = GpuWaitDone(f, v, 60000, [](void* x) {
+        auto* c = static_cast<C*>(x);
+        return (c->stop && *c->stop) || (c->lost && *c->lost); }, &c, &ms);
     static std::atomic<int> logged { 0 };
     if ((ms > 400 || !done) && logged++ < 20)
-        Log(1, std::format("{}: slot reuse waited {:.0f} ms for {} (done {})", what, ms, v, done));
+        Log(done ? 1 : 2, std::format("{}: slot reuse waited {:.0f} ms for {} (done {})", what, ms, v, done));
     return done;
 }
 
@@ -773,10 +774,11 @@ void ProxySwapChain::DrainRender()
     if (_gameQueue && _rgameFence)
     {
         _gameQueue->Signal(_rgameFence.Get(), ++_rgameValue);
-        WaitFence(_rgameFence.Get(), _rgameValue, 3000);
+        GpuWaitDone(_rgameFence.Get(), _rgameValue);
     }
-    if (!_lost)
-        WaitFence(_filledR.Get(), _scheduled, 3000);
+    if (!_lost && !GpuWaitDone(_filledR.Get(), _scheduled, 60000,
+                               [](void* x) { return static_cast<ProxySwapChain*>(x)->_lost; }, this))
+        Log(2, "drain: the send queue did not finish in 60 s");
 }
 
 // Diagnostics: logs the first point after a resize where the display device is found removed
@@ -808,7 +810,7 @@ void ProxySwapChain::StopPresenter()
     if (_dq && _dFence)
     {
         _dq->Signal(_dFence.Get(), ++_dValue);
-        WaitFence(_dFence.Get(), _dValue, 3000);
+        GpuWaitDone(_dFence.Get(), _dValue);
     }
     // the network may still read this side's motion vectors on its own queue
     if (CurrentEnv().nrQuiesce)
@@ -898,7 +900,9 @@ void ProxySwapChain::PresenterLoop()
         }
 
         // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
-        WaitReuse(_dFence.Get(), slotDisplayValue[s], "display");
+        // not done (stop or 60 s): the slot is not reused, the loop comes back to the same frame
+        if (!WaitReuse(_dFence.Get(), slotDisplayValue[s], "display", &_stop))
+            continue;
         double ingestMs = -1;
         if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
@@ -1122,6 +1126,10 @@ void ProxySwapChain::PresenterLoop()
             if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
+            // the ingest waited on the render card's cross-adapter fence: resolved on the CPU before anything is
+            // presented behind it (a present behind an unresolved GPU wait page-faults the display device)
+            if (!GpuWaitDone(_filledD.Get(), g, 60000, [](void* x) { return static_cast<ProxySwapChain*>(x)->_stop; }, this))
+                Log(2, std::format("frame {}: the send did not land: presented anyway", g));
             const bool settled = !env.nrSettle || env.nrSettle();
             if (probe)
             {
@@ -1368,7 +1376,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g;
             meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g;
             // the slot's previous send list must be done before its allocator is reset: else no extras this frame
-            if ((meta.hud || meta.mv) && g > K && !WaitReuse(_filledR.Get(), g - K, "send"))
+            if ((meta.hud || meta.mv) && g > K && !WaitReuse(_filledR.Get(), g - K, "send", &_stop, &_lost))
                 meta.hud = meta.mv = false;
             if (meta.hud || meta.mv)
             {
