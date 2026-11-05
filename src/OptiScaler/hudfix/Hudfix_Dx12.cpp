@@ -975,6 +975,23 @@ bool Hudfix_Dx12::PluginOnly()
     return fg == nullptr || !fg->IsActive() || !Config::Instance()->IsFGEnabled();
 }
 
+// Test rigs switch the sticky pick live: <exe>\OptiScaler_hudless_sticky.txt "0" / "1" (absent: the ini)
+static bool StickyOn()
+{
+    static int n = 0, live = -1;
+    if (n++ % 30 == 0)
+    {
+        live = -1;
+        if (FILE* f = _wfopen((Util::ExePath().parent_path() / L"OptiScaler_hudless_sticky.txt").c_str(), L"rb"))
+        {
+            const int c = fgetc(f);
+            fclose(f);
+            live = c == '0' ? 0 : c == '1' ? 1 : -1;
+        }
+    }
+    return live >= 0 ? live == 1 : Config::Instance()->FGPluginHudlessSticky.value_or_default();
+}
+
 bool Hudfix_Dx12::PluginPickAccept(const PickSig& sig, UINT64 frame)
 {
     if (!_stickyValid || sig == _stickySig)
@@ -983,7 +1000,7 @@ bool Hudfix_Dx12::PluginPickAccept(const PickSig& sig, UINT64 frame)
             _stickyLastSeen = frame;
         return true;
     }
-    if (!Config::Instance()->FGPluginHudlessSticky.value_or_default())
+    if (!StickyOn())
         return true;
     if (frame - _stickyLastSeen > 3) // the game's chain changed: learn again
     {
@@ -1022,7 +1039,7 @@ void Hudfix_Dx12::PluginPickTaken(const PickSig& sig, UINT64 frame)
         _stickyLastSeen = frame;
         LOG_INFO("Plugin HUD-less: sticky pick {:X} ({}->{}), {}/32 of the last picks{}", (size_t) sig.buffer,
                  GetSourceString(sig.captureInfo & 0xFF), GetDispatchString(sig.captureInfo & 0xFF00), same,
-                 Config::Instance()->FGPluginHudlessSticky.value_or_default() ? "" : " (PluginHudlessSticky off: log only)");
+                 StickyOn() ? "" : " (sticky off: log only)");
     }
 }
 
