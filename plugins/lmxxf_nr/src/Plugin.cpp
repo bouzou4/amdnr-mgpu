@@ -64,6 +64,7 @@ NrSettings ReadSettings()
     s.strength = std::clamp(g_keys.Float("Strength", 1.0f), 0.0f, 2.0f);
     s.colorStrength = std::min(g_keys.Float("ColorStrength", 1.0f), 1.0f);
     s.upsample = std::clamp(g_keys.Int("EditUpsample", 1), 0, 1);
+    s.stabilise = g_keys.Bool("EditStabilise", true);
     s.motion = g_keys.Bool("MotionVectors", true);
     s.exposure = g_keys.Bool("Exposure", true);
     s.serialize = g_keys.Bool("Serialize", false);
@@ -85,6 +86,7 @@ void WriteSettings(const NrSettings& s)
     g_api->SetFloat(g_plugin, "Strength", s.strength);
     g_api->SetFloat(g_plugin, "ColorStrength", s.colorStrength);
     g_api->SetInt(g_plugin, "EditUpsample", s.upsample);
+    g_api->SetBool(g_plugin, "EditStabilise", s.stabilise);
     g_api->SetBool(g_plugin, "MotionVectors", s.motion);
     g_api->SetBool(g_plugin, "Exposure", s.exposure);
     g_api->SetBool(g_plugin, "Temporal", s.temporal);
@@ -460,6 +462,12 @@ void DrawTab(void*)
     }
     g_api->ItemTooltip("1080 / 1440 sizes: the network's edit reaches the output guided by its full-size colour (default).\n"
                        "Off: bilinear plus the feed pixel's residual");
+    g_api->Disabled(g_ui.upsample != 1);
+    if (g_api->Checkbox("Stabilise the edit", &g_ui.stabilise))
+        changed = true;
+    g_api->Disabled(false);
+    g_api->ItemTooltip("Guided upsample: the edit accumulated over frames at the output size (follows motion vectors,\n"
+                       "drops history where the colour changed). Removes the 1080 network's shimmer (default)");
     if (g_api->Checkbox("Move the edit with motion vectors", &g_ui.motion))
         changed = true;
     if (g_api->Checkbox("Network history from motion vectors", &g_ui.temporal))

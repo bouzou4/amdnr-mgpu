@@ -53,6 +53,7 @@ struct NrSettings
     float colorStrength = 1.0f;
     float ColorStrength(bool preTonemap) const { return colorStrength >= 0 ? colorStrength : preTonemap ? 0.0f : 1.0f; }
     int32_t upsample = 1; // feed-size edit to the target: 0 bilinear + feed residual, 1 guided by the target colour
+    bool stabilise = true; // guided edit: temporal accumulation at the target size (EditStabilise)
     float uiLow = 0.004f;  // terminal: back buffer vs HUD-less difference where UI starts (encoded units)
     float uiHigh = 0.02f;  // and where it is fully UI
     bool motion = true; // move the one frame old edit with the motion vectors
@@ -91,6 +92,15 @@ struct NrStats
 };
 
 // One lmxxf session on the game's device, driven from the upscale callbacks
+// One apply dispatch's stabiliser views: last history (srv), this frame's (uav), the vectors it follows
+struct StabBind
+{
+    ID3D12Resource* hist = nullptr;
+    ID3D12Resource* out = nullptr;
+    ID3D12Resource* motion = nullptr;
+    DXGI_FORMAT motionFmt = DXGI_FORMAT_R16G16_FLOAT;
+};
+
 class NrEngine
 {
   public:
@@ -168,7 +178,7 @@ class NrEngine
     void ApplyEnv();
     void Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, const ShaderConstants& c,
                   ID3D12Resource* const srv[4], const DXGI_FORMAT srvFmt[4], ID3D12Resource* uav, DXGI_FORMAT uavFmt,
-                  uint32_t w, uint32_t h, ID3D12Resource* norm = nullptr);
+                  uint32_t w, uint32_t h, ID3D12Resource* norm = nullptr, const StabBind* stab = nullptr);
 
     Runtime _rt;
     std::mutex _mutex; // every runtime call, the job state and the stats
@@ -232,6 +242,15 @@ class NrEngine
     uint32_t _hudlessStreak = 0; // presents in a row without a usable HUD-less colour
     ComPtr<ID3D12DescriptorHeap> _heap;
     uint32_t _heapCursor = 0, _heapStride = 0;
+
+    // Guided edit stabiliser: accumulated ratio + guide at the target size, ping-pong
+    ComPtr<ID3D12Resource> _stab[2];
+    uint32_t _stabCur = 0;
+    bool _stabValid = false;
+    // Binds the stabiliser for one apply dispatch: c.histMode, srv/uav pair; flip after the main dispatch only
+    bool StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t h, bool reset, ShaderConstants& c,
+                     ID3D12Resource* motion, StabBind& b);
+    void StabFinish(ID3D12GraphicsCommandList* list, const StabBind& b);
 
     ComPtr<ID3D12Resource> _feed;     // network input, RGBA16F
     ComPtr<ID3D12Resource> _srcCopy;  // after upscaling: copy of the output

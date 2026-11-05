@@ -22,7 +22,7 @@ namespace
 {
 constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr uint32_t kHeapSlots = 64;
-constexpr uint32_t kSlotDescriptors = 6;
+constexpr uint32_t kSlotDescriptors = 9; // t0-t6, u0-u1
 
 DXGI_FORMAT ViewFormat(DXGI_FORMAT f)
 {
@@ -329,8 +329,8 @@ bool NrEngine::CreatePipelines()
     }
 
     D3D12_DESCRIPTOR_RANGE ranges[2] {};
-    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0 };
-    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7, 0, 0, 0 };
+    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0 };
     D3D12_ROOT_PARAMETER params[3] {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = { 0, 0, sizeof(ShaderConstants) / 4 };
@@ -390,7 +390,7 @@ bool NrEngine::CreatePipelines()
 
 void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, const ShaderConstants& c,
                         ID3D12Resource* const srv[4], const DXGI_FORMAT srvFmt[4], ID3D12Resource* uav,
-                        DXGI_FORMAT uavFmt, uint32_t w, uint32_t h, ID3D12Resource* norm)
+                        DXGI_FORMAT uavFmt, uint32_t w, uint32_t h, ID3D12Resource* norm, const StabBind* stab)
 {
     // A ring of descriptor slots, the GPU is never kHeapSlots dispatches behind
     const uint32_t slot = (_heapCursor++ % kHeapSlots) * kSlotDescriptors;
@@ -417,10 +417,22 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
         sd.Texture2D.MipLevels = 1;
         _device->CreateShaderResourceView(norm, &sd, { cpu.ptr + SIZE_T(4) * _heapStride });
     }
+    for (int i = 0; i < 2; i++)
+    {
+        ID3D12Resource* r = stab ? (i == 0 ? stab->hist : stab->motion) : nullptr;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd {};
+        sd.Format = r && i == 1 ? ViewFormat(stab->motionFmt) : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        _device->CreateShaderResourceView(r, &sd, { cpu.ptr + SIZE_T(5 + i) * _heapStride });
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC ud {};
     ud.Format = UavFormat(uavFmt);
     ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(5) * _heapStride });
+    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(7) * _heapStride });
+    ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    _device->CreateUnorderedAccessView(stab ? stab->out : nullptr, nullptr, &ud, { cpu.ptr + SIZE_T(8) * _heapStride });
 
     ID3D12DescriptorHeap* heaps[] = { _heap.Get() };
     list->SetDescriptorHeaps(1, heaps);
@@ -428,8 +440,39 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
     list->SetPipelineState(pso);
     list->SetComputeRoot32BitConstants(0, sizeof(ShaderConstants) / 4, &c, 0);
     list->SetComputeRootDescriptorTable(1, gpu);
-    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(5) * _heapStride });
+    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(7) * _heapStride });
     list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+}
+
+bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t h, bool reset, ShaderConstants& c,
+                           ID3D12Resource* motion, StabBind& b)
+{
+    c.histMode = 0;
+    if (!_settings.stabilise || _settings.upsample != 1)
+        return _stabValid = false;
+    if (!_stab[0] || _stab[0]->GetDesc().Width != w || _stab[0]->GetDesc().Height != h)
+    {
+        _stabValid = false;
+        for (auto& t : _stab)
+            if (!(t = Texture(_device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead)))
+                return false;
+        _stab[0]->SetName(L"lmxxf_nr edit history"), _stab[1]->SetName(L"lmxxf_nr edit history");
+    }
+    c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u);
+    b.hist = _stab[_stabCur].Get();
+    b.out = _stab[_stabCur ^ 1].Get();
+    b.motion = motion;
+    if (motion)
+        b.motionFmt = motion->GetDesc().Format;
+    Barrier(list, b.out, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    return true;
+}
+
+void NrEngine::StabFinish(ID3D12GraphicsCommandList* list, const StabBind& b)
+{
+    Barrier(list, b.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    _stabCur ^= 1;
+    _stabValid = true;
 }
 
 bool NrEngine::CreateSession()
@@ -1059,6 +1102,8 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
     uint64_t wait = 0;
     ID3D12Resource* enh = nullptr;
     Consume(list, &wait, &enh);
+    if (f->flags & OptiUpscale_Reset)
+        _stabValid = false;
     if (enh != nullptr && !(f->flags & OptiUpscale_Reset))
     {
         const auto ed = enh->GetDesc();
@@ -1091,8 +1136,12 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         ID3D12Resource* srv[4] = { src, enh, _feed.Get(), c.useMv ? mv : nullptr };
         const DXGI_FORMAT fmt[4] = { srcDesc.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                      mv ? mv->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT };
+        StabBind sb;
+        const bool stab = StabPrepare(list, w, h, false, c, c.useMv ? mv : nullptr, sb);
         Dispatch(list, _psoApply.Get(), c, srv, fmt, target, pre ? DXGI_FORMAT_R16G16B16A16_FLOAT : srcDesc.Format,
-                 w, h, norm);
+                 w, h, norm, stab ? &sb : nullptr);
+        if (stab)
+            StabFinish(list, sb);
         UavBarrier(list, target);
         Barrier(list, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, targetState);
         MaybeDump(list, enh, target, targetState, src);
@@ -1432,7 +1481,21 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         c.paperWhite = _settings.paperWhite / 80.0f;
         ID3D12Resource* srv[4] = { _termCopy.Get(), enh, _feed.Get(), hud };
         const DXGI_FORMAT fmt[4] = { bd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT, hud->GetDesc().Format };
-        Dispatch(list, _psoTerminal.Get(), c, srv, fmt, _termOut.Get(), bd.Format, w, h);
+        // the history follows this frame's vectors when the evaluate captured them (the edit itself is not moved)
+        const bool mv = _mvCopy && _mvCap.frameId != 0 && _mvCap.frameId == f->upscaleFrameId && _mvCap.w > 0;
+        if (mv)
+        {
+            const auto md = _mvCopy->GetDesc();
+            c.mvUvScaleX = float(_mvCap.w) / float(md.Width);
+            c.mvUvScaleY = float(_mvCap.h) / float(md.Height);
+            c.mvToUvX = _mvCap.scaleX / float(_mvCap.w);
+            c.mvToUvY = _mvCap.scaleY / float(_mvCap.h);
+        }
+        StabBind sb;
+        const bool stab = StabPrepare(list, w, h, mv && _mvCap.reset, c, mv ? _mvCopy.Get() : nullptr, sb);
+        Dispatch(list, _psoTerminal.Get(), c, srv, fmt, _termOut.Get(), bd.Format, w, h, nullptr, stab ? &sb : nullptr);
+        if (stab)
+            StabFinish(list, sb);
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(bb, _termOut.Get());
@@ -1444,7 +1507,10 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
             ID3D12Resource* hsrv[4] = { hud, enh, _feed.Get(), hud };
             const DXGI_FORMAT hfmt[4] = { hd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT, hd.Format };
             Barrier(list, _hudOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Dispatch(list, _psoTerminal.Get(), c, hsrv, hfmt, _hudOut.Get(), hd.Format, w, h);
+            StabBind hb = sb;
+            hb.out = nullptr; // reads the same history, writes none
+            Dispatch(list, _psoTerminal.Get(), c, hsrv, hfmt, _hudOut.Get(), hd.Format, w, h, nullptr,
+                     stab ? &hb : nullptr);
             Barrier(list, _hudOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             const auto ts = D3D12_RESOURCE_STATES(f->hudlessState);
             Barrier(list, hudTarget, ts, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1673,14 +1739,15 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         ShaderConstants c {};
         c.sizeX = w;
         c.sizeY = h;
-        if (motion && in.motion != nullptr && in.motionW > 0 && in.motionH > 0)
+        const bool mv = in.motion != nullptr && in.motionW > 0 && in.motionH > 0;
+        if (mv)
         {
             const auto md = in.motion->GetDesc();
             c.mvUvScaleX = float(in.motionW) / float(md.Width);
             c.mvUvScaleY = float(in.motionH) / float(md.Height);
             c.mvToUvX = in.mvScaleX / float(in.motionW);
             c.mvToUvY = in.mvScaleY / float(in.motionH);
-            c.useMv = 1;
+            c.useMv = motion ? 1 : 0;
         }
         c.enhUvScaleX = float(_feedW) / float(ed.Width);
         c.enhUvScaleY = float(_feedH) / float(ed.Height);
@@ -1694,10 +1761,14 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         ID3D12Resource* srv[4] = { _termCopy.Get(), enh, _feed.Get(), c.useMv ? in.motion : nullptr };
         const DXGI_FORMAT fmt[4] = { sd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                      in.motion ? in.motion->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT };
-        if (c.useMv)
+        StabBind sb;
+        const bool stab = StabPrepare(list, w, h, in.reset, c, mv ? in.motion : nullptr, sb);
+        if (mv)
             Barrier(list, in.motion, in.motionState, kRead);
-        Dispatch(list, _psoApply.Get(), c, srv, fmt, _termOut.Get(), sd.Format, w, h);
-        if (c.useMv)
+        Dispatch(list, _psoApply.Get(), c, srv, fmt, _termOut.Get(), sd.Format, w, h, nullptr, stab ? &sb : nullptr);
+        if (stab)
+            StabFinish(list, sb);
+        if (mv)
             Barrier(list, in.motion, kRead, in.motionState);
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Barrier(list, in.dst, in.dstState, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1762,6 +1833,8 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         return false;
     copySource(list);
     Consume(list, &wait, &enh);
+    if (in.reset)
+        _stabValid = false;
     if (enh != nullptr && !in.reset)
     {
         apply(list, enh, true);
