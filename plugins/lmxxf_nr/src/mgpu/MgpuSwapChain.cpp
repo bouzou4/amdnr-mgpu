@@ -769,6 +769,27 @@ static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what, const bool* st
     return done;
 }
 
+// CPU wait for frame g's send (the render card's cross-adapter fence). false: stop / lost / 60 s, retry the loop.
+bool ProxySwapChain::WaitSend(UINT64 g)
+{
+    double ms = 0;
+    const bool done = GpuWaitDone(_filledD.Get(), g, 60000, [](void* x) {
+        auto* p = static_cast<ProxySwapChain*>(x);
+        return p->_stop || p->_lost; }, this, &ms);
+    {
+        std::lock_guard sg(StatsMutex());
+        auto& st = MutableStats();
+        if (ms > 250)
+            st.sendStalls++;
+        else
+            st.sendWaitMs = Ema(st.sendWaitMs, ms); // hitches stay out of the per-frame figure
+    }
+    if ((ms > 250 || !done) && _sendStallLogs++ < 30)
+        Log(done ? 1 : 2, std::format("frame {}: send landed after {:.0f} ms (render card hitch), nothing queued on the "
+                                      "display card meanwhile (done {})", g, ms, done));
+    return done;
+}
+
 void ProxySwapChain::DrainRender()
 {
     if (_gameQueue && _rgameFence)
@@ -868,6 +889,11 @@ void ProxySwapChain::PresenterLoop()
             }
         }
 
+        // The send lands before anything of this frame is queued: no display queue waits on the render card's fence
+        // (a hitch held submitted work there for seconds; a Present behind it hung the display card)
+        if (!WaitSend(g))
+            continue;
+
         // Minimised or occluded (an exclusive fullscreen left by DXGI): nothing goes to the real back buffers until a
         // test present says the window shows again. A present on them then hung the display card (DEVICE_HUNG).
         if (_occluded || IsIconic(_hwnd))
@@ -878,7 +904,6 @@ void ProxySwapChain::PresenterLoop()
                 if (!_occluded)
                     Log(0, std::format("window minimised or occluded at frame {}: frames dropped until it shows", g));
                 _occluded = true;
-                _dq->Wait(_filledD.Get(), g);
                 _dq->Signal(_releasedD.Get(), g);
                 _dq->Signal(_dFence.Get(), ++_dValue);
                 slotDisplayValue[s] = _dValue;
@@ -926,14 +951,13 @@ void ProxySwapChain::PresenterLoop()
         }
         slotCounted[s] = false;
 
-        double nrMs = 0;
+        double nrMs = 0, nrAnswerMs = -1;
         bool hudFrame = false;
         HRESULT hr;
         UINT pfUsed = 0;
         {
             // no _scMutex: in exclusive fullscreen Present can wait on the window thread, which may be in a proxy call
             const UINT m = _real->GetCurrentBackBufferIndex();
-            _dq->Wait(_filledD.Get(), g);
             ID3D12CommandList* l[2] = { _dList[s * _realCount + m].Get(), nullptr };
             UINT nl = 1;
             const bool haveHud = meta.hud && _hudD && _ui;
@@ -1090,8 +1114,12 @@ void ProxySwapChain::PresenterLoop()
                 }
                 ID3D12GraphicsCommandList* c = nullptr;
                 auto t0 = std::chrono::steady_clock::now();
+                double answerMs = 0;
+                in.answerWaitMs = &answerMs;
                 const bool wrote = env.nrFrame(_ddev.Get(), _dq.Get(), in);
-                nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                // nr stays record + submit time; the CPU wait for the answer is reported on its own
+                nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - answerMs;
+                nrAnswerMs = answerMs;
                 if (useHud)
                 {
                     c = prepUi();
@@ -1128,11 +1156,24 @@ void ProxySwapChain::PresenterLoop()
             if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
-            // the ingest waited on the render card's cross-adapter fence: resolved on the CPU before anything is
-            // presented behind it (a present behind an unresolved GPU wait page-faults the display device)
-            if (!GpuWaitDone(_filledD.Get(), g, 60000, [](void* x) { return static_cast<ProxySwapChain*>(x)->_stop; }, this))
-                Log(2, std::format("frame {}: the send did not land: presented anyway", g));
-            const bool settled = !env.nrSettle || env.nrSettle();
+            bool settled = !env.nrSettle || env.nrSettle();
+            // Present only on an idle display queue (bounded): never a Present behind work that may not finish
+            double idleMs = -1;
+            if (settled && CurrentSettings().presentIdle)
+            {
+                _dq->Signal(_dFence.Get(), ++_dValue);
+                if (!GpuWaitDone(_dFence.Get(), _dValue, kPresentIdleMs, nullptr, nullptr, &idleMs))
+                {
+                    settled = false;
+                    _lastIdleMs = -2;
+                    if (_idleSkips++ < 20)
+                        Log(2, std::format("frame {}: display queue not idle after {:.0f} ms: Present skipped", g, idleMs));
+                }
+                else if (idleMs > 100 && _idleSlow++ < 20)
+                    Log(1, std::format("frame {}: display queue idle after {:.0f} ms before the Present", g, idleMs));
+            }
+            if (settled)
+                _lastIdleMs = idleMs;
             if (probe)
             {
                 _dq->Signal(_dFence.Get(), ++_dValue);
@@ -1183,9 +1224,10 @@ void ProxySwapChain::PresenterLoop()
                 DXGI_SWAP_CHAIN_FULLSCREEN_DESC fd {};
                 _real->GetDesc1(&rd);
                 _real->GetFullscreenDesc(&fd);
-                Log(2, std::format("real Present({}, {:X}) failed {:X}: fullscreen {}, {}x{} fmt {} flags {:X}, windowed {}",
+                Log(2, std::format("real Present({}, {:X}) failed {:X}: fullscreen {}, {}x{} fmt {} flags {:X}, windowed {}, "
+                                   "queue idle before it {} ({:.0f} ms)",
                                    sync, pfUsed, (uint32_t) hr, (int) _fsCached, rd.Width, rd.Height, (int) rd.Format,
-                                   rd.Flags, fd.Windowed));
+                                   rd.Flags, fd.Windowed, _lastIdleMs >= 0 ? "yes" : _lastIdleMs < -1.5 ? "no" : "unchecked", _lastIdleMs));
             }
             LogDeviceRemoved(_ddev.Get(), "display");
             const HRESULT why = _ddev->GetDeviceRemovedReason();
@@ -1244,13 +1286,16 @@ void ProxySwapChain::PresenterLoop()
         }
         if (nrMs > 0)
             st.nrMs = Ema(st.nrMs, nrMs);
+        if (nrAnswerMs >= 0 && nrAnswerMs < 250)
+            st.answerWaitMs = Ema(st.answerWaitMs, nrAnswerMs);
         st.ringDepth = UINT(_scheduled - g);
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
-                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
-                               "hudless {} missed {} ui {:.2f}% gate {} motion {}",
+                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms cpu wait send {:.2f} answer {:.2f} ms "
+                               "stalls {} produced {} presented {} skipped {} hudless {} missed {} ui {:.2f}% gate {} motion {}",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
-                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
+                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.sendWaitMs, st.answerWaitMs, st.sendStalls,
+                               st.produced, st.presented, st.skipped,
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames));
     }
 }

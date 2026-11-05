@@ -12,6 +12,9 @@
 //   --al2 (Anti-Lag 2 called directly) or --reflex (Reflex through nvapi64.dll, markers included),
 //   --phase <s> low latency off/on alternating every <s> s (off first), --waitable (latency 1 waitable object),
 //   --csv <path> per frame: sample, present and GPU done times (QPC)
+//   Hitch rig: --stall <at> --stall-ms <ms> [--stall-every <s>]: from <at> s the render queue waits on a fence the CPU
+//   signals <ms> later (a loading hitch: the send lands late, no long GPU packet on the render card); the game keeps
+//   presenting meanwhile
 #include <windows.h>
 #include <d3dkmthk.h>
 #include <dxgi1_6.h>
@@ -104,6 +107,7 @@ int main(int argc, char** argv)
     bool nullAdapter = false, minPause = false, fseHold = false;
     bool useAl2 = false, useReflex = false, useWaitable = false;
     double gpuMs = 0, cpuMs = 0, phase = 0;
+    double stallAt = -1, stallMs = 2500, stallEvery = 0;
     const char* csvPath = nullptr;
     const char* format = "sdr";
     for (int i = 1; i < argc; ++i)
@@ -130,6 +134,12 @@ int main(int argc, char** argv)
             cpuMs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--phase") && i + 1 < argc)
             phase = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--stall") && i + 1 < argc)
+            stallAt = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--stall-ms") && i + 1 < argc)
+            stallMs = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--stall-every") && i + 1 < argc)
+            stallEvery = atof(argv[++i]);
         else if (!strcmp(argv[i], "--csv") && i + 1 < argc)
             csvPath = argv[++i];
         else if (!strcmp(argv[i], "--al2"))
@@ -456,6 +466,8 @@ int main(int argc, char** argv)
         return x.QuadPart;
     };
     UINT64 frames = 0, failed = 0;
+    ComPtr<ID3D12Fence> stallFence;
+    UINT64 stallValue = 0;
     int fseStep = 0, resizeStep = 0, minStep = 0;
     bool minimized = false;
     BOOL fs = FALSE;
@@ -605,6 +617,18 @@ int main(int argc, char** argv)
         std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
         cl->ResourceBarrier(1, &b);
         cl->Close();
+        if (stallAt >= 0 && el > stallAt)
+        {
+            if (!stallFence)
+                dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stallFence));
+            q->Wait(stallFence.Get(), ++stallValue);
+            printf("stall %llu: render queue held %.0f ms from %.2f s, frame %llu\n", stallValue, stallMs, el, frames);
+            std::thread([f = stallFence, v = stallValue, ms = stallMs] {
+                Sleep(DWORD(ms));
+                f->Signal(v);
+            }).detach();
+            stallAt = stallEvery > 0 ? el + stallEvery : -1;
+        }
         ID3D12CommandList* ls[] = { cl.Get() };
         q->ExecuteCommandLists(1, ls);
         marker(frames + 1, 3); // RENDERSUBMIT_END

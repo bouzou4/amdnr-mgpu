@@ -148,6 +148,7 @@ bool NrFrame(ID3D12Device* d, ID3D12CommandQueue* q, const Mgpu::NrInput& in)
     f.mvScaleY = in.guides.mvScaleY;
     f.reset = in.reset;
     f.waitAnswer = in.waitAnswer;
+    f.waitMs = in.answerWaitMs;
     f.encoding = Encoding(g_colorSpace);
     return DisplayEngine().RunOwn(d, q, f);
 }
@@ -231,6 +232,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.maxLead = (unsigned) std::clamp(g_keys.Int("MgpuMaxFramesAhead", 1), 1, 3);
     s.lowLatency = std::clamp(g_keys.Int("MgpuLowLatency", 2), 0, 2);
     s.earlySend = g_keys.Bool("MgpuEarlySend", false);
+    s.presentIdle = g_keys.Bool("MgpuPresentIdle", false);
     // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
     s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", false) ? 1 : 0), 0, 2);
     s.forwardOutputs = g_keys.Bool("MgpuForwardOutputs", true);
@@ -337,8 +339,8 @@ void MgpuDrawTab(const OptiPluginApi* api)
                      s.nrEveryFrame ? "on" : "off", s.temporal ? "on" : "off", s.maxLead));
     line(std::format("Frame {}x{}, render {:.2f} ms, display {:.2f} ms, added latency {:.2f} ms", st.width, st.height,
                      st.renderFrameMs, st.displayFrameMs, st.latencyMs));
-    line(std::format("Send {:.2f} ms ({:.1f} GB/s), ingest {:.2f} ms ({:.1f} GB/s)", st.sendMs, st.sendGBs, st.ingestMs,
-                     st.ingestGBs));
+    line(std::format("Send {:.2f} ms ({:.1f} GB/s), ingest {:.2f} ms ({:.1f} GB/s), CPU waits send {:.2f} ms answer {:.2f} ms",
+                     st.sendMs, st.sendGBs, st.ingestMs, st.ingestGBs, st.sendWaitMs, st.answerWaitMs));
     line(std::format("Frames sent {}, presented {}, skipped {}", st.produced, st.presented, st.skipped));
     if (s.hudless)
         line(std::format("HUD-less frames {}, missed {}, UI {:.1f}% of pixels, gate trips {}", st.hudlessFrames,
