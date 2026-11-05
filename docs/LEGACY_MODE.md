@@ -84,7 +84,7 @@ Whole-frame NR includes the HUD; that is the prototype. For clean captures the r
 - Command line: `hl2.exe -game ep2 -novid -console -windowed -noborder -w 1920 -h 1080 -condebug +con_logfile lmxxf_console.log +map ep2_outland_01 +exec lmxxf_legacy`, started directly with `SteamAppId=220` in the environment (Steam running), so the rig owns the PID.
 - Live control without input: `cfg\lmxxf_legacy.cfg` runs `alias lmxxf_loop "exec lmxxf_phase; wait 60; lmxxf_loop"`. The rig rewrites `lmxxf_phase.cfg`, using `+left` / `-left` with `cl_yawspeed 20` for a steady camera pan, `cl_drawhud 0`, `engine_no_focus_sleep 0` (otherwise the game sleeps when it is not in front) and `fps_max 0`.
 - NR settings change live through `lmxxf_nr_settings.trigger` in the dump folder (`Temporal`, `OpticalFlow` 0 none / 1 zero / 2 flow, `Model`, `NetworkSize`, `MultiPass`, `Strength`, `Enabled`). Frame and sequence dumps use the plugin's own triggers.
-- Install and restore: copy `d3d9.dll` and `lmxxf_legacy.ini` into the game root. The rig snapshots `ep2\cfg`, `ep2\save` and `hl2\cfg` (hashes) and the whole tree (size and mtime). Afterwards it removes every new file and restores changed guarded files byte-exact.
+- Install and restore: copy `d3d9.dll` and `lmxxf_legacy.ini` into `bin\`, not the game root. `shaderapidx9.dll` lives in `bin\` and resolves `d3d9.dll` there first (probe 1 put the proxy in the root and it never loaded). The rig snapshots `ep2\cfg`, `ep2\save` and `hl2\cfg` (hashes) and the whole tree (size and mtime). Afterwards it removes every new file and restores changed guarded files byte-exact.
 
 ## 6. Results
 

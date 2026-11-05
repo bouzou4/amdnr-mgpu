@@ -2,7 +2,7 @@
 // Offline check of the host's compute part (no window, no present): a recorded sequence (data prepared by
 // prep_seq.py) is played through OpticalFlow + NrEngine::RunOwn on one adapter, in passes of N frames that start
 // with a history reset; the last pass's answers and vectors are written for scoring.
-// lmxxf_legacy_host.exe --selftest <in> <out> <off|of|zero|game> <model 0|1> <pci bus> <runtime> <modules> <weights>
+// lmxxf_legacy_host.exe --selftest <in> <out> <off|of|ffx|zero|game> <model 0|1> <pci bus> <runtime> <modules> <weights>
 #include "../../src/Nr.h"
 #include "OpticalFlow.h"
 
@@ -236,6 +236,8 @@ int SelfTest(int argc, wchar_t** argv)
     OpticalFlow of;
     if (!of.Init(g.dev.Get(), g.q.Get()))
         return 5;
+    if (mode == L"ffx" && !of.UseFfx(true))
+        return 7;
     NrSettings s;
     s.placement = Placement::Terminal;
     s.model = model;

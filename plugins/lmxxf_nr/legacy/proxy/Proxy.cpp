@@ -57,7 +57,7 @@ ComPtr<ID3D12CommandQueue> g_queue;
 ComPtr<ID3D12Fence> g_shared;  // with the host, see LegacyShared.h
 ComPtr<ID3D12Fence> g_local;   // return fence for 9On12
 uint64_t g_localValue = 0;
-HANDLE g_sharedHandle = nullptr, g_event = nullptr;
+HANDLE g_sharedHandle = nullptr, g_event = nullptr, g_localEvent = nullptr;
 ComPtr<ID3D12CommandAllocator> g_alloc[2];
 ComPtr<ID3D12GraphicsCommandList> g_list;
 uint64_t g_allocValue[2] = {};
@@ -111,6 +111,7 @@ bool InitD3D12()
         return false;
     g_list->Close();
     g_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_localEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     const DWORD pid = GetCurrentProcessId();
     wchar_t name[128];
@@ -224,15 +225,26 @@ void Barrier(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3D12_RESOURCE_STA
     l->ResourceBarrier(1, &x);
 }
 
+// Waits until f reaches v. Re-checks the value: a registration that fired after an earlier wait gave up leaves the
+// auto-reset event set, and a bare WaitForSingleObject would take that as this frame's answer.
+bool WaitValue(ID3D12Fence* f, uint64_t v, HANDLE e, DWORD ms)
+{
+    const ULONGLONG end = GetTickCount64() + ms;
+    while (f->GetCompletedValue() < v)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= end || FAILED(f->SetEventOnCompletion(v, e)))
+            return false;
+        WaitForSingleObject(e, DWORD(end - now));
+    }
+    return true;
+}
+
 // Copies src -> dst on our queue (both COMMON at the boundaries)
 void Copy(ID3D12Resource* dst, ID3D12Resource* src)
 {
     const uint32_t i = g_allocNext++ & 1;
-    if (g_local->GetCompletedValue() < g_allocValue[i])
-    {
-        g_local->SetEventOnCompletion(g_allocValue[i], g_event);
-        WaitForSingleObject(g_event, 1000);
-    }
+    WaitValue(g_local.Get(), g_allocValue[i], g_localEvent, 1000);
     g_alloc[i]->Reset();
     g_list->Reset(g_alloc[i].Get(), nullptr);
     Barrier(g_list.Get(), src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -266,6 +278,9 @@ void Stats()
         HostAlive() ? "up" : "down", g_block ? g_block->hostState : -1, g_block ? g_block->hostMs : 0.f,
         g_block ? g_block->ofMs : 0.f, g_block ? g_block->flkStatic : 0.f, g_block ? g_block->flkMc : 0.f,
         g_block ? g_block->status : "");
+    if (g_dev && g_shared)
+        Log("  device %08x, shared fence %llu, frame %llu", (unsigned) g_dev->GetDeviceRemovedReason(),
+            g_shared->GetCompletedValue(), g_n);
     lastFrames = frames;
     lastReturned = g_returned;
     g_waitMsSum = 0;
@@ -327,9 +342,7 @@ void OnPresent(IDirect3DDevice9* dev)
         ++g_sent;
         LARGE_INTEGER t0, t1;
         QueryPerformanceCounter(&t0);
-        bool back = g_shared->GetCompletedValue() >= 2 * g_n;
-        if (!back && SUCCEEDED(g_shared->SetEventOnCompletion(2 * g_n, g_event)))
-            back = WaitForSingleObject(g_event, g_timeoutMs) == WAIT_OBJECT_0;
+        const bool back = WaitValue(g_shared.Get(), 2 * g_n, g_event, g_timeoutMs);
         QueryPerformanceCounter(&t1);
         if (back)
         {

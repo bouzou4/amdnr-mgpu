@@ -53,8 +53,8 @@ float IniFloat(const wchar_t* key, float def)
     return s.empty() ? def : (float) _wtof(s.c_str());
 }
 
-// Vectors: 0 none, 1 zero (static history), 2 optical flow. History itself is the Temporal key; with it off the
-// vectors still go to the flicker meter and the sequence dumps.
+// Vectors: 0 none, 1 zero (static history), 2 our optical flow, 3 FidelityFX optical flow. History itself is the
+// Temporal key; with it off the vectors still go to the flicker meter and the sequence dumps.
 int g_flow = 2;
 
 NrSettings ReadSettings()
@@ -69,7 +69,7 @@ NrSettings ReadSettings()
     s.strength = std::clamp(IniFloat(L"Strength", 1.0f), 0.0f, 2.0f);
     s.temporal = IniInt(L"Temporal", 1) != 0;
     s.meter = IniInt(L"FlickerMeter", 1) != 0;
-    g_flow = std::clamp(IniInt(L"OpticalFlow", 2), 0, 2);
+    g_flow = std::clamp(IniInt(L"OpticalFlow", 2), 0, 3);
     return s;
 }
 
@@ -105,7 +105,7 @@ void PollSettings(NrSettings& s)
         else if (k == "Enabled")
             s.enabled = v != 0;
         else if (k == "OpticalFlow")
-            g_flow = std::clamp(int(v), 0, 2);
+            g_flow = std::clamp(int(v), 0, 3);
         else
             continue;
         applied += line + " ";
@@ -246,7 +246,7 @@ int wmain(int argc, wchar_t** argv)
 
     ComPtr<ID3D12Resource> frame;
     uint32_t generation = 0;
-    uint64_t last = 0, processed = 0, nrFrames = 0;
+    uint64_t last = 0, processed = 0, nrFrames = 0, mismatches = 0;
     block->hostState = loaded ? 1 : 2;
     MemoryBarrier();
     block->hostReady = 1;
@@ -263,6 +263,8 @@ int wmain(int argc, wchar_t** argv)
                 continue;
         }
         const uint64_t n = last + 1;
+        if (block->frame != n) // the proxy is past the frame we are answering: the round trip lost sync
+            ++mismatches;
         if (block->generation != generation)
         {
             generation = block->generation;
@@ -298,6 +300,8 @@ int wmain(int argc, wchar_t** argv)
             list->Reset(alloc[i].Get(), nullptr);
             queue->Wait(fence.Get(), want);
             bool haveMv = false;
+            if (ofOk && g_flow > 0 && !of.UseFfx(g_flow == 3))
+                Log(OptiLog_Error, "FFX optical flow unavailable: our optical flow instead"), g_flow = 2;
             if (ofOk && g_flow > 0)
                 haveMv = of.Run(list.Get(), frame.Get(), D3D12_RESOURCE_STATE_COMMON, g_flow == 1);
             list->Close();
@@ -342,6 +346,8 @@ int wmain(int argc, wchar_t** argv)
                 "moving %.5f (%u), temporal %d flow %d",
                 processed, nrFrames, st.state.c_str(), st.error.c_str(), st.feedWidth, st.feedHeight, st.hipMs,
                 st.networkMs, of.GpuMs(), st.flkStatic, st.flkMc, st.flkFrames, st.temporal, g_flow);
+            Log(OptiLog_Info, "device %08x, shared fence %llu, frame %llu, frame id mismatches %llu",
+                (unsigned) dev->GetDeviceRemovedReason(), fence->GetCompletedValue(), last, mismatches);
             lastLog = now;
         }
     }

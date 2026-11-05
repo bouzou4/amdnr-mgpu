@@ -17,6 +17,8 @@ class OpticalFlow
     // against the last frame's go to Vectors(). False on the first frame of a size (no previous frame: no vectors).
     bool Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D12_RESOURCE_STATES srcState, bool zero,
              bool linear = false);
+    // FidelityFX optical flow (FFX SDK 1.1, 8x8 integer block vectors) instead of ours; false in builds without it
+    bool UseFfx(bool on);
     ID3D12Resource* Vectors() const { return _mv.Get(); } // R16G16_FLOAT, NON_PIXEL_SHADER_RESOURCE after Run
     uint32_t Width() const { return _w[0]; }
     uint32_t Height() const { return _h[0]; }
@@ -25,6 +27,11 @@ class OpticalFlow
 
   private:
     bool Ensure(uint32_t srcW, uint32_t srcH);
+    bool RunFfx(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D12_RESOURCE_STATES srcState, bool linear);
+    struct Ffx;
+    Ffx* _fx = nullptr;
+    bool _useFfx = false;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> _psoFfx;
     void Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, const uint32_t* consts,
                   ID3D12Resource* const srv[3], const DXGI_FORMAT srvFmt[3], ID3D12Resource* uav, DXGI_FORMAT uavFmt,
                   uint32_t groupsX, uint32_t groupsY);
