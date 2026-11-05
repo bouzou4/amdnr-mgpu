@@ -1496,10 +1496,16 @@ ID3D12GraphicsCommandList* NrEngine::NextOwnList(uint32_t* slot)
     if (!_presentList || !_presentFence)
         return nullptr;
     *slot = uint32_t(_presentCounter % kPresentLists);
-    if (_presentFence->GetCompletedValue() < _presentValue[*slot])
+    // its last use must be done before the reset (a 1 s cap could reset a list still behind a slow network)
+    for (int k = 0; k < 10 && _presentFence->GetCompletedValue() < _presentValue[*slot]; ++k)
     {
         _presentFence->SetEventOnCompletion(_presentValue[*slot], _event);
         WaitForSingleObject(_event, 1000);
+    }
+    if (_presentFence->GetCompletedValue() < _presentValue[*slot])
+    {
+        Log(OptiLog_Warn, "NR (%ls): own list still in flight after 10 s: frame skipped", name.c_str());
+        return nullptr;
     }
     _presentAlloc[*slot]->Reset();
     _presentList->Reset(_presentAlloc[*slot].Get(), nullptr);
@@ -1526,16 +1532,22 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
     queue->Signal(_presentFence.Get(), _presentValue[slot]);
 }
 
-// A present queued behind the wait on the network page-faults the display device: present once it is done
-void NrEngine::SettleOwn()
+// A present queued behind the wait on the network page-faults the display device: present once it is done.
+// False: still not done after 10 s, the caller must not present (a 1 s cap queued the Present behind the wait).
+bool NrEngine::SettleOwn()
 {
     const uint64_t value = _answerWait;
     _answerWait = 0;
     if (value == 0 || !_hipFence || _hipFence->GetCompletedValue() >= value)
-        return;
+        return true;
     static thread_local HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (e && SUCCEEDED(_hipFence->SetEventOnCompletion(value, e)))
-        WaitForSingleObject(e, 1000);
+    for (int k = 0; k < 10 && e && _hipFence->GetCompletedValue() < value; ++k)
+        if (SUCCEEDED(_hipFence->SetEventOnCompletion(value, e)))
+            WaitForSingleObject(e, 1000);
+    const bool done = _hipFence->GetCompletedValue() >= value;
+    if (!done)
+        Log(OptiLog_Error, "NR (%ls): network answer not done after 10 s: present skipped", name.c_str());
+    return done;
 }
 
 void NrEngine::Quiesce()

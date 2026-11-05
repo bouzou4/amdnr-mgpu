@@ -179,11 +179,14 @@ void CaptureHudless(OptiPresentFrame* f)
         g_cap.list->Close();
     }
     const uint32_t s = uint32_t(g_cap.counter % 4);
-    if (g_cap.fence->GetCompletedValue() < g_cap.value[s])
+    // the allocator's last list must be done before its reset: no cap that lets a hitch reset it in flight
+    for (int k = 0; k < 10 && g_cap.fence->GetCompletedValue() < g_cap.value[s]; ++k)
     {
         g_cap.fence->SetEventOnCompletion(g_cap.value[s], g_cap.event);
-        WaitForSingleObject(g_cap.event, 500);
+        WaitForSingleObject(g_cap.event, 1000);
     }
+    if (g_cap.fence->GetCompletedValue() < g_cap.value[s])
+        return Log(OptiLog_Warn, "[mgpu] HUD-less capture skipped: its list from 4 frames ago is not done after 10 s");
     g_cap.alloc[s]->Reset();
     g_cap.list->Reset(g_cap.alloc[s].Get(), nullptr);
     Mgpu::CaptureHudless(g_cap.list.Get(), static_cast<ID3D12Resource*>(f->hudless),
@@ -255,7 +258,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
             fn();
     };
     e.nrFrame = NrFrame;
-    e.nrSettle = [] { DisplayEngine().SettleOwn(); };
+    e.nrSettle = [] { return DisplayEngine().SettleOwn(); };
     e.hookExecute = [](ID3D12Device* d)
     {
         extern bool InstallQueueHook(ID3D12Device * device);

@@ -68,7 +68,7 @@ struct Env
     // NR on the display card, recorded and submitted on `queue`. True = wrote `in.dst`.
     std::function<bool(ID3D12Device*, ID3D12CommandQueue*, const NrInput& in)> nrFrame;
     std::function<bool()> nrWanted;
-    std::function<void()> nrSettle; // before the present of a frame nrFrame ran on
+    std::function<bool()> nrSettle; // before the present of a frame nrFrame ran on; false: do not present it
     std::function<void()> nrQuiesce; // NR's queued work is done: the resources it was given may be freed
     std::function<void(const char*)> nrIdle; // no NR this frame, and why (sequence dump requests log it)
     std::function<std::string()> nrStatus;

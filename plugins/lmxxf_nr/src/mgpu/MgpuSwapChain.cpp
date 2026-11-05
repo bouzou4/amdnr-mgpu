@@ -13,6 +13,7 @@ std::mutex& StatsMutex() { return s_statsMutex; }
 static inline UINT64 AlignUp(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 static inline double Ema(double prev, double v) { return prev <= 0 ? v : prev * 0.95 + v * 0.05; }
 static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms);
+static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what);
 
 static std::atomic<ProxySwapChain*> s_active { nullptr };
 ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
@@ -751,6 +752,22 @@ static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
     CloseHandle(e);
 }
 
+// Before a slot's allocators are reset: its previous work must be done (a 500 ms cap reset them in flight)
+static bool WaitReuse(ID3D12Fence* f, UINT64 v, const char* what)
+{
+    if (!f || f->GetCompletedValue() >= v)
+        return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int k = 0; k < 10 && f->GetCompletedValue() < v; ++k)
+        WaitFence(f, v, 1000);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const bool done = f->GetCompletedValue() >= v;
+    static std::atomic<int> logged { 0 };
+    if ((ms > 400 || !done) && logged++ < 20)
+        Log(1, std::format("{}: slot reuse waited {:.0f} ms for {} (done {})", what, ms, v, done));
+    return done;
+}
+
 void ProxySwapChain::DrainRender()
 {
     if (_gameQueue && _rgameFence)
@@ -881,7 +898,7 @@ void ProxySwapChain::PresenterLoop()
         }
 
         // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
-        WaitFence(_dFence.Get(), slotDisplayValue[s], 500);
+        WaitReuse(_dFence.Get(), slotDisplayValue[s], "display");
         double ingestMs = -1;
         if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
@@ -1105,8 +1122,7 @@ void ProxySwapChain::PresenterLoop()
             if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
-            if (env.nrSettle)
-                env.nrSettle();
+            const bool settled = !env.nrSettle || env.nrSettle();
             if (probe)
             {
                 _dq->Signal(_dFence.Get(), ++_dValue);
@@ -1121,7 +1137,8 @@ void ProxySwapChain::PresenterLoop()
                 pf |= DXGI_PRESENT_ALLOW_TEARING;
             pfUsed = pf;
             const auto tp = std::chrono::steady_clock::now();
-            hr = _real->Present(sync, pf);
+            // an unfinished network answer: never queue the Present behind its wait
+            hr = settled ? _real->Present(sync, pf) : S_OK;
             const double presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
             if (presentMs > 250 || hr != _lastPresentHr)
                 Log(presentMs > 250 ? 1 : 0, std::format("real Present {:X} in {:.0f} ms (frame {})", (uint32_t) hr, presentMs, g));
@@ -1350,11 +1367,11 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             std::lock_guard cg(_capM);
             meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g;
             meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g;
+            // the slot's previous send list must be done before its allocator is reset: else no extras this frame
+            if ((meta.hud || meta.mv) && g > K && !WaitReuse(_filledR.Get(), g - K, "send"))
+                meta.hud = meta.mv = false;
             if (meta.hud || meta.mv)
             {
-                // the slot's previous send list must be done before its allocator is reset
-                if (g > K)
-                    WaitFence(_filledR.Get(), g - K, 500);
                 _rxAlloc[s]->Reset();
                 auto* c = _rxList[s].Get();
                 c->Reset(_rxAlloc[s].Get(), nullptr);

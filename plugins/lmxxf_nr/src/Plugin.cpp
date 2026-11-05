@@ -115,8 +115,20 @@ void EnsureRuntime()
     }
 }
 
+// Render size changes are the rigs' gameplay signal (CONTROL's menus and gameplay upscale at different sizes)
+void LogUpscaleSize(const OptiUpscaleFrame* f)
+{
+    static uint32_t rw = 0, rh = 0, ow = 0, oh = 0, changes = 0;
+    if (f->renderWidth == rw && f->renderHeight == rh && f->outputWidth == ow && f->outputHeight == oh)
+        return;
+    rw = f->renderWidth, rh = f->renderHeight, ow = f->outputWidth, oh = f->outputHeight;
+    if (changes++ < 100)
+        Log(OptiLog_Info, "upscale render %ux%u -> %ux%u (frame %llu)", rw, rh, ow, oh, (unsigned long long) f->frameId);
+}
+
 void UpscaleBefore(OptiUpscaleFrame* frame, void*)
 {
+    LogUpscaleSize(frame);
     if (MgpuActive())
         return; // NR runs on the display card
     EnsureRuntime();
