@@ -153,6 +153,30 @@ Four recorded Satisfactory sequences, Small 1080, the game's own vectors as trut
   - Flicker, probe 5 against probe 4. History + OF still: flk_static -0.00121 against -0.00098, flk_mc -0.00144 against -0.00162. History + OF pan: flk_static -0.00094 against -0.00097, flk_mc +0.00005 against +0.00003, psnr_mc 48.95 against 48.94. The history-off sequences differ because the scene differs: the load took 33 s instead of 16 s, so the camera ended up elsewhere. History-off pan has 0.41 moving against 0.31, flk_mc +0.00076. History-off still has no moving pixels, so flk_mc is undefined. The fix only changes the host's CPU wait, not the NR path.
   - nr_pan was at 82 fps against probe 4's 105-109, with host GPU time 6.3 ms against 5.0 ms. Other agents' CPU and memory load was high during the run. The fix doesn't touch GPU work, so this needs a re-time on a quiet machine before it counts.
 
+### 6.3 Crysis 2 Maximum Edition (Steam 108800, 2560x1440 fullscreen, Full, 1440, 2 passes, OF on, single card)
+
+This is the second game, and it needed no proxy changes. It ran the UI build and runtime `stage\current`, the same as the play install.
+
+- The game is 32-bit CryEngine 3. `bin32\Crysis2.exe` is SteamStub-wrapped. Starting it directly with `SteamAppId=108800` in the environment works, and so does `steam://rungameid/108800`. `CryRenderD3D9.dll` loads `d3d9.dll` with `LoadLibrary`, so the proxy goes into `bin32\` next to the exe. The game calls `Direct3DCreate9` (not Ex) twice and `CreateDevice` once per adapter (1x1 probes), then creates the real device.
+- DX9 selection: the default is DX11. `r_Driver = "DX9"` in the game root's `system.cfg` has no effect, because the player's `Saved Games\Crysis2\game.cfg` sets `r_Driver = "DX11"`. Either `-dx9` on the command line or `r_Driver = "DX9"` in that `game.cfg` selects `CryRenderD3D9.dll`; both were verified. In DX11 mode the proxy still loads, because the DX11 renderer also calls `Direct3DCreate9`, but no device is created and nothing is processed.
+- The game boots to a title screen ("press Enter to begin"), so no level is needed. Keyboard input goes through DirectInput, so a key posted to the window does not move past it. The title animates slowly, so it is a near-still scene.
+- The DRM components (`bin32\EACore`) raised no prompt and no online check before the title screen.
+
+| Phase | fps | Notes |
+|---|---|---|
+| NR bypassed (title, uncapped) | 431 | |
+| NR on, steady (no dumps) | 28.3-29.8 | host GPU 29.1 ms (network 28.9 ms, OF 0.04-0.2 ms), host wait 32-34 ms per frame |
+
+| Sequence (12 frames, title) | flk_static | flk_mc | psnr_mc (dB) |
+|---|---|---|---|
+| history + OF | -0.00028 | -0.00008 | 32.5 |
+| history off | +0.00063 | +0.00123 | 36.4 |
+
+- Dump gate: the feed is in [0,1]. The answer differs from the feed by 0.018 on average, and by more than 1/255 on 6.5 % of pixels. The title is dark (feed median 0.0013 linear).
+- 0 failed presents and no device-removed or device-hung line. The overlay menu draws over the game (Insert, or `menu` in `proxy_keys.trigger`).
+- Timeouts (250 ms) happen at the first frames and around every frame or sequence dump. At 2560x1440 the host is still busy with a dump when the proxy's wait ends. After a timeout the proxy presents raw frames until the host catches up. Between dumps that was 250-650 raw frames per 4 s window, and fps reads 80-180 there. The steady phases and the play-install launch had no timeouts.
+- Automation: `data\legacy\crysis2_probe.ps1` runs with `-dx9`, a brightness gate, and bypass / NR / menu / history-off phases. `c2_sample.ps1` samples the threads of a stuck process. The probe restores `system.cfg` and `Saved Games\Crysis2` byte-exact (the game rewrites `Profiles\default\*.xml` at every start) and removes `Game.log` and other new files from the game folder.
+
 ## 7. Multi-GPU (design)
 
 The host already opens its own device on the adapter the proxy names, so the split maps onto the existing ring with one change: the proxy's 9On12 device goes to the render card (bus 7). The host runs on the display card (bus 3).
