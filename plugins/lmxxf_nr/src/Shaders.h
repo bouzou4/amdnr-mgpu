@@ -30,6 +30,7 @@ cbuffer C : register(b0)
     uint UseNorm;     // Norm bound (upscale placements): the guard can bypass Apply
     float ExpoMul;    // Stats: game exposure * ExpoMul = net units per scene unit (1 / pre-exposure); 0 = auto
     float ColorStrength; // 0: network luma on the game's chroma, 1: the network's colour edit as it is
+    uint UpMode;         // edit upsample: 0 bilinear + feed residual, 1 guided (EditGuided)
 };
 
 static const float kGuard = 1.5; // fed median above this after mapping: bypass
@@ -168,9 +169,47 @@ float3 Up(Texture2D<float4> t, float2 uvScale, float2 uv)
     return t.SampleLevel(Lin, uv * uvScale, 0).rgb + t.SampleLevel(Pt, ci * uvScale, 0).rgb - box * 0.25;
 }
 
+// Guided upsample: the edit as a ratio to the feed colour, joint bilateral over 3x3 feed pixels (distance and the
+// guide luma of this pixel against each feed pixel), times this pixel's own colour
+static const float kRatioK = 0.01;
+static const float kRangeSigma = 0.08;
+static const float kSpaceSigma = 0.6; // feed pixels
+float Guide(float3 n) { return sqrt(Luma(saturate(n))); }
+float3 EditGuided(float2 uv, float3 c, float2 fs)
+{
+    float3 n = ToNet(max(ToLinear(c), 0));
+    float g = Guide(n);
+    float2 p = uv * fs - 0.5;
+    int2 b = int2(uv * fs);
+    float3 acc = 0;
+    float accL = 0, ws = 0;
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+        [unroll] for (int dx = -1; dx <= 1; dx++)
+        {
+            int2 q = clamp(b + int2(dx, dy), 0, int2(fs) - 1);
+            float3 f = Fed.Load(int3(q, 0)).rgb, en = Enh.Load(int3(q, 0)).rgb;
+            float2 d = (q - p) / kSpaceSigma;
+            float dg = (Guide(f) - g) / kRangeSigma;
+            float w = exp(-0.5 * (dot(d, d) + dg * dg)) + 1e-8;
+            acc += w * clamp((en - f) / (f + kRatioK), -1, 4);
+            if (ColorStrength < 1)
+                accL += w * clamp((Luma(en) + 1e-3) / (Luma(f) + 1e-3), 0, 4);
+            ws += w;
+        }
+    float3 e = acc / ws * (n + kRatioK);
+    if (ColorStrength >= 1)
+        return e;
+    return lerp(n * (accL / ws - 1), e, saturate(ColorStrength));
+}
+
 // Network space edit at uv for colour c: below ColorStrength 1 part of it is the network's luma ratio on c's own chroma
 float3 Edit(float2 uv, float3 c)
 {
+    float2 fs;
+    Fed.GetDimensions(fs.x, fs.y);
+    fs = floor(fs * FedUvScale + 0.5);
+    if (UpMode == 1 && any(fs < float2(Size))) // feed at the target size: the edit as it is
+        return EditGuided(uv, c, fs);
     float3 enh = Up(Enh, EnhUvScale, uv), fed = Up(Fed, FedUvScale, uv);
     float3 e = enh - fed;
     if (ColorStrength >= 1)
@@ -237,8 +276,9 @@ struct ShaderConstants
     uint32_t useNorm;
     float expoMul;
     float colorStrength;
+    uint32_t upMode;
 };
-static_assert(sizeof(ShaderConstants) == 84);
+static_assert(sizeof(ShaderConstants) == 88);
 
 // Flicker meter, tools/seq_metrics.py on the GPU: per pixel of the feed, the change of the network's answer against
 // the change of its input (display encoding), on still pixels and on visible moving pixels (warped with the vectors).
