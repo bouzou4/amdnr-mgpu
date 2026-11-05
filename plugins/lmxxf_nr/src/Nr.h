@@ -52,6 +52,7 @@ struct NrSettings
     // 0 before / after upscaling, 1 at the display placements
     float colorStrength = 1.0f;
     float ColorStrength(bool preTonemap) const { return colorStrength >= 0 ? colorStrength : preTonemap ? 0.0f : 1.0f; }
+    int32_t upsample = 1; // feed-size edit to the target: 0 bilinear + feed residual, 1 guided by the target colour
     float uiLow = 0.004f;  // terminal: back buffer vs HUD-less difference where UI starts (encoded units)
     float uiHigh = 0.02f;  // and where it is fully UI
     bool motion = true; // move the one frame old edit with the motion vectors

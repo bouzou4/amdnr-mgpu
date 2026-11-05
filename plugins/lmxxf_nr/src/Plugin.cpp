@@ -63,6 +63,7 @@ NrSettings ReadSettings()
     s.style = std::clamp(g_keys.Int("Style", 0), -1, 2);
     s.strength = std::clamp(g_keys.Float("Strength", 1.0f), 0.0f, 2.0f);
     s.colorStrength = std::min(g_keys.Float("ColorStrength", 1.0f), 1.0f);
+    s.upsample = std::clamp(g_keys.Int("EditUpsample", 1), 0, 1);
     s.motion = g_keys.Bool("MotionVectors", true);
     s.exposure = g_keys.Bool("Exposure", true);
     s.serialize = g_keys.Bool("Serialize", false);
@@ -83,6 +84,7 @@ void WriteSettings(const NrSettings& s)
     g_api->SetInt(g_plugin, "Style", s.style);
     g_api->SetFloat(g_plugin, "Strength", s.strength);
     g_api->SetFloat(g_plugin, "ColorStrength", s.colorStrength);
+    g_api->SetInt(g_plugin, "EditUpsample", s.upsample);
     g_api->SetBool(g_plugin, "MotionVectors", s.motion);
     g_api->SetBool(g_plugin, "Exposure", s.exposure);
     g_api->SetBool(g_plugin, "Temporal", s.temporal);
@@ -450,6 +452,14 @@ void DrawTab(void*)
         changed = true;
     g_api->ItemTooltip("Share of the network's colour change: 0 keeps the game's chroma with the network's luma, 1 takes its "
                        "colour (default, faithful). Auto: 0 before / after upscaling, 1 at the display placements");
+    bool guided = g_ui.upsample == 1;
+    if (g_api->Checkbox("Guided edit upsample", &guided))
+    {
+        g_ui.upsample = guided ? 1 : 0;
+        changed = true;
+    }
+    g_api->ItemTooltip("1080 / 1440 sizes: the network's edit reaches the output guided by its full-size colour (default).\n"
+                       "Off: bilinear plus the feed pixel's residual");
     if (g_api->Checkbox("Move the edit with motion vectors", &g_ui.motion))
         changed = true;
     if (g_api->Checkbox("Network history from motion vectors", &g_ui.temporal))

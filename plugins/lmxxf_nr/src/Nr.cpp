@@ -1082,6 +1082,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
         c.colorStrength = _settings.ColorStrength(true);
+        c.upMode = uint32_t(_settings.upsample);
         c.encoding = encoding;
         c.useNorm = norm != nullptr;
 
@@ -1424,6 +1425,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
         c.colorStrength = _settings.ColorStrength(false);
+        c.upMode = uint32_t(_settings.upsample);
         c.uiLow = _settings.uiLow;
         c.uiHigh = _settings.uiHigh;
         c.encoding = encoding;
@@ -1685,6 +1687,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         c.fedUvScaleX = c.fedUvScaleY = 1.0f;
         c.strength = _settings.strength;
         c.colorStrength = _settings.ColorStrength(false);
+        c.upMode = uint32_t(_settings.upsample);
         c.encoding = in.encoding;
         c.paperWhite = _settings.paperWhite / 80.0f;
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
