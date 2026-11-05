@@ -181,11 +181,27 @@ class NrEngine
                   ID3D12Resource* const srv[4], const DXGI_FORMAT srvFmt[4], ID3D12Resource* uav, DXGI_FORMAT uavFmt,
                   uint32_t w, uint32_t h, ID3D12Resource* norm = nullptr, const StabBind* stab = nullptr);
 
+    // Replaced resources the GPU may still read: freed once the game queue, the session queue and our own lists
+    // are past the replacement
+    struct Retired
+    {
+        ComPtr<ID3D12Resource> res;
+        ComPtr<ID3D12Fence> gameFence;
+        uint64_t game = 0, hip = 0, own = 0;
+    };
+    std::vector<Retired> _retired;
+    ComPtr<ID3D12Fence> _retireFence; // signalled on _retireQueue only
+    ID3D12CommandQueue* _retireQueue = nullptr;
+    uint64_t _retireValue = 0;
+    void Retire(ComPtr<ID3D12Resource>& r); // r is empty after
+    void ReleaseRetired();
+
     Runtime _rt;
     std::mutex _mutex; // every runtime call, the job state and the stats
     NrSettings _settings;
     NrSettings _active; // what the session was created with
     bool _dirty = false;
+    bool _placementSwitch = false; // the job in flight was fed by the other placement: its edit is dropped
     std::atomic<State> _state { State::Idle };
     std::thread _worker;
     NrStats _stats;

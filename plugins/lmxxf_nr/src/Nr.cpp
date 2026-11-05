@@ -176,6 +176,8 @@ bool NrEngine::LoadRuntime(const RuntimePaths& paths)
 void NrEngine::Configure(const NrSettings& s)
 {
     std::lock_guard lock(_mutex);
+    if (s.placement != _settings.placement)
+        _placementSwitch = true;
     _settings = s;
     // A history session drops adaptive ViT reuse: toggling history rebuilds it off the render thread
     _dirty = s.size != _active.size || s.model != _active.model || s.Style() != _active.Style() ||
@@ -455,8 +457,11 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
     {
         _stabValid = false;
         for (auto& t : _stab)
+        {
+            Retire(t); // the last apply may still read it (a placement or size change)
             if (!(t = Texture(_device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead)))
                 return false;
+        }
         _stab[0]->SetName(L"lmxxf_nr edit history"), _stab[1]->SetName(L"lmxxf_nr edit history");
     }
     c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u);
@@ -649,6 +654,41 @@ void NrEngine::WaitIdle()
     wait(_queue.Get(), _hipFence.Get(), _hipValue);
 }
 
+void NrEngine::Retire(ComPtr<ID3D12Resource>& r)
+{
+    if (!r)
+        return;
+    Retired x;
+    x.res = std::move(r);
+    if (_gameQueue)
+    {
+        // own fence per queue: signals from two queues on one fence could complete out of order
+        if (_retireQueue != _gameQueue.Get() || !_retireFence)
+        {
+            _retireFence.Reset();
+            _retireValue = 0;
+            _device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_retireFence));
+            _retireQueue = _gameQueue.Get();
+        }
+        if (_retireFence && SUCCEEDED(_gameQueue->Signal(_retireFence.Get(), _retireValue + 1)))
+            x.gameFence = _retireFence, x.game = ++_retireValue;
+    }
+    if (_queue && _hipFence && SUCCEEDED(_queue->Signal(_hipFence.Get(), _hipValue + 1)))
+        x.hip = ++_hipValue;
+    x.own = _presentFence ? _presentCounter : 0;
+    _retired.push_back(std::move(x));
+}
+
+void NrEngine::ReleaseRetired()
+{
+    if (_retired.empty())
+        return;
+    const uint64_t hip = _hipFence ? _hipFence->GetCompletedValue() : UINT64_MAX;
+    const uint64_t own = _presentFence ? _presentFence->GetCompletedValue() : UINT64_MAX;
+    std::erase_if(_retired, [&](const Retired& x)
+                  { return x.hip <= hip && x.own <= own && (!x.gameFence || x.gameFence->GetCompletedValue() >= x.game); });
+}
+
 void NrEngine::DrainJob()
 {
     if (_jobState == Job::Enqueued)
@@ -750,6 +790,7 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
     }
     if (ok && (feedW != _feedW || feedH != _feedH || !_feed))
     {
+        Retire(_feed);
         _feed = Texture(_device.Get(), feedW, feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead);
         _feedW = feedW;
         _feedH = feedH;
@@ -775,6 +816,7 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
 
 void NrEngine::ReadTimings()
 {
+    ReleaseRetired();
     FinishDump();
     SeqPoll();
     MeterRead();
@@ -931,6 +973,14 @@ void NrEngine::Consume(ID3D12GraphicsCommandList* list, uint64_t* wait, ID3D12Re
 {
     *wait = 0;
     *enh = nullptr;
+    // After a placement change the answer belongs to the other source (size, encoding, UI): retired unapplied
+    const bool stale = std::exchange(_placementSwitch, false);
+    if (stale)
+    {
+        _stabValid = false;
+        _meterPrevValid = false;
+        _extentReset = true;
+    }
     if (_jobState == Job::Enqueued)
     {
         const int32_t rc = _rt.api.RecordOutputs(_ctx, _job.handle, list);
@@ -938,7 +988,7 @@ void NrEngine::Consume(ID3D12GraphicsCommandList* list, uint64_t* wait, ID3D12Re
         {
             _rt.api.Retire(_ctx, _job.handle);
             *wait = _jobHipValue;
-            if (_feedValid)
+            if (_feedValid && !stale)
                 *enh = static_cast<ID3D12Resource*>(_job.private_output);
             if (*enh != nullptr && _jobSeq >= 0 && _jobSeq < (int32_t) _seq.size())
             {
@@ -1061,6 +1111,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         if (!_override || _override->GetDesc().Width != srcDesc.Width || _override->GetDesc().Height != srcDesc.Height ||
             _overrideState != colorState)
         {
+            Retire(_override);
             _override = Texture(_device.Get(), (uint32_t) srcDesc.Width, srcDesc.Height,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT, true, colorState);
             _overrideState = colorState;
@@ -1072,7 +1123,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         const auto od = output->GetDesc();
         if (!_srcCopy || _srcCopy->GetDesc().Width != od.Width || _srcCopy->GetDesc().Height != od.Height ||
             _srcCopy->GetDesc().Format != od.Format)
-            _srcCopy = Texture(_device.Get(), (uint32_t) od.Width, od.Height, od.Format, false, kRead);
+            Retire(_srcCopy), _srcCopy = Texture(_device.Get(), (uint32_t) od.Width, od.Height, od.Format, false, kRead);
         if (!_srcCopy)
             return;
         Barrier(list, output, outputState, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1326,7 +1377,7 @@ void NrEngine::CaptureMotion(OptiUpscaleFrame* f)
     const auto md = mv->GetDesc();
     if (!_mvCopy || _mvCopy->GetDesc().Width != md.Width || _mvCopy->GetDesc().Height != md.Height ||
         _mvCopy->GetDesc().Format != ViewFormat(md.Format))
-        _mvCopy = Texture(_device.Get(), (uint32_t) md.Width, md.Height, ViewFormat(md.Format), false, kRead);
+        Retire(_mvCopy), _mvCopy = Texture(_device.Get(), (uint32_t) md.Width, md.Height, ViewFormat(md.Format), false, kRead);
     if (!_mvCopy)
         return;
     const auto st = D3D12_RESOURCE_STATES(f->motionVectorsState);
@@ -1655,6 +1706,7 @@ bool NrEngine::Shutdown()
         WaitIdle();
         if (_presentFence)
             GpuWaitDone(_presentFence.Get(), _presentCounter); // the present lists before they are freed
+        ReleaseRetired();
     }
     if (_ctx != nullptr)
     {
@@ -1671,6 +1723,8 @@ bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
     if (_termCopy && _termCopy->GetDesc().Width == bd.Width && _termCopy->GetDesc().Height == bd.Height &&
         _termCopy->GetDesc().Format == bd.Format)
         return true;
+    Retire(_termCopy);
+    Retire(_termOut);
     _termCopy = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, bd.Format, false, kRead);
     _termOut = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, UavFormat(bd.Format), true,
                        D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1690,6 +1744,8 @@ bool NrEngine::EnsureHudCopies(const D3D12_RESOURCE_DESC& hd)
     if (_hudCopy && _hudCopy->GetDesc().Width == hd.Width && _hudCopy->GetDesc().Height == hd.Height &&
         _hudCopy->GetDesc().Format == hd.Format)
         return true;
+    Retire(_hudCopy);
+    Retire(_hudOut);
     _hudCopy = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, hd.Format, false, kRead);
     _hudOut = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, UavFormat(hd.Format), true,
                       D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1906,6 +1962,7 @@ void NrEngine::Meter(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, bool 
         return;
     if (!_meterPrev || _meterPrev->GetDesc().Width != 2ull * _feedW || _meterPrev->GetDesc().Height != _feedH)
     {
+        Retire(_meterPrev);
         _meterPrev = Texture(_device.Get(), 2 * _feedW, _feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, false, kRead);
         _meterPrevValid = false;
     }
