@@ -1451,6 +1451,8 @@ ID3D12GraphicsCommandList* NrEngine::NextOwnList(uint32_t* slot)
         _presentFence->SetEventOnCompletion(_presentValue[*slot], _event);
         WaitForSingleObject(_event, 1000);
     }
+    if (_presentFence->GetCompletedValue() < _presentValue[*slot])
+        return nullptr; // still in flight: no reset, no list this frame
     _presentAlloc[*slot]->Reset();
     _presentList->Reset(_presentAlloc[*slot].Get(), nullptr);
     _presentValue[*slot] = ++_presentCounter; // signalled by SubmitOwn

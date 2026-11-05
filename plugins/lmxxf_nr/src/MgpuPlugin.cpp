@@ -183,6 +183,8 @@ void CaptureHudless(OptiPresentFrame* f)
         g_cap.fence->SetEventOnCompletion(g_cap.value[s], g_cap.event);
         WaitForSingleObject(g_cap.event, 500);
     }
+    if (g_cap.fence->GetCompletedValue() < g_cap.value[s])
+        return; // still in flight: never reset it, skip this capture
     g_cap.alloc[s]->Reset();
     g_cap.list->Reset(g_cap.alloc[s].Get(), nullptr);
     Mgpu::CaptureHudless(g_cap.list.Get(), static_cast<ID3D12Resource*>(f->hudless),

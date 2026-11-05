@@ -1145,11 +1145,11 @@ void ProxySwapChain::PresenterLoop()
             }
         }
         slotCounted[s] = false;
-        // The send is complete (CPU) before any display work or Present is queued behind it (perf skip bit 64: GPU
-        // wait only, which hung at the first HUD-less frames without NR). Not the whole display hang story yet.
+        // Default: the display queue waits for the send on the GPU. Perf bit 512 opts into a CPU wait first; it and the
+        // early release (1024) each removed the display device (DEVICE_HUNG) in Satisfactory runs.
         using Clock = std::chrono::steady_clock;
         const auto tPick = Clock::now();
-        if (!(Perf().skip.load() & 64))
+        if (Perf().skip.load() & 512)
         {
             // no timeout that lets work queue behind it: a loading hitch can hold a send for seconds
             for (int k = 0; k < 10 && _filledD->GetCompletedValue() < g; ++k)
@@ -1286,8 +1286,8 @@ void ProxySwapChain::PresenterLoop()
             const auto tRec = Clock::now();
             _dq->Signal(_releasedD.Get(), g);
             // the slot is taken: the game may queue its next frame while this one waits for NR and presents
-            // (perf skip bit 128: only after the Present)
-            early = !(Perf().skip.load() & 128);
+            // (opt-in, perf bit 1024; default: only after the Present)
+            early = (Perf().skip.load() & 1024) != 0;
             if (early)
             {
                 lk.lock();
