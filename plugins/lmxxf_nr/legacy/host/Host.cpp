@@ -53,8 +53,8 @@ float IniFloat(const wchar_t* key, float def)
     return s.empty() ? def : (float) _wtof(s.c_str());
 }
 
-// Vectors: 0 none, 1 zero (static history), 2 our optical flow, 3 FidelityFX optical flow. History itself is the
-// Temporal key; with it off the vectors still go to the flicker meter and the sequence dumps.
+// Vectors: 0 none, 1 zero (static history), 2 optical flow. History itself is the Temporal key; with it off the
+// vectors still go to the flicker meter and the sequence dumps.
 int g_flow = 2;
 
 NrSettings ReadSettings()
@@ -69,7 +69,7 @@ NrSettings ReadSettings()
     s.strength = std::clamp(IniFloat(L"Strength", 1.0f), 0.0f, 2.0f);
     s.temporal = IniInt(L"Temporal", 1) != 0;
     s.meter = IniInt(L"FlickerMeter", 1) != 0;
-    g_flow = std::clamp(IniInt(L"OpticalFlow", 2), 0, 3);
+    g_flow = std::clamp(IniInt(L"OpticalFlow", 2), 0, 2);
     return s;
 }
 
@@ -105,7 +105,7 @@ void PollSettings(NrSettings& s)
         else if (k == "Enabled")
             s.enabled = v != 0;
         else if (k == "OpticalFlow")
-            g_flow = std::clamp(int(v), 0, 3);
+            g_flow = std::clamp(int(v), 0, 2);
         else
             continue;
         applied += line + " ";
@@ -262,9 +262,15 @@ int wmain(int argc, wchar_t** argv)
             if (WaitForSingleObject(ev, 100) != WAIT_OBJECT_0)
                 continue;
         }
-        const uint64_t n = last + 1;
-        if (block->frame != n) // the proxy is past the frame we are answering: the round trip lost sync
+        // Answer the proxy's own frame id, never our count: the two drifted apart in Ep2 (one per frame)
+        const uint64_t n = block->frame;
+        if (n != last + 1)
             ++mismatches;
+        if (n <= last)
+        {
+            Sleep(0);
+            continue;
+        }
         if (block->generation != generation)
         {
             generation = block->generation;
@@ -300,8 +306,6 @@ int wmain(int argc, wchar_t** argv)
             list->Reset(alloc[i].Get(), nullptr);
             queue->Wait(fence.Get(), want);
             bool haveMv = false;
-            if (ofOk && g_flow > 0 && !of.UseFfx(g_flow == 3))
-                Log(OptiLog_Error, "FFX optical flow unavailable: our optical flow instead"), g_flow = 2;
             if (ofOk && g_flow > 0)
                 haveMv = of.Run(list.Get(), frame.Get(), D3D12_RESOURCE_STATE_COMMON, g_flow == 1);
             list->Close();

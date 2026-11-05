@@ -67,7 +67,7 @@ Choice for the prototype: **our own MIT block matcher** (`legacy/host/OpticalFlo
 - A per-pixel pass picks the best of the 3x3 neighbouring block vectors on a 3x3 window, so vectors follow edges.
 - No dependency, any GPU, one file.
 
-FFX optical flow is the upgrade path if quality demands it: it is the same block-level idea with a tuned search, and it needs the FFX SDK backend built in. Wrong vectors are bounded by the runtime itself: its raw guard rejects history wherever the warped previous input differs from the current input by more than 0.08, so bad flow degrades to "no history" locally rather than to ghosting.
+FidelityFX optical flow was measured against it and dropped (section 6.1). Wrong vectors are bounded by the runtime itself: its raw guard rejects history wherever the warped previous input differs from the current input by more than 0.08, so bad flow degrades to "no history" locally rather than to ghosting.
 
 Results: see section 6.
 
@@ -82,13 +82,51 @@ Whole-frame NR includes the HUD; that is the prototype. For clean captures the r
 
 - Registry entry: `data\games.json` `hl2ep2` (exe `hl2.exe`, appid 420, the game root as `dir`).
 - Command line: `hl2.exe -game ep2 -novid -console -windowed -noborder -w 1920 -h 1080 -condebug +con_logfile lmxxf_console.log +map ep2_outland_01 +exec lmxxf_legacy`, started directly with `SteamAppId=220` in the environment (Steam running), so the rig owns the PID.
-- Live control without input: `cfg\lmxxf_legacy.cfg` runs `alias lmxxf_loop "exec lmxxf_phase; wait 60; lmxxf_loop"`. The rig rewrites `lmxxf_phase.cfg`, using `+left` / `-left` with `cl_yawspeed 20` for a steady camera pan, `cl_drawhud 0`, `engine_no_focus_sleep 0` (otherwise the game sleeps when it is not in front) and `fps_max 0`.
+- Live control without input: `cfg\lmxxf_legacy.cfg` runs `alias lmxxf_loop "exec lmxxf_phase; wait 60; lmxxf_loop"`. The rig rewrites `lmxxf_phase.cfg`, using `+left` / `-left` for a steady camera pan, `cl_drawhud 0` and `engine_no_focus_sleep 0` (otherwise the game sleeps when it is not in front). Flicker phases run at `fps_max 60` with `cl_yawspeed 30` (about 10 px per frame); fps phases at `fps_max 0`.
 - NR settings change live through `lmxxf_nr_settings.trigger` in the dump folder (`Temporal`, `OpticalFlow` 0 none / 1 zero / 2 flow, `Model`, `NetworkSize`, `MultiPass`, `Strength`, `Enabled`). Frame and sequence dumps use the plugin's own triggers.
+- Before the phases, a brightness gate takes frame dumps until the feed is no longer black (the map load and its fade-in take about 40 s after launch). Between phases the probe stops at the first device-removed or device-hung line in the proxy or host log.
 - Install and restore: copy `d3d9.dll` and `lmxxf_legacy.ini` into `bin\`, not the game root. `shaderapidx9.dll` lives in `bin\` and resolves `d3d9.dll` there first (probe 1 put the proxy in the root and it never loaded). The rig snapshots `ep2\cfg`, `ep2\save` and `hl2\cfg` (hashes) and the whole tree (size and mtime). Afterwards it removes every new file and restores changed guarded files byte-exact.
 
 ## 6. Results
 
-(filled in from the probes)
+### 6.1 Optical flow (offline)
+
+Four recorded Satisfactory sequences, Small 1080, the game's own vectors as truth (`seq_metrics` definitions; flicker is the answer's frame-to-frame change minus the input's, so negative means steadier than the input). `warp` is the mean |I(t) - warp(I(t-1))| with each vector field. The time is the optical flow's GPU time at a 1080 source, functional lease.
+
+| Vectors | flk_static | flk_mc | psnr_mc (dB) | warp | ms |
+|---|---|---|---|---|---|
+| none (history off) | +0.00053..+0.00069 | +0.00013..+0.00045 | 39.3-42.6 | - | - |
+| zero vectors | -0.00090..-0.00014 | +0.00006..+0.00023 | 39.7-42.9 | 0.0056-0.0143 | - |
+| **ours** (`OpticalFlow.cpp`) | -0.00044..-0.00009 | -0.00015..-0.00005 | 39.9-43.2 | 0.0040-0.0084 | 0.47-0.57 |
+| FidelityFX OF (SDK 1.1, bilinear block upsampling) | -0.00033..+0.00001 | -0.00010..+0.00012 | 39.7-43.0 | 0.0057-0.0127 | 0.12-0.14 |
+| game vectors (reference) | -0.00096..-0.00012 | -0.00070..-0.00041 | 40.8-44.0 | 0.0052-0.0107 | - |
+
+- Ours is better than FFX OF on every sequence and quality column. FFX OF was built from source (opticalflow component plus its DX12 backend) and fed the same frames. Its vectors are integer pixels per 8x8 block, which suits frame interpolation but not history reprojection. Nearest and bilinear block upsampling scored the same. Its only advantage is speed (about 0.4 ms less per frame), so it was dropped: no FFX code or dependency remains.
+- The still-pixel threshold (2/255 mean luma difference, no search) trades a little motion flicker for static flicker against the version without it. The version with it is the only one kept.
+- Game vectors remain well ahead on motion flicker (flk_mc 3-8x lower), although ours warps the frames more closely. Colour-only flow recovers only part of the motion-compensated gain.
+
+### 6.2 Ep2 (probe 4, 1920x1080 windowed, Small, OF on, single card)
+
+| Phase | fps | Notes |
+|---|---|---|
+| NR bypassed (still / pan, uncapped) | 1177 / 1182 | the proxy present path without the round trip |
+| NR on, history + OF, pan, uncapped | 105-109 | every frame answered by the host (0 skipped); host wait 8.0-8.5 ms per frame |
+| NR on, 60 fps cap | 53-60 | flicker phases |
+
+| Sequence (12 frames) | flk_static | flk_mc | psnr_mc (dB) | mean motion |
+|---|---|---|---|---|
+| history + OF, still | -0.00098 | -0.00162 | 44.0 | 0.4 px |
+| history off, still | +0.00030 | +0.00006 | 46.4 | 0.2 px |
+| history + OF, pan | -0.00097 | +0.00003 | 48.9 | 4.7 px |
+| history off, pan | -0.00011 | +0.00104 | 43.3 | 3.3 px |
+
+- Dump gate: feed in [0,1], the answer differs from the feed on 5.6 % of pixels. The scene is dark (feed median 0.0015 linear).
+- 0 failed presents and no device-removed or device-hung line in any run. The game folder was restored byte-exact.
+- History with colour-only flow does what it did offline. On the pan, motion-compensated flicker drops from +0.00104 to +0.00003 and psnr_mc rises by 5.6 dB. On the still view, flicker goes from above the input's to below it.
+- The NR cost caps the game at about 110 fps: the proxy waits on the CPU for each frame's answer, and the host's network plus hand-off takes 5-8 ms at 1080 (Small).
+- Timeouts (250 ms) happen only at the first frames (host start, network build) and around frame and sequence dumps and network rebuilds. During each one, frames go to the screen without NR until the host catches up ("skipped").
+- Probe 2's fps were wrong. The proxy waited with one auto-reset event for two fences and took any wake-up as the host's answer. After the first timeout it ran free: about 540 presents/s counted as answered while the host ran NR on 110-135 frames/s. Fixed: the wait re-checks the fence value, and the host answers the proxy's frame id.
+- Open: the host's frame-id mismatch counter counts every frame in Ep2 (0 in the test title), although the fence values on both sides agree with the frame ids. Most likely the counter itself is wrong; it is not yet explained.
 
 ## 7. Multi-GPU (design)
 
@@ -109,7 +147,6 @@ The host already opens its own device on the adapter the proxy names, so the spl
 | D3D9 generally (32-bit, on 9On12) | Per-game 9On12 compatibility checks, MSAA resolve instead of forcing it off, `IDirect3DSwapChain9::Present` and `D3DSWAPEFFECT_FLIPEX` paths, gamma/sRGB detection, fallback (c) for titles 9On12 renders wrongly, a launcher-free install | 1-2 weeks, plus about half a day per game for validation |
 | 64-bit D3D11 games without upscalers | OptiScaler hooks their DXGI swapchain already. spike/api11vk's `Dx11wDx12SC` gives present callbacks on a D3D12 back buffer. Add OF in-process (the same class) and the existing terminal whole-frame path. No host process. | 3-5 days on top of api11vk |
 | 32-bit D3D11 games | The same host split: a 32-bit `dxgi.dll` proxy, D3D11 `CreateSharedHandle` (NT handles) and `ID3D11Fence` (Windows 10 1703+) instead of 9On12 | 1 week |
-| FFX optical flow instead of ours | Build the FFX SDK's opticalflow component with its DX12 backend into the host, map `R16G16_SINT` 8x8 output to our vector texture | 2-3 days |
 
 [hl2-20th]: https://www.tomshardware.com/video-games/pc-gaming/half-life-2-gets-a-major-20th-anniversary-update-and-bundles-lost-coast-with-episodes-the-game-is-now-free-on-steam-until-november-18
 [pcgw-hl2]: https://www.pcgamingwiki.com/wiki/Half-Life_2

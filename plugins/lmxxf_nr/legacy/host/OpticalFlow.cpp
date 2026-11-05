@@ -6,12 +6,6 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
-#include <vector>
-
-#ifdef LMXXF_FFX_OF
-#include <FidelityFX/host/backends/dx12/ffx_dx12.h>
-#include <FidelityFX/host/ffx_opticalflow.h>
-#endif
 
 using Microsoft::WRL::ComPtr;
 
@@ -157,30 +151,6 @@ float BlockSad(int2 o, float2 v)
 }
 )";
 
-// FFX block vectors (R16G16_SINT, source pixels, one per 8x8 source block) -> our level-0 field
-constexpr const char kFfxSource[] = R"(
-Texture2D<int4> V : register(t0);
-RWTexture2D<float4> Dst : register(u0);
-cbuffer C : register(b0)
-{
-    uint2 OutSize;
-    uint2 InSize;
-    float2 Scale; // source pixels per level-0 pixel
-};
-
-[numthreads(8, 8, 1)] void FfxToLevel0(uint3 id : SV_DispatchThreadID)
-{
-    if (any(id.xy >= OutSize)) return;
-    // Bilinear between block centres
-    float2 p = (id.xy + 0.5) * Scale / 8 - 0.5;
-    int2 b = int2(floor(p)), m = int2(InSize) - 1;
-    float2 t = p - b;
-    float2 v00 = V.Load(int3(clamp(b, 0, m), 0)).xy, v10 = V.Load(int3(clamp(b + int2(1, 0), 0, m), 0)).xy;
-    float2 v01 = V.Load(int3(clamp(b + int2(0, 1), 0, m), 0)).xy, v11 = V.Load(int3(clamp(b + 1, 0, m), 0)).xy;
-    Dst[id.xy] = float4(lerp(lerp(v00, v10, t.x), lerp(v01, v11, t.x), t.y) / Scale, 0, 0);
-}
-)";
-
 void Barrier(ID3D12GraphicsCommandList* l, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b)
 {
     if (a == b)
@@ -264,10 +234,10 @@ bool OpticalFlow::Init(ID3D12Device* device, ID3D12CommandQueue* queue)
     auto compile = compiler ? (pD3DCompile) GetProcAddress(compiler, "D3DCompile") : nullptr;
     if (compile == nullptr)
         return false;
-    auto make = [&](const char* entry, ComPtr<ID3D12PipelineState>& pso, const char* text = kSource)
+    auto make = [&](const char* entry, ComPtr<ID3D12PipelineState>& pso)
     {
         ComPtr<ID3DBlob> cs, e;
-        if (FAILED(compile(text, strlen(text), "of", nullptr, nullptr, entry, "cs_5_0",
+        if (FAILED(compile(kSource, sizeof(kSource) - 1, "of", nullptr, nullptr, entry, "cs_5_0",
                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e)))
         {
             Log(OptiLog_Error, "optical flow: %s failed to compile: %s", entry, e ? (const char*) e->GetBufferPointer() : "");
@@ -281,9 +251,6 @@ bool OpticalFlow::Init(ID3D12Device* device, ID3D12CommandQueue* queue)
     if (!make("Luma", _psoLuma) || !make("Down", _psoDown) || !make("Search", _psoSearch) ||
         !make("Pixel", _psoPixel) || !make("Zero", _psoZero))
         return false;
-#ifdef LMXXF_FFX_OF
-    make("FfxToLevel0", _psoFfx, kFfxSource);
-#endif
 
     D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * kSlotDesc,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
@@ -391,9 +358,7 @@ bool OpticalFlow::Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D1
     const DXGI_FORMAT r16[3] = { DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT };
     uint32_t c[kConsts];
     bool wrote = false;
-    if (_useFfx && !zero)
-        wrote = RunFfx(list, src, srcState, linear);
-    else if (zero)
+    if (zero)
     {
         consts(c, _w[0], _h[0], 1, 1, 0, 0, 1, 1, 1.0f);
         ID3D12Resource* none[3] = {};
@@ -481,117 +446,3 @@ float OpticalFlow::GpuMs()
     std::nth_element(t, t + n / 2, t + n);
     return t[n / 2];
 }
-
-#ifdef LMXXF_FFX_OF
-struct OpticalFlow::Ffx
-{
-    std::vector<uint8_t> scratch;
-    FfxInterface iface {};
-    FfxOpticalflowContext ctx {};
-    bool ctxOk = false, valid = false;
-    uint32_t w = 0, h = 0, vw = 0, vh = 0;
-    ComPtr<ID3D12Resource> vec, scd;
-};
-
-bool OpticalFlow::UseFfx(bool on)
-{
-    if (on && !_fx && _psoFfx)
-    {
-        _fx = new Ffx;
-        _fx->scratch.resize(ffxGetScratchMemorySizeDX12(FFX_OPTICALFLOW_CONTEXT_COUNT));
-        if (ffxGetInterfaceDX12(&_fx->iface, ffxGetDeviceDX12(_dev.Get()), _fx->scratch.data(), _fx->scratch.size(),
-                                FFX_OPTICALFLOW_CONTEXT_COUNT) != FFX_OK)
-        {
-            Log(OptiLog_Error, "FFX optical flow: no DX12 backend interface");
-            delete _fx;
-            _fx = nullptr;
-        }
-    }
-    const bool use = on && _fx;
-    if (use != _useFfx)
-    {
-        _useFfx = use;
-        _valid = false;
-    }
-    return _useFfx == on;
-}
-
-bool OpticalFlow::RunFfx(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D12_RESOURCE_STATES srcState,
-                         bool linear)
-{
-    auto& f = *_fx;
-    const auto sd = src->GetDesc();
-    if (!f.ctxOk || f.w != sd.Width || f.h != sd.Height)
-    {
-        if (f.ctxOk)
-            ffxOpticalflowContextDestroy(&f.ctx);
-        f.ctxOk = f.valid = false;
-        FfxOpticalflowContextDescription cd {};
-        cd.backendInterface = f.iface;
-        cd.resolution = { (uint32_t) sd.Width, sd.Height };
-        if (ffxOpticalflowContextCreate(&f.ctx, &cd) != FFX_OK)
-        {
-            Log(OptiLog_Error, "FFX optical flow: context create failed for %llux%u", sd.Width, sd.Height);
-            return false;
-        }
-        FfxOpticalflowSharedResourceDescriptions rd {};
-        ffxOpticalflowGetSharedResourceDescriptions(&f.ctx, &rd);
-        f.vw = rd.opticalFlowVector.resourceDescription.width;
-        f.vh = rd.opticalFlowVector.resourceDescription.height;
-        f.vec = Tex(_dev.Get(), f.vw, f.vh, DXGI_FORMAT_R16G16_SINT);
-        f.scd = Tex(_dev.Get(), rd.opticalFlowSCD.resourceDescription.width, rd.opticalFlowSCD.resourceDescription.height,
-                    DXGI_FORMAT_R32_UINT);
-        f.w = (uint32_t) sd.Width;
-        f.h = sd.Height;
-        f.ctxOk = f.vec && f.scd;
-        Log(OptiLog_Info, "FFX optical flow: source %ux%u, %ux%u block vectors, level 0 %ux%u", f.w, f.h, f.vw, f.vh,
-            _w[0], _h[0]);
-        if (!f.ctxOk)
-            return false;
-    }
-    auto state = [](D3D12_RESOURCE_STATES s)
-    { return s == D3D12_RESOURCE_STATE_COMMON ? FFX_RESOURCE_STATE_COMMON : FFX_RESOURCE_STATE_COMPUTE_READ; };
-    FfxOpticalflowDispatchDescription dd {};
-    dd.commandList = ffxGetCommandListDX12(list);
-    dd.color = ffxGetResourceDX12(src, ffxGetResourceDescriptionDX12(src), L"lmxxf color", state(srcState));
-    dd.opticalFlowVector = ffxGetResourceDX12(f.vec.Get(), ffxGetResourceDescriptionDX12(f.vec.Get(), FFX_RESOURCE_USAGE_UAV),
-                                              L"lmxxf ffx vectors", FFX_RESOURCE_STATE_COMPUTE_READ);
-    dd.opticalFlowSCD = ffxGetResourceDX12(f.scd.Get(), ffxGetResourceDescriptionDX12(f.scd.Get(), FFX_RESOURCE_USAGE_UAV),
-                                           L"lmxxf ffx scd", FFX_RESOURCE_STATE_COMPUTE_READ);
-    if (!_valid) // Invalidate()
-        f.valid = false;
-    dd.reset = !f.valid;
-    // Linear input: scRGB with 1.0 = 80 nits, so FFX encodes it perceptually; else the values are already encoded
-    dd.backbufferTransferFunction = linear ? FFX_BACKBUFFER_TRANSFER_FUNCTION_SCRGB : FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
-    dd.minMaxLuminance = { 0.0f, 80.0f };
-    if (ffxOpticalflowContextDispatch(&f.ctx, &dd) != FFX_OK)
-    {
-        Log(OptiLog_Error, "FFX optical flow: dispatch failed");
-        return false;
-    }
-    const bool had = f.valid;
-    f.valid = _valid = true;
-    if (!had)
-        return false;
-    // FFX bound its own heap and root signature
-    ID3D12DescriptorHeap* heaps[] = { _heap.Get() };
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRootSignature(_root.Get());
-    uint32_t c[kConsts] {};
-    const float scale[2] = { float(f.w) / float(_w[0]), float(f.h) / float(_h[0]) };
-    c[0] = _w[0], c[1] = _h[0], c[2] = f.vw, c[3] = f.vh;
-    memcpy(&c[4], scale, 8);
-    ID3D12Resource* s[3] = { f.vec.Get(), nullptr, nullptr };
-    const DXGI_FORMAT fmt[3] = { DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT };
-    Barrier(list, _mv.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    Dispatch(list, _psoFfx.Get(), c, s, fmt, _mv.Get(), DXGI_FORMAT_R16G16_FLOAT, (_w[0] + 7) / 8, (_h[0] + 7) / 8);
-    Barrier(list, _mv.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
-    return true;
-}
-#else
-struct OpticalFlow::Ffx
-{
-};
-bool OpticalFlow::UseFfx(bool on) { return !on; }
-bool OpticalFlow::RunFfx(ID3D12GraphicsCommandList*, ID3D12Resource*, D3D12_RESOURCE_STATES, bool) { return false; }
-#endif
