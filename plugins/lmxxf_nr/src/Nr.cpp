@@ -1511,7 +1511,29 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
     list->Close();
     _ownQueue = queue;
     ID3D12CommandList* l[] = { list };
-    if (_pendingList.load() == list)
+    const bool pending = _pendingList.load() == list;
+    if (_ownCpuWait && wait != 0)
+    {
+        double ms = 0;
+        const bool done = GpuWaitDone(_hipFence.Get(), wait, 60000, nullptr, nullptr, &ms);
+        std::lock_guard lock(_mutex);
+        if (!done)
+        {
+            // never executed: Consume cancels a recorded producer, the slot fence is signalled for reuse
+            Log(OptiLog_Error, "NR (%ls): network answer not done after %.0f ms: frame dropped", name.c_str(), ms);
+            _ownStuck = true;
+            if (pending)
+                _pendingList = nullptr, _pendingProducer = false, _pendingWait = 0;
+            queue->Signal(_presentFence.Get(), _presentValue[slot]);
+            return;
+        }
+        if (ms > 250)
+            Log(OptiLog_Warn, "NR (%ls): network answer took %.0f ms (CPU wait, nothing queued behind it)", name.c_str(), ms);
+        if (pending)
+            _pendingWait = 0;
+        wait = 0;
+    }
+    if (pending)
     {
         OnExecute(queue, 1, l);
     }
@@ -1530,6 +1552,8 @@ bool NrEngine::SettleOwn()
 {
     const uint64_t value = _answerWait;
     _answerWait = 0;
+    if (std::exchange(_ownStuck, false))
+        return false;
     if (value == 0 || !_hipFence || _hipFence->GetCompletedValue() >= value)
         return true;
     const bool done = GpuWaitDone(_hipFence.Get(), value);
@@ -1612,6 +1636,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
 {
     if (!RuntimeLoaded() || in.src == nullptr || in.dst == nullptr || !Settings().enabled)
         return false;
+    _ownCpuWait = true;
     const auto sd = in.src->GetDesc();
     const uint32_t w = (uint32_t) sd.Width, h = sd.Height;
     if (!Begin(device, queue, w, h))

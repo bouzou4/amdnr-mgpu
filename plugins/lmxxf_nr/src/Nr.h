@@ -204,6 +204,8 @@ class NrEngine
     ID3D12GraphicsCommandList* NextOwnList(uint32_t* slot);
     void SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12GraphicsCommandList* list, uint64_t wait);
     uint64_t _answerWait = 0;
+    bool _ownCpuWait = false; // RunOwn (display card): HIP answers awaited on the CPU, no queue waits on HIP
+    bool _ownStuck = false;   // an answer never came: the frame's lists were dropped, its Present must be too
     bool EnsureCopies(const D3D12_RESOURCE_DESC& d);
     // Frame dump on <dumpDir>\lmxxf_nr_dump.trigger: the network output, what it was fed, and the result
     void MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result = nullptr,

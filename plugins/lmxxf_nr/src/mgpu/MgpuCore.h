@@ -26,6 +26,7 @@ struct Settings
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
     int lowLatency = 2;        // 1: Present throttles on the render card, 2: and paces the next frame (Pacer)
     bool earlySend = false;    // the send copy is queued before the wait for the display card
+    bool presentIdle = true;   // the real Present goes only to an idle display queue (bounded CPU wait)
     int dred = 0;              // DRED on the display device: 1 breadcrumbs + page faults, 2 page faults only
     bool forwardOutputs = true; // the render adapter's EnumOutputs returns the display card's outputs
 };
@@ -102,7 +103,7 @@ struct Stats
     uint64_t slotBytes = 0;
     double renderBusy = -1, displayBusy = -1;        // 3D engine use %, -1 = unknown
     std::string nrStatus;
-    uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0;
+    uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0, sendStalls = 0;
     double uiShare = -1; // share of pixels the UI composite took from the back buffer, last measured
     std::string nrSource; // what NR runs on (HUD-less mode: the HUD-less colour or the whole-frame fallback)
     bool fallback = false; // display card lost: single-GPU passthrough, no NR

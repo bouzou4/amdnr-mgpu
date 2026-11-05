@@ -231,6 +231,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.maxLead = (unsigned) std::clamp(g_keys.Int("MgpuMaxFramesAhead", 1), 1, 3);
     s.lowLatency = std::clamp(g_keys.Int("MgpuLowLatency", 2), 0, 2);
     s.earlySend = g_keys.Bool("MgpuEarlySend", false);
+    s.presentIdle = g_keys.Bool("MgpuPresentIdle", true);
     // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
     s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", false) ? 1 : 0), 0, 2);
     s.forwardOutputs = g_keys.Bool("MgpuForwardOutputs", true);
