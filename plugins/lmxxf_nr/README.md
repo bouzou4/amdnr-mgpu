@@ -44,6 +44,7 @@ Style=0            ; DLSS5_STYLE, 0 = NVIDIA's look; option -1 auto: 2 before / 
 Strength=1.0
 ColorStrength=1.0  ; share of the network's colour change: 1 as it is (faithful), 0 its luma on the game's chroma; option -1 auto: 0 before / after upscaling, 1 terminal and multi-GPU
 EditUpsample=1     ; 1080 / 1440 sizes, edit to the output: 1 guided by the output-size colour (ratio, joint bilateral 3x3), 0 bilinear + feed residual
+EditStabilise=true ; guided upsample: edit ratio accumulated at the output size (motion vectors, guide-change rejection, 3x3 spread clamp)
 Temporal=true      ; motion-fed network history, when the runtime takes it
 MultiGpu=false     ; see below, needs a restart
 RuntimeDir=        ; folder of LmxxfNrRuntime.dll, tried first
