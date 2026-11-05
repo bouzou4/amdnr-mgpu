@@ -12,6 +12,7 @@
 
 #include "mgpu/MgpuCore.h"
 #include "GpuWait.h"
+#include "Progress.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -1021,6 +1022,10 @@ void NrEngine::Consume(ID3D12GraphicsCommandList* list, uint64_t* wait, ID3D12Re
 void NrEngine::Produce(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* frame, uint64_t wait)
 {
     const bool produced = PrepareJob(list, frame);
+    // the runtime is often first to see a removal (its fence reads UINT64_MAX)
+    if (!produced && _device && FAILED(_device->GetDeviceRemovedReason()))
+        if (auto d = Progress::Describe("NR record"); !d.empty())
+            Log(OptiLog_Error, "%s", d.c_str());
     _jobSeq = -1;
     if (produced && _seqActive && _seqNext > 0 && _resetFrame == _frameId)
         SeqRestart("history reset");
@@ -1650,7 +1655,9 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
     if (_ownCpuWait && wait != 0)
     {
         double ms = 0;
+        Progress::SetPhase(Progress::AnswerWait);
         const bool done = GpuWaitDone(_hipFence.Get(), wait, 60000, nullptr, nullptr, &ms);
+        Progress::SetPhase(Progress::NrRecord);
         _ownWaitMs += ms;
         std::lock_guard lock(_mutex);
         if (!done)
@@ -1845,6 +1852,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         c.upMode = uint32_t(_settings.upsample);
         c.encoding = in.encoding;
         c.paperWhite = _settings.paperWhite / 80.0f;
+        Progress::In(list, Progress::ApplyIn);
         Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12Resource* srv[4] = { _termCopy.Get(), enh, _feed.Get(), c.useMv ? in.motion : nullptr };
         const DXGI_FORMAT fmt[4] = { sd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -1864,6 +1872,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         Barrier(list, in.dst, D3D12_RESOURCE_STATE_COPY_DEST, in.dstState);
         // whole frame: the source copy pairs the result with this frame's feed
         MaybeDump(list, enh, in.dst, in.dstState, in.src == in.dst ? _termCopy.Get() : nullptr);
+        Progress::Out(list, Progress::ApplyOut);
     };
 
     _motion = {};
@@ -1889,10 +1898,12 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         auto* list = NextOwnList(&slot);
         if (list == nullptr)
             return false;
+        Progress::In(list, Progress::FeedIn);
         Consume(list, &wait, &enh);
         copySource(list);
         feed(list);
         Produce(list, nullptr, wait);
+        Progress::Out(list, Progress::FeedOut);
         lock.unlock();
         SubmitOwn(queue, slot, list, wait);
         _answerWait = wait; // the present must not queue behind that list's wait
@@ -1919,6 +1930,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     auto* list = NextOwnList(&slot);
     if (list == nullptr)
         return false;
+    Progress::In(list, Progress::FeedIn);
     copySource(list);
     Consume(list, &wait, &enh);
     if (in.reset)
@@ -1931,6 +1943,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     Meter(list, enh, false); // the vectors are this frame's, not the answer's
     feed(list);
     Produce(list, nullptr, wait);
+    Progress::Out(list, Progress::FeedOut);
     lock.unlock();
     SubmitOwn(queue, slot, list, wait);
     _answerWait = wait;
@@ -2327,7 +2340,12 @@ void NrEngine::OnExecute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandLis
             ID3D12CommandList* l[] = { _tsList[slot * 2].Get() };
             o_ExecuteCommandLists(_queue.Get(), 1, l);
         }
+        uint32_t mark = UINT32_MAX;
+        if (ID3D12CommandList* m = Progress::NetBefore(_queue.Get(), &mark))
+            o_ExecuteCommandLists(_queue.Get(), 1, &m);
         const int32_t rc = _rt.api.EnqueueHip(_ctx, _job.handle, _queue.Get());
+        if (ID3D12CommandList* m = Progress::NetAfter(mark))
+            o_ExecuteCommandLists(_queue.Get(), 1, &m);
         if (timed)
         {
             ID3D12CommandList* l[] = { _tsList[slot * 2 + 1].Get() };

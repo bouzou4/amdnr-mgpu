@@ -94,6 +94,8 @@ void WriteRow(Probe* p, const Row& r)
 {
     fprintf(p->fp, "%llu,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d\n", r.frame, r.t[0], r.t[1], r.t[2], r.t[3], r.t[4],
             r.t[5], r.t[6], r.skipped ? 1 : 0);
+    if (r.frame % 16 == 0) // a device removal or a killed game keeps all but the last few rows
+        fflush(p->fp);
 }
 
 void Set(Probe* p, uint64_t frame, Col c, int64_t t)

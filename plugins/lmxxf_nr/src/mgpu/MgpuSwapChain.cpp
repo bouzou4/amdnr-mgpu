@@ -3,6 +3,7 @@
 #include "MgpuComposite.h"
 #include "MgpuFrameGen.h"
 #include "../GpuWait.h"
+#include "../Progress.h"
 #include "MgpuLatency.h"
 
 #include <algorithm>
@@ -152,6 +153,7 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
     if (FAILED(hr))
         return hr;
     _ddev = DisplayDevice();
+    Progress::Init(_ddev.Get());
     _dq = DisplayQueue();
     if (!_ddev || !_dq)
         return E_FAIL;
@@ -1004,6 +1006,8 @@ void ProxySwapChain::PresenterLoop()
 
         // The send lands before anything of this frame is queued: no display queue waits on the render card's fence
         // (a hitch held submitted work there for seconds; a Present behind it hung the display card)
+        Progress::SetFrame(g);
+        Progress::SetPhase(Progress::WaitSend);
         if (!WaitSend(g))
             continue;
         // FFX's work of the previous Present reads the HUD-less colour, depth and vectors this frame overwrites
@@ -1042,8 +1046,10 @@ void ProxySwapChain::PresenterLoop()
 
         // This slot's previous display work (timestamps, the UI count, the extra list) must be done.
         // not done (stop or 60 s): the slot is not reused, the loop comes back to the same frame
+        Progress::SetPhase(Progress::WaitReuse);
         if (!WaitReuse(_dFence.Get(), slotDisplayValue[s], "display", &_stop))
             continue;
+        Progress::SetPhase(Progress::Ingest);
         double ingestMs = -1;
         if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
@@ -1140,6 +1146,7 @@ void ProxySwapChain::PresenterLoop()
                         haveDp = true;
                     }
                 }
+                Progress::Out(c, Progress::IngestOut);
                 c->Close();
                 l[nl++] = c;
             }
@@ -1172,6 +1179,7 @@ void ProxySwapChain::PresenterLoop()
                 _duAlloc[s]->Reset();
                 auto* c = _duList[s].Get();
                 c->Reset(_duAlloc[s].Get(), nullptr);
+                Progress::In(c, Progress::UiIn);
                 D3D12_RESOURCE_BARRIER b[2] = { Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                                                    D3D12_RESOURCE_STATE_COPY_SOURCE),
                                                 Tr(_bbD.Get(), ns, D3D12_RESOURCE_STATE_COPY_DEST) };
@@ -1259,7 +1267,9 @@ void ProxySwapChain::PresenterLoop()
                 auto t0 = std::chrono::steady_clock::now();
                 double answerMs = 0;
                 in.answerWaitMs = &answerMs;
+                Progress::SetPhase(Progress::NrRecord);
                 const bool wrote = env.nrFrame(_ddev.Get(), _dq.Get(), in);
+                Progress::SetPhase(Progress::UiRecord);
                 // nr stays record + submit time; the CPU wait for the answer is reported on its own
                 nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - answerMs;
                 nrAnswerMs = answerMs;
@@ -1278,6 +1288,7 @@ void ProxySwapChain::PresenterLoop()
                     for (auto& x : b)
                         std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
                     c->ResourceBarrier(2, b);
+                    Progress::Out(c, Progress::UiOut);
                     c->Close();
                     ID3D12CommandList* cl[] = { c };
                     _dq->ExecuteCommandLists(1, cl);
@@ -1292,6 +1303,7 @@ void ProxySwapChain::PresenterLoop()
                 // NR off: the mask is still measured (and dumped) so the gate can be checked without NR
                 auto* c = prepUi();
                 _ui->Record(c, s, _bbD.Get(), _hudD.Get(), nullptr, nullptr, _gameDesc.Width, _gameDesc.Height);
+                Progress::Out(c, Progress::UiOut);
                 c->Close();
                 ID3D12CommandList* cl[] = { c };
                 _dq->ExecuteCommandLists(1, cl);
@@ -1300,6 +1312,7 @@ void ProxySwapChain::PresenterLoop()
             if (dump)
                 DumpTexture(_ddev.Get(), _dq.Get(), _realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                             env.dumpDir + std::format(L"\\f{:06}_display", g));
+            Progress::SetPhase(Progress::Settle);
             bool settled = !env.nrSettle || env.nrSettle();
             // Present only on an idle display queue (bounded): never a Present behind work that may not finish
             double idleMs = -1;
@@ -1335,8 +1348,12 @@ void ProxySwapChain::PresenterLoop()
                 pf |= DXGI_PRESENT_ALLOW_TEARING;
             pfUsed = pf;
             const auto tp = std::chrono::steady_clock::now();
+            Progress::SetPhase(Progress::Present);
             // an unfinished network answer: never queue the Present behind its wait
             hr = settled ? _real->Present(sync, pf) : S_OK;
+            Progress::SetPhase(Progress::Idle);
+            if (SUCCEEDED(hr))
+                Progress::Presented(g);
             const double presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
             if (presentMs > 250 || hr != _lastPresentHr)
                 Log(presentMs > 250 ? 1 : 0, std::format("real Present {:X} in {:.0f} ms (frame {})", (uint32_t) hr, presentMs, g));
@@ -1379,6 +1396,8 @@ void ProxySwapChain::PresenterLoop()
                                    rd.Flags, fd.Windowed, _lastIdleMs >= 0 ? "yes" : _lastIdleMs < -1.5 ? "no" : "unchecked", _lastIdleMs));
             }
             LogDeviceRemoved(_ddev.Get(), "display");
+            if (auto d = Progress::Describe("Present failed"); !d.empty())
+                Log(2, d);
             const HRESULT why = _ddev->GetDeviceRemovedReason();
             if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG ||
                 FAILED(why))
