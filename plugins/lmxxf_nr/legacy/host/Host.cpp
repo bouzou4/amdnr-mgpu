@@ -258,11 +258,13 @@ int wmain(int argc, wchar_t** argv)
         const uint64_t want = 2 * (last + 1) - 1;
         if (fence->GetCompletedValue() < want)
         {
+            // Re-check after the wait: a registration left by a timed-out wait keeps the auto-reset event set
             fence->SetEventOnCompletion(want, ev);
-            if (WaitForSingleObject(ev, 100) != WAIT_OBJECT_0)
+            WaitForSingleObject(ev, 100);
+            if (fence->GetCompletedValue() < want)
                 continue;
         }
-        // Answer the proxy's own frame id, never our count: the two drifted apart in Ep2 (one per frame)
+        // Answer the proxy's own frame id, never our count
         const uint64_t n = block->frame;
         if (n != last + 1)
             ++mismatches;
