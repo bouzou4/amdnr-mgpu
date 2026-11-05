@@ -1291,12 +1291,12 @@ void ProxySwapChain::PresenterLoop()
         st.ringDepth = UINT(_scheduled - g);
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
-                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms cpu wait send {:.2f} answer {:.2f} ms "
-                               "stalls {} produced {} presented {} skipped {} hudless {} missed {} ui {:.2f}% gate {} motion {}",
+                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {}",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
-                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.sendWaitMs, st.answerWaitMs, st.sendStalls,
-                               st.produced, st.presented, st.skipped,
-                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames));
+                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
+                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
+                               st.sendWaitMs, st.answerWaitMs, st.sendStalls));
     }
 }
 
