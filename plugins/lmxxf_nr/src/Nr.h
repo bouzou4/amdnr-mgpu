@@ -119,6 +119,7 @@ class NrEngine
         float mvScaleX = 1, mvScaleY = 1;
         bool reset = false;
         bool waitAnswer = false;
+        double* waitMs = nullptr; // out: CPU wait for the network answer
         uint32_t encoding = 1; // 0 linear, 1 sRGB, 2 PQ, 3 scRGB
     };
     bool RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const OwnFrame& in);
@@ -206,6 +207,7 @@ class NrEngine
     uint64_t _answerWait = 0;
     bool _ownCpuWait = false; // RunOwn (display card): HIP answers awaited on the CPU, no queue waits on HIP
     bool _ownStuck = false;   // an answer never came: the frame's lists were dropped, its Present must be too
+    double _ownWaitMs = 0;    // this RunOwn's CPU waits on HIP answers
     bool EnsureCopies(const D3D12_RESOURCE_DESC& d);
     // Frame dump on <dumpDir>\lmxxf_nr_dump.trigger: the network output, what it was fed, and the result
     void MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, ID3D12Resource* result = nullptr,

@@ -1516,6 +1516,7 @@ void NrEngine::SubmitOwn(ID3D12CommandQueue* queue, uint32_t slot, ID3D12Graphic
     {
         double ms = 0;
         const bool done = GpuWaitDone(_hipFence.Get(), wait, 60000, nullptr, nullptr, &ms);
+        _ownWaitMs += ms;
         std::lock_guard lock(_mutex);
         if (!done)
         {
@@ -1637,6 +1638,8 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     if (!RuntimeLoaded() || in.src == nullptr || in.dst == nullptr || !Settings().enabled)
         return false;
     _ownCpuWait = true;
+    _ownWaitMs = 0;
+    struct WaitOut { const OwnFrame& f; const double& v; ~WaitOut() { if (f.waitMs) *f.waitMs = v; } } waitOut { in, _ownWaitMs };
     const auto sd = in.src->GetDesc();
     const uint32_t w = (uint32_t) sd.Width, h = sd.Height;
     if (!Begin(device, queue, w, h))

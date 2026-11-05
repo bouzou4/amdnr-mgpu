@@ -776,10 +776,13 @@ bool ProxySwapChain::WaitSend(UINT64 g)
     const bool done = GpuWaitDone(_filledD.Get(), g, 60000, [](void* x) {
         auto* p = static_cast<ProxySwapChain*>(x);
         return p->_stop || p->_lost; }, this, &ms);
-    if (ms > 250)
     {
         std::lock_guard sg(StatsMutex());
-        MutableStats().sendStalls++;
+        auto& st = MutableStats();
+        if (ms > 250)
+            st.sendStalls++;
+        else
+            st.sendWaitMs = Ema(st.sendWaitMs, ms); // hitches stay out of the per-frame figure
     }
     if ((ms > 250 || !done) && _sendStallLogs++ < 30)
         Log(done ? 1 : 2, std::format("frame {}: send landed after {:.0f} ms (render card hitch), nothing queued on the "
@@ -948,7 +951,7 @@ void ProxySwapChain::PresenterLoop()
         }
         slotCounted[s] = false;
 
-        double nrMs = 0;
+        double nrMs = 0, nrAnswerMs = -1;
         bool hudFrame = false;
         HRESULT hr;
         UINT pfUsed = 0;
@@ -1111,8 +1114,12 @@ void ProxySwapChain::PresenterLoop()
                 }
                 ID3D12GraphicsCommandList* c = nullptr;
                 auto t0 = std::chrono::steady_clock::now();
+                double answerMs = 0;
+                in.answerWaitMs = &answerMs;
                 const bool wrote = env.nrFrame(_ddev.Get(), _dq.Get(), in);
-                nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                // nr stays record + submit time; the CPU wait for the answer is reported on its own
+                nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - answerMs;
+                nrAnswerMs = answerMs;
                 if (useHud)
                 {
                     c = prepUi();
@@ -1279,13 +1286,16 @@ void ProxySwapChain::PresenterLoop()
         }
         if (nrMs > 0)
             st.nrMs = Ema(st.nrMs, nrMs);
+        if (nrAnswerMs >= 0 && nrAnswerMs < 250)
+            st.answerWaitMs = Ema(st.answerWaitMs, nrAnswerMs);
         st.ringDepth = UINT(_scheduled - g);
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
-                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
-                               "hudless {} missed {} ui {:.2f}% gate {} motion {}",
+                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms cpu wait send {:.2f} answer {:.2f} ms "
+                               "stalls {} produced {} presented {} skipped {} hudless {} missed {} ui {:.2f}% gate {} motion {}",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
-                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
+                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.sendWaitMs, st.answerWaitMs, st.sendStalls,
+                               st.produced, st.presented, st.skipped,
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames));
     }
 }

@@ -26,7 +26,7 @@ struct Settings
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
     int lowLatency = 2;        // 1: Present throttles on the render card, 2: and paces the next frame (Pacer)
     bool earlySend = false;    // the send copy is queued before the wait for the display card
-    bool presentIdle = true;   // the real Present goes only to an idle display queue (bounded CPU wait)
+    bool presentIdle = false;  // the real Present goes only to an idle display queue (bounded CPU wait)
     int dred = 0;              // DRED on the display device: 1 breadcrumbs + page faults, 2 page faults only
     bool forwardOutputs = true; // the render adapter's EnumOutputs returns the display card's outputs
 };
@@ -57,6 +57,7 @@ struct NrInput
     Guides guides;     // scalars of the frame `motion` belongs to (resources not valid here)
     bool reset = false; // history must not be used (resize, gap, camera cut)
     bool waitAnswer = false;
+    double* answerWaitMs = nullptr; // out: CPU wait for the network answer inside nrFrame
 };
 
 struct Env
@@ -96,6 +97,7 @@ struct Stats
     uint64_t produced = 0, presented = 0, skipped = 0;
     double renderFrameMs = 0, displayFrameMs = 0;    // EMA of present-to-present
     double sendMs = 0, ingestMs = 0;                 // GPU time of the copy on each side
+    double sendWaitMs = 0, answerWaitMs = 0;         // presenter CPU waits: the send landing, the network answer
     double sendGBs = 0, ingestGBs = 0;
     double latencyMs = 0;                            // proxy Present -> real Present (CPU)
     double nrMs = 0;                                 // CPU time of the NR record+submit
