@@ -78,6 +78,27 @@ Whole-frame NR includes the HUD; that is the prototype. For clean captures the r
 1. A static-pixel UI mask: the optical flow already marks pixels whose vector is zero and whose luma is stable while the scene around them moves. Over a few hundred frames that classifies HUD rectangles. Edits there are dropped. Cheap, heuristic, wrong while the camera is still.
 2. A HUD-less copy by draw interception: D3D9 games draw the HUD last with z off and an orthographic projection. A proxy that copies the back buffer before the first such draw (a state heuristic like OptiScaler's HUDfix) gives a HUD-less frame and makes terminal-style compositing possible. More work and per-engine tuning, but exact.
 
+### 4.1 Controls (hotkeys and menu)
+
+There is no OptiScaler menu in a 32-bit game, so the proxy draws its own: Dear ImGui (OptiScaler's vendored copy under `src/OptiScaler/include/imgui`, DX12 backend, stb_truetype instead of FreeType) on the unwrapped back buffer, recorded on the proxy's D3D12 queue after the host's answer is copied back and before the buffer goes back to 9On12.
+
+| Key (default) | Action | ini key (`[Legacy]`, VK code) |
+|---|---|---|
+| Insert | menu open / closed (Esc also closes it) | `KeyMenu` |
+| End | NR on / off (frames skip the host) | `KeyNr` |
+| Page Up | network size 1080 tier -> 1440 -> native (live; the network rebuilds for a few seconds) | `KeySize` |
+| Page Down | network history on / off | `KeyHistory` |
+| Home | optical flow on / off (off: zero vectors, static history) | `KeyFlow` |
+
+- The keys are unbound in HL2's defaults, and no modifiers are used because the player's config binds Ctrl and Alt. A window subclass on the device window handles them, and the game never sees them. Each press shows a 2 s toast and logs a line. `Hotkeys=0` / `Overlay=0` turn them off, `StartupHint=0` drops the start-up toast.
+- The menu has preset, NR, network size, model, passes, style, strength, colour, guided edit upsample, stabiliser, history and motion source.
+  - Live readouts: fps, host NR / network / optical flow ms, the proxy's wait, network resolution, frames with / without NR, bypassed frames, host timeouts, skipped frames, failed presents and the flicker meter.
+  - Changes go to the host through `Legacy::Control` in the shared block (version 2, layout asserted in both builds); the host applies them when its serial changes. They are saved to `lmxxf_legacy.ini` 0.5 s after the last change.
+- Input while the menu is open: key presses, characters, mouse buttons, wheel and `WM_INPUT` are kept from the game. Releases pass so that a key held when the menu opened does not stick. The cursor is drawn by ImGui and moves with raw mouse deltas (the game keeps the OS cursor captured), or with client positions when no raw input comes. Keyboard navigation works too.
+- Tests without input: `proxy_keys.trigger` in the dump folder (action names `menu`, `nr`, `size`, `history`, `flow`, one per line) runs the same actions. `proxy_dump.trigger` writes the presented back buffer, overlay included, to `proxy_frame.bmp`. The test title takes a key script (`ms:vk,...`) and posts the keys to its own window.
+- The lmxxf runtime polls `GetAsyncKeyState` itself: F9 cycles `DLSS5_MULTI_PASS` and rewrites its `custom-config.txt`, and F8 toggles ViT reuse. HL2 binds F9 to quick load. `Runtime::Load` turns both off (`DLSS5_MULTI_PASS_HOTKEY=0`, `DLSS5_VIT_REUSE_HOTKEY=0`). F7 (the runtime's text overlay) has no switch.
+- Both logs open with `FILE_SHARE_READ`, so they can be tailed while the game runs.
+
 ## 5. Automation (Ep2)
 
 - Registry entry: `data\games.json` `hl2ep2` (exe `hl2.exe`, appid 420, the game root as `dir`).

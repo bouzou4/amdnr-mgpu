@@ -3,6 +3,7 @@
 // prep_seq.py) is played through OpticalFlow + NrEngine::RunOwn on one adapter, in passes of N frames that start
 // with a history reset; the last pass's answers and vectors are written for scoring.
 // lmxxf_legacy_host.exe --selftest <in> <out> <off|of|zero|game> <model 0|1> <pci bus> <runtime> <modules> <weights>
+//     [Key=v,...: EditStabilise, EditUpsample, NetworkSize, MultiPass]
 #include "../../src/Nr.h"
 #include "OpticalFlow.h"
 
@@ -241,6 +242,23 @@ int SelfTest(int argc, wchar_t** argv)
     s.model = model;
     s.temporal = mode != L"off";
     s.meter = false;
+    for (std::wstring kv = argc > 10 ? argv[10] : L""; !kv.empty();)
+    {
+        const size_t c = kv.find(L','), e = kv.find(L'=');
+        const std::wstring k = kv.substr(0, e);
+        const int v = e == std::wstring::npos ? 0 : _wtoi(kv.c_str() + e + 1);
+        if (k == L"EditStabilise")
+            s.stabilise = v != 0;
+        else if (k == L"EditUpsample")
+            s.upsample = v;
+        else if (k == L"NetworkSize")
+            s.size = (NetworkSize) v;
+        else if (k == L"MultiPass")
+            s.passes = v;
+        kv = c == std::wstring::npos ? L"" : kv.substr(c + 1);
+    }
+    Log(OptiLog_Info, "selftest: stabilise %d upsample %d size %d passes %d", s.stabilise, s.upsample, (int) s.size,
+        s.passes);
     auto& nr = Engine();
     nr.name = L"selftest";
     nr.Configure(s);
