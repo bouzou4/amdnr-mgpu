@@ -1053,7 +1053,9 @@ void ProxySwapChain::PresenterLoop()
             {
                 NrInput in;
                 const auto now = std::chrono::steady_clock::now();
-                const bool gap = _lastNr.time_since_epoch().count() &&
+                // a frame dump's stall is not a pause: no history reset (the dumped frames would show a reset frame)
+                const bool dumpStall = g >= _dumpFrom && g <= _dumpTo;
+                const bool gap = _lastNr.time_since_epoch().count() && !dumpStall &&
                                  std::chrono::duration<double, std::milli>(now - _lastNr).count() > 250.0;
                 _lastNr = now;
                 if (haveMv)

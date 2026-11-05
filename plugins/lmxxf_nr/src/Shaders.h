@@ -152,10 +152,26 @@ void Stats(uint3 gt : SV_GroupThreadID)
         Dst[uint2(0, 0)] = float4(scale, gsHigh[0] / 4096.0, autoScale, 0);
 }
 
+// Bilinear t at uv plus the feed pixel's residual: the box of the target pixels over a feed pixel is that pixel
+// (the feed's box filter undone; plain bilinear halves the edit at the feed's Nyquist)
+float3 Up(Texture2D<float4> t, float2 uvScale, float2 uv)
+{
+    float2 fs;
+    Fed.GetDimensions(fs.x, fs.y);
+    fs *= FedUvScale;
+    float2 ci = (floor(uv * fs) + 0.5) / fs;
+    float2 q = max(0.5 / fs - 0.5 / float2(Size), 0);
+    float3 box = t.SampleLevel(Lin, (ci + float2(-q.x, -q.y)) * uvScale, 0).rgb +
+                 t.SampleLevel(Lin, (ci + float2(q.x, -q.y)) * uvScale, 0).rgb +
+                 t.SampleLevel(Lin, (ci + float2(-q.x, q.y)) * uvScale, 0).rgb +
+                 t.SampleLevel(Lin, (ci + float2(q.x, q.y)) * uvScale, 0).rgb;
+    return t.SampleLevel(Lin, uv * uvScale, 0).rgb + t.SampleLevel(Pt, ci * uvScale, 0).rgb - box * 0.25;
+}
+
 // Network space edit at uv for colour c: below ColorStrength 1 part of it is the network's luma ratio on c's own chroma
 float3 Edit(float2 uv, float3 c)
 {
-    float3 enh = Enh.SampleLevel(Lin, uv * EnhUvScale, 0).rgb, fed = Fed.SampleLevel(Lin, uv * FedUvScale, 0).rgb;
+    float3 enh = Up(Enh, EnhUvScale, uv), fed = Up(Fed, FedUvScale, uv);
     float3 e = enh - fed;
     if (ColorStrength >= 1)
         return e;
