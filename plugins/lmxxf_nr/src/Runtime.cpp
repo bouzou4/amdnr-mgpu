@@ -132,6 +132,10 @@ bool ResolveRuntime(const Autoconfig::RuntimeCandidate& c, const std::wstring& e
 bool Runtime::Load(const RuntimePaths& paths)
 {
     tried = true;
+    // The runtime polls GetAsyncKeyState: F9 cycles DLSS5_MULTI_PASS and rewrites custom-config.txt, F8 the ViT reuse.
+    // Games bind those keys (HL2: F9 quick load); the plugin owns these settings. Set before load: env beats the files.
+    SetRuntimeEnv("DLSS5_MULTI_PASS_HOTKEY", "0");
+    SetRuntimeEnv("DLSS5_VIT_REUSE_HOTKEY", "0");
     searched.clear();
     for (const auto& c : paths.candidates)
     {
