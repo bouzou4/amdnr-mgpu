@@ -1,6 +1,6 @@
 // Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../../LICENSE.
 // x86 D3D9Ex title for the legacy pair without a game: squares moving 3 px per frame right on a hidden window.
-// Usage: lmxxf_legacy_test.exe <path to proxy d3d9.dll> [frames] [width] [height]
+// Usage: lmxxf_legacy_test.exe <path to proxy d3d9.dll> [seconds] [width] [height]
 #include <windows.h>
 #include <d3d9.h>
 
@@ -11,7 +11,7 @@ int wmain(int argc, wchar_t** argv)
 {
     if (argc < 2)
         return 2;
-    const int frames = argc > 2 ? _wtoi(argv[2]) : 600;
+    const double seconds = argc > 2 ? _wtof(argv[2]) : 10.0;
     const UINT w = argc > 3 ? _wtoi(argv[3]) : 1280, h = argc > 4 ? _wtoi(argv[4]) : 720;
     HMODULE d3d9 = LoadLibraryW(argv[1]);
     auto create = d3d9 ? (HRESULT(WINAPI*)(UINT, IDirect3D9Ex**)) GetProcAddress(d3d9, "Direct3DCreate9Ex") : nullptr;
@@ -44,9 +44,12 @@ int wmain(int argc, wchar_t** argv)
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
-    int failed = 0;
-    for (int i = 0; i < frames; ++i)
+    int failed = 0, frames = 0;
+    for (int i = 0;; ++i, ++frames)
     {
+        QueryPerformanceCounter(&t1);
+        if (double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart) >= seconds)
+            break;
         dev->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(70, 90, 110), 1.0f, 0);
         D3DRECT r[64];
         int n = 0;

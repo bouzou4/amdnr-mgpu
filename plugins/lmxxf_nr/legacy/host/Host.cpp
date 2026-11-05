@@ -140,10 +140,23 @@ namespace Mgpu
 void Log(int level, const std::string& s) { ::Log((OptiLogLevel) std::clamp(level + 1, 0, 3), "%s", s.c_str()); }
 } // namespace Mgpu
 
+int SelfTest(int argc, wchar_t** argv);
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc < 3)
         return 2;
+    if (wcscmp(argv[1], L"--selftest") == 0)
+    {
+        _wfopen_s(&g_log, (std::wstring(argv[3]) + L"\\selftest.log").c_str(), L"w");
+        static OptiPluginApi api {};
+        api.size = sizeof(api);
+        api.Log = HostLog;
+        g_api = &api;
+        o_ExecuteCommandLists = Execute;
+        const int r = SelfTest(argc, argv);
+        TerminateProcess(GetCurrentProcess(), r); // skip HIP teardown at exit
+    }
     const DWORD gamePid = (DWORD) _wtoi(argv[1]);
     g_ini = argv[2];
     std::wstring logDir = IniStr(L"Legacy", L"LogDir");
@@ -314,7 +327,7 @@ int wmain(int argc, wchar_t** argv)
         ++processed;
 
         const ULONGLONG now = GetTickCount64();
-        if (now - lastLog >= 10000)
+        if (now - lastLog >= 4000)
         {
             const auto st = nr.Stats();
             block->hostMs = st.hipMs;

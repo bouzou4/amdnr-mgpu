@@ -38,14 +38,15 @@ cbuffer C : register(b0)
     uint HasParent;
     uint2 ParentBlocks;
     float ZeroBias;
-    float Pad;
+    float Linear; // Luma: the source is linear, encode it for matching
 };
 
 [numthreads(8, 8, 1)] void Luma(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= OutSize)) return;
-    float3 c = T0.SampleLevel(Lin, (id.xy + 0.5) / float2(OutSize), 0).rgb;
-    Dst[id.xy] = dot(saturate(c), float3(0.299, 0.587, 0.114));
+    float3 c = saturate(T0.SampleLevel(Lin, (id.xy + 0.5) / float2(OutSize), 0).rgb);
+    if (Linear != 0) c = pow(c, 1 / 2.2);
+    Dst[id.xy] = dot(c, float3(0.299, 0.587, 0.114));
 }
 
 [numthreads(8, 8, 1)] void Down(uint3 id : SV_DispatchThreadID)
@@ -56,6 +57,8 @@ cbuffer C : register(b0)
               T0.Load(int3(min(p + int2(0, 1), m), 0)).x + T0.Load(int3(min(p + 1, m), 0)).x;
     Dst[id.xy] = s * 0.25;
 }
+
+static const float kStill = 2.0 / 255; // mean luma difference treated as no motion
 
 float BlockSad(int2 o, float2 v)
 {
@@ -78,6 +81,8 @@ float BlockSad(int2 o, float2 v)
     int2 o = int2(id.xy) * 8;
     float2 best = 0;
     float bestS = BlockSad(o, 0) * ZeroBias;
+    // Unchanged within noise: still, no search (flat or static areas would pick noise vectors)
+    if (bestS < kStill * 64) { Dst[id.xy] = float4(0, 0, bestS / 64, 0); return; }
     if (HasParent)
     {
         int2 pb = int2(id.xy) / 2, pm = int2(ParentBlocks) - 1;
@@ -114,7 +119,15 @@ float BlockSad(int2 o, float2 v)
     if (any(id.xy >= OutSize)) return;
     int2 p = int2(id.xy), m = int2(OutSize) - 1, bm = int2(ParentBlocks) - 1, b = p / 8;
     float2 best = 0;
-    float bestS = 1e9;
+    float bestS = 0;
+    [unroll] for (int y0 = -1; y0 <= 1; ++y0)
+        [unroll] for (int x0 = -1; x0 <= 1; ++x0)
+        {
+            int2 q = clamp(p + int2(x0, y0), 0, m);
+            bestS += abs(T0.Load(int3(q, 0)).x - T1.Load(int3(q, 0)).x);
+        }
+    if (bestS < kStill * 9) { Dst[id.xy] = 0; return; }
+    bestS *= ZeroBias;
     [unroll] for (int j = -1; j <= 1; ++j)
         [unroll] for (int i = -1; i <= 1; ++i)
         {
@@ -318,7 +331,8 @@ void OpticalFlow::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState*
     list->Dispatch(gx, gy, 1);
 }
 
-bool OpticalFlow::Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D12_RESOURCE_STATES srcState, bool zero)
+bool OpticalFlow::Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D12_RESOURCE_STATES srcState, bool zero,
+                      bool linear)
 {
     const auto sd = src->GetDesc();
     if (!Ensure((uint32_t) sd.Width, sd.Height))
@@ -366,6 +380,8 @@ bool OpticalFlow::Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D1
             const DXGI_FORMAT f[3] = { l == 0 ? SrvFormat(sd.Format) : DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT,
                                        DXGI_FORMAT_R16_FLOAT };
             consts(c, _w[l], _h[l], l ? _w[l - 1] : (uint32_t) sd.Width, l ? _h[l - 1] : sd.Height, 0, 0, 1, 1, 1.0f);
+            const float lin = linear && l == 0 ? 1.0f : 0.0f;
+            memcpy(&c[11], &lin, 4);
             Barrier(list, cur[l].Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             Dispatch(list, l == 0 ? _psoLuma.Get() : _psoDown.Get(), c, s, f, cur[l].Get(), DXGI_FORMAT_R16_FLOAT,
                      groups(_w[l]), groups(_h[l]));
@@ -387,7 +403,7 @@ bool OpticalFlow::Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D1
                 Barrier(list, _vec[l].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
             }
             ID3D12Resource* s[3] = { cur[0].Get(), prev[0].Get(), _vec[0].Get() };
-            consts(c, _w[0], _h[0], _w[0], _h[0], 0, 1, _bw[0], _bh[0], 1.0f);
+            consts(c, _w[0], _h[0], _w[0], _h[0], 0, 1, _bw[0], _bh[0], 0.9f);
             Barrier(list, _mv.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             Dispatch(list, _psoPixel.Get(), c, s, r16, _mv.Get(), DXGI_FORMAT_R16G16_FLOAT, groups(_w[0]),
                      groups(_h[0]));

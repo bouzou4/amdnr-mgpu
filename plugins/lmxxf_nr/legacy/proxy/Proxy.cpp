@@ -78,6 +78,7 @@ std::wstring g_bypassPath; // <DumpDir>\proxy_bypass.trigger: while it exists fr
 bool g_bypass = false;
 
 // Stats
+std::atomic<uint64_t> g_failedPresents { 0 };
 uint64_t g_presents = 0, g_sent = 0, g_returned = 0, g_timeouts = 0, g_skipped = 0;
 LARGE_INTEGER g_freq {}, g_lastStat {};
 double g_waitMsSum = 0;
@@ -253,15 +254,15 @@ void Stats()
     if (g_lastStat.QuadPart == 0)
         g_lastStat = now;
     const double s = double(now.QuadPart - g_lastStat.QuadPart) / double(g_freq.QuadPart);
-    if (s < 10.0)
+    if (s < 4.0)
         return;
     const uint64_t frames = g_presents;
     static uint64_t lastFrames = 0, lastReturned = 0;
     const double fps = double(frames - lastFrames) / s;
     const uint64_t ret = g_returned - lastReturned;
     Log("pacing: %.1f fps, %llu presents, %llu returned from the host (%llu in window), %llu timeouts, %llu skipped, "
-        "host wait %.2f ms/frame, host %s state %d gpu %.2f ms, of %.2f ms, flk %.5f / %.5f, %s",
-        fps, frames, g_returned, ret, g_timeouts, g_skipped, ret ? g_waitMsSum / double(ret) : 0.0,
+        "%llu failed presents, host wait %.2f ms/frame, host %s state %d gpu %.2f ms, of %.2f ms, flk %.5f / %.5f, %s",
+        fps, frames, g_returned, ret, g_timeouts, g_skipped, g_failedPresents.load(), ret ? g_waitMsSum / double(ret) : 0.0,
         HostAlive() ? "up" : "down", g_block ? g_block->hostState : -1, g_block ? g_block->hostMs : 0.f,
         g_block ? g_block->ofMs : 0.f, g_block ? g_block->flkStatic : 0.f, g_block ? g_block->flkMc : 0.f,
         g_block ? g_block->status : "");
@@ -386,7 +387,10 @@ HRESULT STDMETHODCALLTYPE hkPresent(IDirect3DDevice9* d, const RECT* a, const RE
     if (!(g_firstCalls.fetch_or(1) & 1))
         Log("first Present");
     OnPresent(d);
-    return o_Present(d, a, b, w, r);
+    const HRESULT hr = o_Present(d, a, b, w, r);
+    if (FAILED(hr) && g_failedPresents++ < 10)
+        Log("Present failed: %08x", hr);
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE hkPresentEx(IDirect3DDevice9Ex* d, const RECT* a, const RECT* b, HWND w, const RGNDATA* r,
                                       DWORD f)
@@ -394,7 +398,10 @@ HRESULT STDMETHODCALLTYPE hkPresentEx(IDirect3DDevice9Ex* d, const RECT* a, cons
     if (!(g_firstCalls.fetch_or(2) & 2))
         Log("first PresentEx (flags %lx)", f);
     OnPresent(d);
-    return o_PresentEx(d, a, b, w, r, f);
+    const HRESULT hr = o_PresentEx(d, a, b, w, r, f);
+    if (FAILED(hr) && g_failedPresents++ < 10)
+        Log("PresentEx failed: %08x", hr);
+    return hr;
 }
 
 void FixParams(D3DPRESENT_PARAMETERS* p, const char* where)

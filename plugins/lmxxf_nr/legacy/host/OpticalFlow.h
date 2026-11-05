@@ -15,7 +15,8 @@ class OpticalFlow
     bool Init(ID3D12Device* device, ID3D12CommandQueue* queue);
     // Records on list: src (an SRV-readable colour texture in srcState) becomes this frame's pyramid, and the vectors
     // against the last frame's go to Vectors(). False on the first frame of a size (no previous frame: no vectors).
-    bool Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D12_RESOURCE_STATES srcState, bool zero);
+    bool Run(ID3D12GraphicsCommandList* list, ID3D12Resource* src, D3D12_RESOURCE_STATES srcState, bool zero,
+             bool linear = false);
     ID3D12Resource* Vectors() const { return _mv.Get(); } // R16G16_FLOAT, NON_PIXEL_SHADER_RESOURCE after Run
     uint32_t Width() const { return _w[0]; }
     uint32_t Height() const { return _h[0]; }
