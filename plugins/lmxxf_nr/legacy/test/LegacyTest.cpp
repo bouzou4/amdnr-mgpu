@@ -1,8 +1,9 @@
 // Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../../LICENSE.
 // x86 D3D9Ex title for the legacy pair without a game: squares moving 3 px per frame right on a hidden window.
-// Usage: lmxxf_legacy_test.exe <path to proxy d3d9.dll> [seconds] [width] [height] [pause ms] [keys]
+// Usage: lmxxf_legacy_test.exe <path to proxy d3d9.dll> [seconds] [width] [height] [pause ms] [keys] [flags]
 // keys: "ms:vk,ms:vk,..." key presses posted to the title's own window (the proxy's hotkeys and menu), no system input
 // pause ms: one present-free gap at a third of the run, like a game's level load
+// flags: 1 show the window (without activating it), 2 exclusive fullscreen
 #include <windows.h>
 #include <d3d9.h>
 
@@ -28,6 +29,7 @@ int wmain(int argc, wchar_t** argv)
         keys[nKeys++] = { ms / 1000.0, UINT(wcstoul(e + 1, &e, 0)), false };
         k = *e == L',' ? e + 1 : e;
     }
+    const int flags = argc > 7 ? _wtoi(argv[7]) : 0;
     HMODULE d3d9 = LoadLibraryW(argv[1]);
     auto create = d3d9 ? (HRESULT(WINAPI*)(UINT, IDirect3D9Ex**)) GetProcAddress(d3d9, "Direct3DCreate9Ex") : nullptr;
     if (!create)
@@ -39,6 +41,8 @@ int wmain(int argc, wchar_t** argv)
     RegisterClassW(&wc);
     HWND wnd = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"lmxxf legacy test", WS_POPUP, 0, 0, w, h, nullptr,
                                nullptr, wc.hInstance, nullptr);
+    if (flags & 1)
+        ShowWindow(wnd, SW_SHOWNOACTIVATE);
     IDirect3D9Ex* d3d = nullptr;
     if (FAILED(create(D3D_SDK_VERSION, &d3d)))
         return printf("create failed\n"), 4;
@@ -49,11 +53,14 @@ int wmain(int argc, wchar_t** argv)
     pp.BackBufferCount = 1;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     pp.hDeviceWindow = wnd;
-    pp.Windowed = TRUE;
+    pp.Windowed = (flags & 2) ? FALSE : TRUE;
     pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    D3DDISPLAYMODEEX mode { sizeof(mode), w, h, 60, D3DFMT_X8R8G8B8, D3DSCANLINEORDERING_PROGRESSIVE };
+    if (flags & 2)
+        pp.FullScreen_RefreshRateInHz = 60;
     IDirect3DDevice9Ex* dev = nullptr;
     HRESULT hr = d3d->CreateDeviceEx(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, wnd, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp,
-                                     nullptr, &dev);
+                                     (flags & 2) ? &mode : nullptr, &dev);
     if (FAILED(hr))
         return printf("CreateDeviceEx %08lx\n", hr), 5;
     LARGE_INTEGER f, t0, t1;

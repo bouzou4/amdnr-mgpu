@@ -213,7 +213,12 @@ void Menu()
     ImGui::TextDisabled("Size, model, passes and style rebuild the network (a few seconds without NR).");
 
     ImGui::Separator();
-    ImGui::Text("%.1f fps (%.2f ms)   %ux%u", r.fps, r.frameMs, r.outW, r.outH);
+    ImGui::Text("%.1f fps (%.2f ms)   %ux%u   latency %.1f ms", r.fps, r.frameMs, r.outW, r.outH, r.latencyMs);
+    if (r.mgpu && r.mgpuOff)
+        ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "Two GPUs: presenter stopped (see the proxy log), no NR");
+    else if (r.mgpu)
+        ImGui::Text("Two GPUs: game %.1f fps, %llu frames dropped (ring full), %llu not shown (window hidden)",
+                    r.gameFps, r.dropped, r.occluded);
     if (!r.on12)
         ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "D3D9On12 is off: no NR");
     else if (!r.hostUp)

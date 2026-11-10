@@ -18,10 +18,13 @@ struct Settings
 
 struct Readouts
 {
-    float fps = 0, frameMs = 0;
+    float fps = 0, frameMs = 0; // shown on the screen (multi-GPU: the presenter's)
+    float gameFps = 0, latencyMs = 0; // the game's presents; its present call -> real present
     float hostMs = 0, netMs = 0, ofMs = 0, waitMs = 0, proxyWaitMs = 0;
     uint32_t feedW = 0, feedH = 0, outW = 0, outH = 0;
     uint64_t presents = 0, timeouts = 0, skipped = 0, bypassed = 0, failedPresents = 0, nrFrames = 0, passFrames = 0;
+    uint64_t dropped = 0, occluded = 0; // multi-GPU: game frames never sent (ring full), frames not presented
+    bool mgpu = false, mgpuOff = false;
     int hostState = 0;
     bool hostUp = false, applied = true, on12 = false;
     uint32_t caps = 0;

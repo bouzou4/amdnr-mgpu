@@ -98,6 +98,7 @@ There is no OptiScaler menu in a 32-bit game, so the proxy draws its own: Dear I
 - Tests without input: `proxy_keys.trigger` in the dump folder (action names `menu`, `nr`, `size`, `history`, `flow`, one per line) runs the same actions. `proxy_dump.trigger` writes the presented back buffer, overlay included, to `proxy_frame.bmp`. The test title takes a key script (`ms:vk,...`) and posts the keys to its own window.
 - The lmxxf runtime polls `GetAsyncKeyState` itself: F9 cycles `DLSS5_MULTI_PASS` and rewrites its `custom-config.txt`, and F8 toggles ViT reuse. HL2 binds F9 to quick load. `Runtime::Load` turns both off (`DLSS5_MULTI_PASS_HOTKEY=0`, `DLSS5_VIT_REUSE_HOTKEY=0`). F7 (the runtime's text overlay) has no switch.
 - Both logs open with `FILE_SHARE_READ`, so they can be tailed while the game runs.
+- With `MultiGpu=1` the menu draws on the display card's swapchain (section 7).
 
 ## 5. Automation (Ep2)
 
@@ -177,16 +178,56 @@ This is the second game, and it needed no proxy changes. It ran the UI build and
 - Timeouts (250 ms) happen at the first frames and around every frame or sequence dump. At 2560x1440 the host is still busy with a dump when the proxy's wait ends. After a timeout the proxy presents raw frames until the host catches up. Between dumps that was 250-650 raw frames per 4 s window, and fps reads 80-180 there. The steady phases and the play-install launch had no timeouts.
 - Automation: `data\legacy\crysis2_probe.ps1` runs with `-dx9`, a brightness gate, and bypass / NR / menu / history-off phases. `c2_sample.ps1` samples the threads of a stuck process. The probe restores `system.cfg` and `Saved Games\Crysis2` byte-exact (the game rewrites `Profiles\default\*.xml` at every start) and removes `Game.log` and other new files from the game folder.
 
-## 7. Multi-GPU (design)
+## 7. Multi-GPU (`MultiGpu=1`)
 
-The host already opens its own device on the adapter the proxy names, so the split maps onto the existing ring with one change: the proxy's 9On12 device goes to the render card (bus 7). The host runs on the display card (bus 3).
+The game renders on the render card (bus 7, no outputs). NR and presenting happen on the display card (bus 3). The host is unchanged: it opens the adapter whose LUID the proxy writes into the block, which is now the display card's.
 
-- A cross-process texture can't be shared across adapters, so the frame crosses as a **cross-adapter shared heap** (`D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER`, row-major, in system memory). The render card copies into it, the display card copies out, and the fences are shared cross-adapter as well. That is the same mechanism as `mgpu/MgpuSwapChain`'s ring, minus the swapchain proxy.
-- Presenting: the frame has to reach the screen from the display card. Two ways:
-  1. The result comes back over the ring to the render card, and the game's own D3D9 present goes through Windows' cross-adapter present. That is one more PCIe trip and a hybrid present, but it is simple.
-  2. The proxy owns a DXGI flip swapchain for the game's HWND on a second D3D12 device on the display card, inside the game process, and the D3D9 present is skipped. The NR'd frame then comes back from the host on the same card, as a same-adapter shared texture. This is the mgpu design and the better one.
-- Cost model from the spike rules: about 0.065 ms of render time per MB written to system memory. 1080p BGRA8 is 8.3 MB, so about 0.54 ms per frame on the render card, and about 1.1 ms with option 1's return trip.
-- Not built: Ep2 renders hundreds of fps on one card, so the second card only pays off for NR cost, which is already measured for the ring in Satisfactory.
+```
+ 32-bit game process                                                         x64 host (display card)
+ game thread:  9On12 on the render card's D3D12 device
+   Present hook: back buffer -> ring slot m % 3 (cross-adapter heap, system memory)
+                 Signal send fence m (cross-adapter) ; the real Present is skipped
+ presenter thread (display card device + DXGI flip swapchain on the game's window):
+   CPU wait send fence (newest m: older frames are skipped)
+   slot -> shared frame texture ; Signal ingest m (the game may refill the slot)
+   Signal 2n-1 ------------------------------------------------------------> OF + NrEngine::RunOwn
+   CPU wait 2n (250 ms) <---------------------------------------------------- Signal 2n
+   frame texture -> swapchain back buffer, overlay, Present
+```
+
+- **9On12 on a card without outputs.** D3D9 adapters are outputs, so every one is on the display card. d3d9.dll and 9On12 (`Adapter::Adapter` in the 9On12 source) both take the app's D3D12 device only if its LUID is the adapter's. Otherwise d3d9.dll silently creates a native D3D9 device on the display card (QI for `IDirect3DDevice9On12` fails). The proxy therefore patches `ID3D12Device::GetAdapterLuid` (vtable slot 43) so that the render device reports the display card's LUID, but only on the thread and only while `Direct3DCreate9On12(Ex)` and `CreateDevice(Ex)` run. Outside those calls the real LUID comes back (self-checked at start-up). Swapping the runtime's KMT adapter for the render card's instead made `CreateDeviceEx` fail with D3DERR_NOTAVAILABLE.
+- **Render card choice:** the adapter on a PCI bus (D3DKMT adapter address) without outputs, other than the display card. `MgpuRenderBus` forces a bus. DXGI lists two extra R9700 entries with no bus; they are skipped.
+- **Ring:** 3 row-major buffers in one `D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER` heap, created on the display card and opened on the render card. The send fence is created shared cross-adapter on the render card. The game waits on the CPU, never longer than `TimeoutMs`, until the presenter has ingested frame m - `MgpuAhead` (default 1), so it renders frame N+1 while the host runs NR on N. A frame whose slot is not free in time is dropped (`dropped`). A resize recreates the ring; the old one is released once both queues have passed it.
+- **Waits (the main plugin's lessons, data\hang\ROOTCAUSE.md):** the presenter waits for the send on the CPU before anything of the frame is queued on the display card. The display card's queues hold no wait on a render-card fence. The host's GPU wait is on a display-card fence that the presenter's queue signals, and it has already completed when queued, because the host waits on the CPU first. Every CPU wait has a timeout. The presenter stops (and the game's own present takes over, without NR) at the first device-removed or failed Present (`DeviceLost`).
+- **Presenting:** a flip-discard swapchain (3 buffers, tearing when the game asked for an immediate interval) on the game's window, created by the presenter thread on the display card's queue. A minimised or occluded window gets test presents only.
+- **Overlay:** the menu and toasts draw on the swapchain back buffer on the display card. `proxy_dump.trigger` dumps that buffer. The menu shows the game's fps, latency, dropped and hidden frames.
+- **Fullscreen.** 9On12 runs the device windowed, because the render card has no output to own. The game's own `D3DPRESENT_PARAMETERS` keep its fullscreen request: the runtime gets a copy, and the game's struct gets the results back. When the game read back `Windowed=TRUE`, Crysis 2 switched itself to windowed.
+  - `MgpuFullscreen=1` (default): the window covers its monitor, and DWM scales the game-sized swapchain.
+  - `0`: the window stays as the game made it.
+  - `2`: also switches the display mode (CDS_FULLSCREEN) in the CreateDevice/Reset hook. The windowed 9On12 device then reports D3DERR_DEVICELOST and never recovers: Crysis 2 stalls in its lost-device loop.
+  - `3`: DXGI exclusive fullscreen (`SetFullscreenState`). Crysis 2 pauses the same way.
+  - While the proxy moves the window or changes the mode, the game's window proc does not see the resulting messages (`g_shieldUntil`).
+- Keys (`[Legacy]`): `MultiGpu`, `MgpuAhead` (1-2), `MgpuFullscreen` (0-3), `MgpuRenderBus`, `MgpuSyncInterval` (-1 = the game's interval).
+- Latency below is the time from the game's present call to the real Present of that frame. Single-GPU, that is the host round trip; multi-GPU, it is the ring wait plus NR plus the present.
+
+### 7.1 Results (2026-11-10, bus 7 at PCIe **2.0** x8: functional, not a perf baseline)
+
+Bus 7 came up as Gen2 (warm boot), so a send takes 2-8 ms instead of about 0.5 ms. Network Full, 1440, 2 passes, history + OF, runtime `stage\current`. The NR rows are "steady" 4 s windows: no timeout, every shown frame answered by the host. Dumps cause timeouts, and after a timeout raw frames are mixed in until the host catches up, in both modes.
+
+| Case | fps single / multi | latency ms single / multi | host GPU ms | failed presents | device errors |
+|---|---|---|---|---|---|
+| Test title, 1920x1080 windowed | 49.2 / 49.0 | 20.0 / 40.4 | 17.6 | 0 / 0 | none |
+| Ep2 `ep2_outland_01`, 1920x1080 windowed | 47.2 / 49.4 | 20.4 / 40.1 | 17.4-17.8 | 0 / 0 | none |
+| Crysis 2 title screen, 2560x1440 (multi: `MgpuFullscreen=0`) | 28.6 / 29.5 | 34.5 / 67.1 | 29.6-30.4 | 0 / 0 | none |
+| **Crysis 2 in a level** (`Downtown`, standing), 2560x1440 fullscreen (multi: `MgpuFullscreen=1`) | **24.1 / 29.4** | 36.3 / 67.4 | 29.1-29.6 | 0 / 0 | none |
+| Crysis 2 in the level, NR bypassed | 174 / 64-128 | - | - | 0 / 0 | none |
+
+- Where the game's own rendering costs time (the Crysis 2 level: about 5.7 ms per frame), the second card gives +22 %. Single-GPU, render and NR add up on one card. Multi-GPU, NR alone sets the frame time.
+- Where the game is nearly free (test title, Ep2, Crysis 2 title), NR sets the frame time on both, and the second card only adds one frame of latency.
+- The multi-GPU ceiling is the host round trip, 33.6 ms against 29.5 ms of NR GPU time. The presenter is serial: it ingests frame N+1 only after N is presented, and the host idles meanwhile. Pipelining that would bring it to about 33 fps.
+- Bypassed, multi-GPU is send-bound at Gen2: 7-8 ms for a 14.4 MB 1440p frame. Re-time at Gen5 (`data\hang\bw\link.exe`) after a cold boot.
+- Crysis 2 levels load from the command line: `-dx9 -devmode +map Downtown`. The run creates `Saved Games\Crysis2\SaveGames\default_downtown_*`, and the probe removes it.
+- Quality is unchanged: the same host, the same network, the same OF.
 
 ## 8. Effort estimates
 
