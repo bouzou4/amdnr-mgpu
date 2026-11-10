@@ -71,6 +71,7 @@ NrSettings ReadSettings()
     s.temporal = g_keys.Bool("Temporal", true);
     s.paperWhite = std::clamp(g_keys.Float("HdrPaperWhite", 200.0f), 80.0f, 1000.0f);
     s.wholeFrameFallback = g_keys.Bool("WholeFrameFallback", true);
+    s.terminalHudless = g_keys.Bool("TerminalHudless", true);
     s.meter = g_keys.Bool("FlickerMeter", true);
     return s;
 }

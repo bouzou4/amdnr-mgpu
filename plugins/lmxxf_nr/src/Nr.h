@@ -62,6 +62,7 @@ struct NrSettings
     bool serialize = false; // the game queue waits for the network right away (measuring, like inline NR)
     float paperWhite = 200.0f; // HDR output: nits the network's 1.0 maps to
     bool wholeFrameFallback = true; // terminal without a HUD-less colour: NR on the whole frame, UI included
+    bool terminalHudless = true; // false (test rigs): terminal ignores the HUD-less colour
     bool meter = true; // flicker meter on the network's answers (own-list placements)
 };
 
@@ -260,6 +261,7 @@ class NrEngine
     ComPtr<ID3D12Resource> _hudCopy, _hudOut; // the game's FG swapchain: its HUD-less input before / after the edit
     uint64_t _hudlessMissing = 0;
     uint32_t _hudlessStreak = 0; // presents in a row without a usable HUD-less colour
+    int8_t _termWhole = -1; // last terminal NR frame: 1 whole frame, 0 HUD-less
     ComPtr<ID3D12DescriptorHeap> _heap;
     uint32_t _heapCursor = 0, _heapStride = 0;
 
@@ -363,6 +365,8 @@ class NrEngine
     void MeterRead();
     void SeqPoll();
     void SeqRestart(const char* why);
+    void SeqDrop(); // _seq emptied, its readbacks into _seqDrop
+    std::vector<ComPtr<ID3D12Resource>> _seqDrop;
     static constexpr uint64_t kSeqSettle = 30; // jobs after a rebuild or a history reset before a sequence starts
     uint32_t _seqPending = 0; // frames of a requested sequence not started yet
     uint64_t _readyFrame = 0, _resetFrame = 0;

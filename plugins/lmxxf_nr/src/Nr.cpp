@@ -816,6 +816,13 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
 
 void NrEngine::ReadTimings()
 {
+    // dropped sequence readbacks: retired once the list that last copied into them was submitted
+    if (!_seqDrop.empty() && _pendingList.load() == nullptr)
+    {
+        for (auto& b : _seqDrop)
+            Retire(b);
+        _seqDrop.clear();
+    }
     ReleaseRetired();
     FinishDump();
     SeqPoll();
@@ -1419,7 +1426,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     const bool fgSc = f->size >= kFgScEnd && f->fgSwapchain != 0;
     const bool gameFg = f->size >= kFgEnd && f->frameGeneration != OptiFrameGen_Off && !fgSc;
     const uint32_t hudSource = f->size >= kFgEnd ? f->hudlessSource : OptiHudless_Hudfix;
-    const bool haveHud = f->hudless != nullptr && !gameFg;
+    const bool haveHud = f->hudless != nullptr && !gameFg && s.terminalHudless;
     const bool editHud = haveHud && fgSc && hudSource == OptiHudless_FfxFG && f->frameGeneration != OptiFrameGen_Off;
     _hudlessStreak = haveHud ? 0 : _hudlessStreak + 1;
     // A lone missed pick keeps the HUD-less mode (no NR that frame); a run of them falls back
@@ -1461,6 +1468,15 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     _stats.srcWidth = w;
     _stats.srcHeight = h;
     ReadTimings();
+    // HUD-less <-> whole frame: the feed gains or loses the UI, the history and the stabiliser restart
+    if (_termWhole >= 0 && _termWhole != int8_t(whole))
+    {
+        _extentReset = true;
+        _stabValid = false;
+        _meterPrevValid = false;
+        Log(OptiLog_Info, "terminal: %s, history reset", whole ? "HUD-less -> whole frame" : "whole frame -> HUD-less");
+    }
+    _termWhole = int8_t(whole);
 
     if (!EnsureCopies(bd))
         return;
@@ -1706,6 +1722,7 @@ bool NrEngine::Shutdown()
         WaitIdle();
         if (_presentFence)
             GpuWaitDone(_presentFence.Get(), _presentCounter); // the present lists before they are freed
+        _seqDrop.clear();
         ReleaseRetired();
     }
     if (_ctx != nullptr)
@@ -2079,7 +2096,7 @@ void NrEngine::SeqCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D
     b.Height = b.DepthOrArraySize = b.MipLevels = 1;
     b.SampleDesc.Count = 1;
     b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    img.buf.Reset();
+    Retire(img.buf);
     if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                 IID_PPV_ARGS(&img.buf))))
         return;
@@ -2122,7 +2139,7 @@ void NrEngine::SeqPoll()
             return SeqIdle("network rebuilt, waiting for it to settle");
         if (_frameId < _resetFrame + kSeqSettle)
             return SeqIdle("history reset, waiting for it to settle");
-        _seq.clear();
+        SeqDrop();
         _seq.resize(_seqPending);
         _seqPending = 0;
         _seqNext = 0;
@@ -2156,10 +2173,20 @@ void NrEngine::SeqRestart(const char* why)
     if (!_seqActive)
         return;
     _seqPending = (uint32_t) _seq.size();
-    _seq.clear();
+    SeqDrop();
     _seqActive = false;
     _jobSeq = -1;
     Log(OptiLog_Info, "sequence dump restarted (%ls): %s", name.c_str(), why);
+}
+
+// Lists in flight, and the one being recorded, may still copy into the readbacks: never freed here
+void NrEngine::SeqDrop()
+{
+    for (auto& s : _seq)
+        for (SeqImage* img : { &s.fed, &s.mv, &s.enh })
+            if (img->buf)
+                _seqDrop.push_back(std::move(img->buf));
+    _seq.clear();
 }
 
 void NrEngine::SeqWrite()
