@@ -64,6 +64,21 @@ Harness (3840x2160, Performance preset, synthetic depth and vectors, no render l
 
 Satisfactory (spike, before the port): dfg4 and dfg5 lost the display device about 0.5 s after FG came on (provider 4.0.2, page fault at a VA DRED could not attribute). Not HUD-less, render scale or the queue. Not rerun yet on this branch; the jobs that separate provider (3.1.6 against 4.0.2) and inputs (synthetic against the game's) are in the rig queue.
 
+## With the asynchronous network (NrCadence=async, this branch)
+
+Harness, Quality, provider 4.0.2, synthetic depth and vectors, `MgpuDred=1`, both links at 28 GB/s:
+
+| Case | real fps | presented/s | notes |
+|---|---|---|---|
+| async, no FG | 540 | 540 | the harness has no render load |
+| async + FG | 115 | 230 | PresentMon: each frame on screen 3.88 ms median (p95 4.91), display latency 9.4 ms median, one 548 ms hitch at FG start |
+| every-frame NR + FG | 88.8 | 178 | the presenter waits 15 ms per frame for the network |
+| async + FG, the upscaler-start / HUD-less gate sequence with 1.7 s render stalls | | | clean: FG generates throughout, its context is rebuilt when the upscaler's render size appears |
+
+Generated frame against its neighbours: 31.4 dB against their mean, 26.9 / 28.8 against each (an interpolation).
+
+Satisfactory (on feat/displayfg2, every-frame NR, `MgpuDred=1`, no dumps): FSR 3.1.6 and 4.0.2 both ran synthetic inputs, then the game's depth, vectors and HUD-less colour, then NR on, with no loss: 63-64 real fps, 128-129 presented per second. The spike's 4.0.2 losses (dfg4, dfg5) ran with DRED page faults only, without breadcrumbs. These passes ran with breadcrumbs (`MgpuDred=1`), the interim mitigation for the display-card losses, so they do not clear 4.0.2 without it.
+
 ## Failure handling
 
 - FFX swapchain creation fails: plain swapchain, FG row greyed out with the reason.
