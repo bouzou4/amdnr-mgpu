@@ -129,6 +129,10 @@ Full 1080 tier, multi-GPU, same menu, 12-frame dumps (`seq_metrics.py`, flk_stat
 
 Without history the output changes more than its input from frame to frame (positive flicker); with history it changes less, on still and on motion-compensated pixels, and the edit on disoccluded pixels does not grow (no ghosting signal). Panning sequences (1-5 px/frame, 6-20 % of pixels moving): flk_mc +0.00095 / psnr_mc 35.8 off against -0.00026..-0.00060 / 37.5-44.1 on. The vectors' sign checks out on every sequence (warping with +mv beats -mv and no motion).
 
+### Frame generation on the display card (prototype)
+
+`MgpuFrameGen=true` (multi-GPU only, default false) makes FSR frame generation run on the display card, through OptiScaler's FidelityFX modules (plugin API extension 7): the presenter's real swapchain is an FFX frame generation swapchain, depth and motion vectors come over the ring with the frame, and the NR'd HUD-less colour is FFX's HUD-less input. Design, measurements and open points: `docs/DISPLAY_FG_DESIGN.md`. Keys: `MgpuFgOn` (true: FG on from the start), `MgpuFgVersion` (empty: the newest provider, the driver's FSR 4 ML frame generation on RDNA 4; `3`: FSR 3.1), `MgpuFgHudless` (true), `MgpuFgSwapOnDemand` (false; true: the FFX swapchain exists only while FG is on, a plain one otherwise. The swap takes 0.2-0.6 s, drops the frames in flight, and waits while the window is in exclusive fullscreen or within 120 frames of the last swap; if the FFX swapchain can't be made, FG stays off). Not run in a game on this branch yet.
+
 ## Robustness
 
 Checked on the Satisfactory main menu (3840x2160, FSR 4, Small 1080 tier with history) with in-process logs and frame dumps only; the rig scripts live in the git-ignored `data/`.

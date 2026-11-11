@@ -1746,9 +1746,18 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     if (!_lost && !_broken && _fq && CurrentSettings().fgSwapOnDemand && _scheduled % 30 == 0)
     {
         PollLive(CurrentEnv().dumpDir);
-        const bool want = (LiveFg() >= 0 ? LiveFg() != 0 : CurrentSettings().fgStartOn) && !GameFg();
-        if (want != (_fgen != nullptr))
+        const bool want = (LiveFg() >= 0 ? LiveFg() != 0 : CurrentSettings().fgStartOn) && !GameFg() && !_fgSwapFailed;
+        // not in exclusive fullscreen (the swapchain owns the mode), and not twice within 2 s of frames
+        if (want != (_fgen != nullptr) && !_fsCached && _scheduled >= _fgSwapAfter)
+        {
             SwapReal(want);
+            _fgSwapAfter = _scheduled + 120;
+            if (want && !_fgen)
+            {
+                _fgSwapFailed = true;
+                Log(2, "display FG: the FFX swapchain could not be made on this window: FG stays off");
+            }
+        }
     }
     LARGE_INTEGER tEntry;
     QueryPerformanceCounter(&tEntry);
