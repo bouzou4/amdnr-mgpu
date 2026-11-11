@@ -162,6 +162,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT64 _taken = 0; // overlap: frames the ingest thread took from the ring
     UINT64 _workFrame = 0; // overlap: the frame the work stage is on, and when the game may send the next one
     int64_t _grantQpc = 0;
+    std::atomic<double> _leadWaitMs { 0 }; // game thread's wait for the display card per frame (EMA)
     UINT64 _picked[K] {}; // last frame the display card took from each slot
     UINT _sync[K] {}, _flags[K] {};
     std::chrono::steady_clock::time_point _tSched[K];

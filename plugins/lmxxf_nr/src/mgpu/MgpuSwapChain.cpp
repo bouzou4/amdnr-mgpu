@@ -2149,12 +2149,12 @@ void ProxySwapChain::PresentLoop()
                                "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
                                "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {} "
                                "added {:.2f} ms (render done -> display card {:.2f}, -> past present {:.2f}) overlap {} "
-                               "send lead {:.2f} ms",
+                               "send lead {:.2f} ms lead wait {:.2f} ms",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
                                st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
                                st.sendWaitMs, st.answerWaitMs, st.sendStalls, st.addedMs, st.renderToDisplayMs,
-                               st.displayToPresentMs, _overlap.load(), st.jitLeadMs));
+                               st.displayToPresentMs, _overlap.load(), st.jitLeadMs, _leadWaitMs.load()));
     }
 }
 
@@ -2264,13 +2264,16 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         // Bound the lead over the display card ([Mgpu] MaxFramesAhead, default 1).
         // Overlap: one frame ahead, and a second one only when the work stage is about to be free (just in time). A
         // game free to run 2 frames ahead gave the same frame rate with a whole display frame more latency.
-        const bool jit = _pipeline != 0;
+        // ... only while the game waits for the display card: with the render card the bound it never does, and a second
+        // frame would only queue on the render card (a frame of latency, no frame rate)
+        const bool jit = _pipeline != 0 && _leadWaitMs > 0.5;
         const UINT64 lead = (std::max)(1u, CurrentSettings().maxLead);
         // Early send: the copy goes to the GPU before the lead wait (the slot's last reader is done: consumed >= g - 2)
         const bool early = _earlySend && lead == 1 && !jit;
         if (!early)
         {
             const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            const int64_t tw0 = QpcTicks();
             LARGE_INTEGER qf;
             QueryPerformanceFrequency(&qf);
             const int64_t limitQpc = QpcTicks() + qf.QuadPart / 4;
@@ -2293,6 +2296,9 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
                 else if (_cv.wait_until(lk, limit) == std::cv_status::timeout)
                     break;
             }
+            const double waited = double(QpcTicks() - tw0) * 1000.0 / double(qf.QuadPart);
+            if (waited < 250)
+                _leadWaitMs = _leadWaitMs.load() * 0.95 + waited * 0.05;
         }
         const UINT64 g = _scheduled + 1;
         const UINT s = UINT(g % K);
