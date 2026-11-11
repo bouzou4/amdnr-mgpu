@@ -669,7 +669,9 @@ void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
         std::lock_guard g(_capM);
         dropAll(_hudR);
         dropAll(_mvR);
-        dropAll(_graveR);
+        for (auto& x : _graveR)
+            drop(x.res);
+        _graveR.clear();
     }
     drop(_hudD);
     drop(_mvD);
@@ -742,8 +744,11 @@ void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& g
     if (!_mvR[i] || _mvR[i]->GetDesc().Width != m.Width || _mvR[i]->GetDesc().Height != m.Height ||
         _mvR[i]->GetDesc().Format != m.Format)
     {
+        // the send of the frame that last staged into it reads it; a render size that keeps changing must not pile up
+        const UINT64 sent = _filledR->GetCompletedValue();
+        std::erase_if(_graveR, [&](const Grave& x) { return x.tag <= sent; });
         if (_mvR[i])
-            _graveR.push_back(_mvR[i]);
+            _graveR.push_back({ _mvR[i], _mvTag[i] });
         D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
         _mvR[i].Reset();
         if (FAILED(_rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &m, D3D12_RESOURCE_STATE_COMMON, nullptr,
@@ -990,7 +995,7 @@ void ProxySwapChain::PresenterLoop()
                 if (meta.mv && (!_mvD || _mvD->GetDesc().Width != meta.mvDesc.Width ||
                                 _mvD->GetDesc().Height != meta.mvDesc.Height || _mvD->GetDesc().Format != meta.mvDesc.Format))
                 {
-                    if (_mvD)
+                    if (_mvD && !(env.nrRetire && env.nrRetire(_mvD.Get())))
                         _graveD.push_back(_mvD);
                     D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
                     D3D12_RESOURCE_DESC md = meta.mvDesc;

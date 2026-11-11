@@ -688,6 +688,17 @@ void NrEngine::Retire(ComPtr<ID3D12Resource>& r)
     _retired.push_back(std::move(x));
 }
 
+bool NrEngine::RetireExternal(ID3D12Resource* r)
+{
+    ComPtr<ID3D12Resource> keep = r;
+    std::lock_guard lock(_mutex);
+    if (!_device || !_gameQueue)
+        return false;
+    ReleaseRetired(); // also while NR is off: nothing else collects then
+    Retire(keep);
+    return true;
+}
+
 void NrEngine::ReleaseRetired()
 {
     if (_retired.empty())

@@ -72,6 +72,9 @@ struct Env
     std::function<bool()> nrWanted;
     std::function<bool()> nrSettle; // before the present of a frame nrFrame ran on; false: do not present it
     std::function<void()> nrQuiesce; // NR's queued work is done: the resources it was given may be freed
+    // A replaced display-card resource NR may still read: NR keeps it until its queues and the display queue are
+    // past it. False: not taken (NR has no device yet), the caller keeps it
+    std::function<bool(ID3D12Resource*)> nrRetire;
     std::function<void(const char*)> nrIdle; // no NR this frame, and why (sequence dump requests log it)
     std::function<std::string()> nrStatus;
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send

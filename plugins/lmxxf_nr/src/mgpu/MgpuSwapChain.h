@@ -191,7 +191,14 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     // HUD-less colour and motion vectors: render-card staging per game back buffer, extra regions in each slot.
     bool _wantHud = false, _wantMv = false;
     std::mutex _capM;
-    std::vector<ComPtr<ID3D12Resource>> _hudR, _mvR, _graveR;
+    std::vector<ComPtr<ID3D12Resource>> _hudR, _mvR;
+    // Replaced motion staging: freed once the send of the last frame that used it is done (_filledR >= tag)
+    struct Grave
+    {
+        ComPtr<ID3D12Resource> res;
+        UINT64 tag = 0;
+    };
+    std::vector<Grave> _graveR;
     std::vector<UINT64> _hudTag, _mvTag; // frame id each staging holds
     std::vector<Guides> _mvConst;
     UINT64 _hudOffset = 0, _mvOffset = 0, _mvCap = 0;

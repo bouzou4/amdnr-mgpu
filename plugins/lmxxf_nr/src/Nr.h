@@ -139,6 +139,9 @@ class NrEngine
     void SeqIdle(const char* why); // no NR this frame: logs why a requested sequence dump waits (rate-limited)
     bool Shutdown(); // hot reload: GPU idle, worker joined, session destroyed; false if a game list holds our work
     void Quiesce();   // CPU wait for all queued network work: its inputs may be freed after
+    // A resource of the caller this engine's lists read, being replaced: kept until every queue is past it.
+    // False without a device (NR never ran): not taken
+    bool RetireExternal(ID3D12Resource* r);
     // Leaves the session alone: the game card's engine while the display card runs NR
     void SetSuspended(bool s) { _suspended = s; }
     bool Suspended() const { return _suspended; }

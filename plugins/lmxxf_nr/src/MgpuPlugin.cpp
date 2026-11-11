@@ -267,6 +267,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
         InstallQueueHook(d);
     };
     e.nrQuiesce = [] { DisplayEngine().Quiesce(); };
+    e.nrRetire = [](ID3D12Resource* r) { return DisplayEngine().RetireExternal(r); };
     e.nrIdle = [](const char* why) { DisplayEngine().SeqIdle(why); };
     e.nrWanted = [] { return Engine().Settings().enabled; };
     e.nrStatus = []
