@@ -23,7 +23,7 @@
 //   g multi-GPU triggers), window changes (r resize, m minimise) and upscaler changes (h HUD-less source on / off,
 //   q render scale, u reset flag / no vectors). Every step is printed with its frame; the same seed and options give
 //   the same steps at the same frames, --fuzz-classes keeps the sequence and drops the other classes. Stops at a
-//   device loss (exit 5) or when NR fails (exit 6)
+//   device loss (exit 5) or when NR fails (exit 6). --script <file> plays a fixed sequence instead (fuzz.h)
 #include <windows.h>
 #include <d3dkmthk.h>
 #include <dxgi1_6.h>
@@ -127,6 +127,7 @@ int main(int argc, char** argv)
     int fuzzSteps = 200;
     double cap = 0;
     const char* fuzzClasses = nullptr;
+    const char* scriptPath = nullptr;
     setvbuf(stdout, nullptr, _IOLBF, 4096);
     for (int i = 1; i < argc; ++i)
     {
@@ -180,6 +181,8 @@ int main(int argc, char** argv)
             fuzzSteps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fuzz-classes") && i + 1 < argc)
             fuzzClasses = argv[++i];
+        else if (!strcmp(argv[i], "--script") && i + 1 < argc)
+            fuzz = true, scriptPath = argv[++i];
         else if (!strcmp(argv[i], "--cap") && i + 1 < argc)
             cap = atof(argv[++i]);
         else
@@ -575,6 +578,7 @@ int main(int argc, char** argv)
     }
     // Switch fuzzer state
     hx::Fuzzer fz;
+    std::vector<hx::Action> script;
     std::wstring dumpDir;
     {
         wchar_t exe[MAX_PATH] = {};
@@ -594,6 +598,13 @@ int main(int argc, char** argv)
     {
         CreateDirectoryW(dumpDir.c_str(), nullptr);
         fz.Init(fuzzSeed, mgpuHint, useUpscaler, fuzzClasses, fullW, fullH);
+        if (scriptPath)
+        {
+            if (!hx::LoadScript(scriptPath, script))
+                return printf("script %s: no steps\n", scriptPath), 7;
+            fuzzSteps = (int) script.size();
+            fuzzNext += script[0].gap;
+        }
         if (cap <= 0)
             cap = 120;
         printf("fuzz seed %llu, %d steps, classes %s, cap %.0f fps, upscaler %d, hudless %d, mgpu %d\n", fuzzSeed,
@@ -665,8 +676,9 @@ int main(int argc, char** argv)
                 }
                 else
                 {
-                    hx::Action a = fz.Next(frames);
-                    fuzzNext = frames + a.gap;
+                    const size_t at = size_t(fuzzDone + fuzzSkipped);
+                    hx::Action a = script.empty() ? fz.Next(frames) : script[at];
+                    fuzzNext = frames + (script.empty() ? a.gap : at + 1 < script.size() ? script[at + 1].gap : 0);
                     SYSTEMTIME lt {};
                     GetLocalTime(&lt);
                     printf("fuzz %d frame %llu t %.2f at %02u:%02u:%02u.%03u%s: %s\n", fuzzDone + fuzzSkipped, frames, el,

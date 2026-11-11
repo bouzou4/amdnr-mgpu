@@ -12,7 +12,8 @@ D3D12 debug layer message, plugin error and device loss with the switches that l
         [--reslock reslock.py --owner fuzz --minutes 2 --pause 120] [--classes idsr] [--key K=V ...]
 
 A device loss ends its run; the next one starts after --cooldown seconds (Windows bugchecks on 5 TDRs in a minute),
-and the campaign stops after --max-losses of them. `python run.py --out DIR --report` only rebuilds the findings.
+and the campaign stops after --max-losses of them. `python run.py --out DIR --report` only rebuilds the findings. --script FILE plays a fixed sequence (see
+mgpu_harness/fuzz.h) with the start keys of the first seed: the reproduction of a finding, or the test of its fix.
 """
 import argparse
 import json
@@ -78,7 +79,7 @@ def kill_tree(pid):
 
 
 def run_one(a, st, mode, seed):
-    out = Path(a.out) / f'{mode}_{seed}'
+    out = Path(a.out) / (f'{mode}_{Path(a.script).stem}' if a.script else f'{mode}_{seed}')
     out.mkdir(parents=True, exist_ok=True)
     keys, hargs = mode_keys(mode, seed)
     keys.update({'Validation': str(a.validation), 'TestHooks': 'true', 'TriggerEvery': '4', 'RuntimeDir': a.runtime_dir})
@@ -103,14 +104,16 @@ def run_one(a, st, mode, seed):
         shutil.rmtree(dumps)  # the previous run's dumps of this stage folder
     dumps.mkdir()
 
-    cmd = [str(st / 'mgpu_harness.exe'), str(a.seconds), '--fuzz', str(seed), '--fuzz-steps', str(a.steps)] + hargs
+    cmd = [str(st / 'mgpu_harness.exe'), str(a.seconds)]
+    cmd += ['--script', str(Path(a.script).resolve())] if a.script else ['--fuzz', str(seed), '--fuzz-steps', str(a.steps)]
+    cmd += hargs
     if a.classes:
         cmd += ['--fuzz-classes', a.classes]
     if a.reslock:
         res = a.res or ('display,gpu3,gpu7' if mode == 'mgpu' else 'display,gpu3')
         cmd = [sys.executable, '-I', a.reslock, 'run', '--owner', a.owner, '--res', res, '--mode', 'functional',
                '--minutes', str(a.minutes), '--'] + cmd
-    meta = {'mode': mode, 'seed': seed, 'keys': keys, 'cmd': cmd[-(len(hargs) + 5 + (2 if a.classes else 0)):],
+    meta = {'mode': mode, 'seed': seed, 'keys': keys, 'cmd': [c for c in cmd if c.startswith('--') or len(c) < 24][-16:],
             'started': time.strftime('%Y-%m-%dT%H:%M:%S')}
     with open(out / 'harness.txt', 'w', encoding='utf-8', errors='replace') as so:
         p = subprocess.Popen(cmd, cwd=st, stdout=so, stderr=subprocess.STDOUT)
@@ -242,6 +245,7 @@ def main():
     ap.add_argument('--seconds', type=int, default=105)
     ap.add_argument('--validation', type=int, default=2)
     ap.add_argument('--classes')
+    ap.add_argument('--script', help='a fixed step sequence (mgpu_harness --script) instead of the seeds')
     ap.add_argument('--key', action='append')
     ap.add_argument('--reslock')
     ap.add_argument('--owner', default='fuzz')
@@ -255,7 +259,7 @@ def main():
     if not a.report:
         st = stage(a)
         losses = 0
-        for seed in a.seeds:
+        for seed in (a.seeds[:1] if a.script else a.seeds):
             for mode in a.modes:
                 r = run_one(a, st, mode, seed)
                 print(f"{r['run']}: {r['applied']} steps, exit {r['meta'].get('exit')}, {len(r['findings'])} findings"
