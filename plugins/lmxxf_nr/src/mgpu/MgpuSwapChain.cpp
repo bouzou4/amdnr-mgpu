@@ -2264,9 +2264,9 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         // Bound the lead over the display card ([Mgpu] MaxFramesAhead, default 1).
         // Overlap: one frame ahead, and a second one only when the work stage is about to be free (just in time). A
         // game free to run 2 frames ahead gave the same frame rate with a whole display frame more latency.
-        // ... only while the game waits for the display card: with the render card the bound it never does, and a second
-        // frame would only queue on the render card (a frame of latency, no frame rate)
-        const bool jit = _pipeline != 0 && _leadWaitMs > 0.5;
+        // ... only once the render card has finished this frame: while it is still drawing it (the render card is the
+        // bound) a second frame would only queue there, a frame of latency for no frame rate
+        const bool jit = _pipeline != 0;
         const UINT64 lead = (std::max)(1u, CurrentSettings().maxLead);
         // Early send: the copy goes to the GPU before the lead wait (the slot's last reader is done: consumed >= g - 2)
         const bool early = _earlySend && lead == 1 && !jit;
@@ -2277,7 +2277,8 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             LARGE_INTEGER qf;
             QueryPerformanceFrequency(&qf);
             const int64_t limitQpc = QpcTicks() + qf.QuadPart / 4;
-            auto granted = [&] { return jit && _scheduled < _consumed + 2 && _workFrame >= _scheduled; };
+            auto rendered = [&] { return _rgameFence->GetCompletedValue() >= _rgameValue; };
+            auto granted = [&] { return jit && _scheduled < _consumed + 2 && _workFrame >= _scheduled && rendered(); };
             auto ready = [&] {
                 return _stop || _scheduled < _consumed + lead || (granted() && QpcTicks() >= _grantQpc);
             };
@@ -2291,6 +2292,13 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
                     PreciseSleepUntil(at);
                     lk.lock();
                     if (at >= limitQpc)
+                        break;
+                }
+                else if (jit && _scheduled < _consumed + 2 && _workFrame >= _scheduled)
+                {
+                    // only the render card's frame holds the grant: look again shortly (its fence wakes no one here)
+                    if (_cv.wait_for(lk, std::chrono::microseconds(500)) == std::cv_status::timeout &&
+                        std::chrono::steady_clock::now() >= limit)
                         break;
                 }
                 else if (_cv.wait_until(lk, limit) == std::cv_status::timeout)
