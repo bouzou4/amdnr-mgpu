@@ -65,6 +65,8 @@ NrSettings ReadSettings()
     s.colorStrength = std::min(g_keys.Float("ColorStrength", 1.0f), 1.0f);
     s.upsample = std::clamp(g_keys.Int("EditUpsample", 1), 0, 1);
     s.stabilise = g_keys.Bool("EditStabilise", true);
+    if (std::string v; g_keys.Lookup("NrCadence", &v))
+        s.cadence = _stricmp(v.c_str(), "async") == 0 ? 0 : std::clamp(atoi(v.c_str()), 1, 3);
     s.motion = g_keys.Bool("MotionVectors", true);
     s.exposure = g_keys.Bool("Exposure", true);
     s.serialize = g_keys.Bool("Serialize", false);
@@ -559,6 +561,10 @@ void DrawTab(void*)
                            "below 0: it steadies the image. Moving needs this frame's answer (multi-GPU, NR every frame).");
     }
     Text("Frames: %llu run, %llu skipped", (unsigned long long) st.framesRun, (unsigned long long) st.framesSkipped);
+    if (g_ui.Cadenced())
+        Text("Cadence: %s; %llu frames with the reprojected edit, %llu waited for an answer",
+             g_ui.cadence == 0 ? "async" : g_ui.cadence == 2 ? "network every 2nd frame" : "network every 3rd frame",
+             (unsigned long long) st.framesHeld, (unsigned long long) st.cadenceWaits);
     if (!st.status.empty())
         g_api->TextDisabled(st.status.c_str());
     if (!g_needsApi)

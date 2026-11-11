@@ -54,6 +54,10 @@ struct NrSettings
     float ColorStrength(bool preTonemap) const { return colorStrength >= 0 ? colorStrength : preTonemap ? 0.0f : 1.0f; }
     int32_t upsample = 1; // feed-size edit to the target: 0 bilinear + feed residual, 1 guided by the target colour
     bool stabilise = true; // guided edit: temporal accumulation at the target size (EditStabilise)
+    // NrCadence, terminal and multi-GPU with the guided edit: the network on every N-th frame (1-3), 0 = async (fed
+    // again as soon as its last answer is in; no frame waits for it). The frames between show the reprojected edit
+    int32_t cadence = 1;
+    bool Cadenced() const { return cadence != 1 && upsample == 1; }
     float uiLow = 0.004f;  // terminal: back buffer vs HUD-less difference where UI starts (encoded units)
     float uiHigh = 0.02f;  // and where it is fully UI
     bool motion = true; // move the one frame old edit with the motion vectors
@@ -76,6 +80,8 @@ struct NrStats
     float networkMs = 0.0f; // median, the runtime's GetTimings (network only), 0 when unavailable
     uint64_t framesRun = 0;
     uint64_t framesSkipped = 0;
+    uint64_t framesHeld = 0;   // cadence: frames shown with the reprojected edit, no new answer
+    uint64_t cadenceWaits = 0; // cadence N: frames that had to wait for an answer older than N frames
     uint32_t frameInfoSize = 0;
     bool temporal = false; // the runtime gets motion vectors and keeps a history
     uint32_t encoding = 1; // of the last source: 0 linear, 1 sRGB, 2 PQ, 3 scRGB, 4 scene HDR
@@ -100,6 +106,7 @@ struct StabBind
     ID3D12Resource* out = nullptr;
     ID3D12Resource* motion = nullptr;
     DXGI_FORMAT motionFmt = DXGI_FORMAT_R16G16_FLOAT;
+    ID3D12Resource* acc = nullptr; // cadence: this frame -> the pair's frame
 };
 
 class NrEngine
@@ -273,6 +280,35 @@ class NrEngine
     bool StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t h, bool reset, ShaderConstants& c,
                      ID3D12Resource* motion, StabBind& b);
     void StabFinish(ID3D12GraphicsCommandList* list, const StabBind& b);
+
+    // NrCadence != 1. One job in flight at most; its answer goes onto the frame it arrives on, read at the motion
+    // accumulated since it was fed, and frames without an answer show the stabiliser's history reprojected
+    struct CadIn
+    {
+        ID3D12Resource* color = nullptr; // the frame the edit goes onto (readable)
+        DXGI_FORMAT colorFmt = DXGI_FORMAT_UNKNOWN;
+        ID3D12Resource* hud = nullptr;     // terminal: the HUD-less colour; null: no UI mask (Apply)
+        ID3D12Resource* feedSrc = nullptr; // what the network is fed from
+        float feedUvX = 1, feedUvY = 1;
+        uint32_t w = 0, h = 0, encoding = 1;
+        ID3D12Resource* mv = nullptr; // this frame's vectors (readable), null: none
+        uint32_t mvW = 0, mvH = 0;
+        float mvScaleX = 1, mvScaleY = 1;
+        bool reset = false;
+    };
+    // Apply: true when _termOut holds the result; *enh: the answer consumed this frame, if any. Then Feed.
+    bool CadenceApply(ID3D12GraphicsCommandList* list, const CadIn& in, uint64_t* wait, ID3D12Resource** enh);
+    void CadenceFeed(ID3D12GraphicsCommandList* list, const CadIn& in, uint64_t wait);
+    ComPtr<ID3D12PipelineState> _psoAcc;
+    ComPtr<ID3D12Resource> _acc[2]; // uv offset from this frame to the last fed one, ping-pong
+    ComPtr<ID3D12Resource> _accFed; // the copy the job in flight was given as its motion
+    uint32_t _accCur = 0;
+    bool _accChain = false;  // _acc[_accCur] reaches the last fed frame
+    bool _cadFeed = false;   // this frame feeds the network (Apply's plan for Feed)
+    bool _cadReset = true;   // a break since the last feed: the next job starts a new history
+    bool _cadStale = false;  // the job in flight was fed before a break: its answer is dropped
+    uint32_t _sinceFeed = 0; // frames since the last feed
+    uint64_t _cadFrames = 0;
 
     ComPtr<ID3D12Resource> _feed;     // network input, RGBA16F
     ComPtr<ID3D12Resource> _srcCopy;  // after upscaling: copy of the output

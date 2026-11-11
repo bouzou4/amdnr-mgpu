@@ -1,8 +1,10 @@
 // Copyright (c) 2026 the lmxxf_nr plugin authors. MIT licence, see ../../LICENSE.
 // Offline edit upsample bench on one adapter (no window, no swapchain).
-//   upsample_bench apply <dir> <entry> [--bus N] [--reps N] [--cs X] [--up 0|1] [--frames N] [--stab]
+//   upsample_bench apply <dir> <entry> [--bus N] [--reps N] [--cs X] [--up 0|1] [--frames N] [--stab] [--cadence P,D]
 //       dir: src_NN.f32 (4K, WxHx3 linear), fed_NN.f32 / enh_NN.f32 (feed, linear), size.txt "W H w h".
 //       --stab: the edit stabiliser on, history across frames, optional mv_NN.f32 (4K px toward the previous frame).
+//       --cadence P,D (with --stab): NrCadence as the plugin runs it. The pair of every P-th frame, applied D frames
+//       later (1 <= D <= P) at the accumulated motion; the other frames hold the reprojected history. Writes cd_NN.f32.
 //       Runs the plugin shader <entry> (ApplyTerminal, HUD-less = Src) and writes up_NN.f32; prints the GPU ms.
 //   upsample_bench fsr <dir> <ffx dir> [--bus N] [--version S] [--frames N] [--sharp X] [--reps N]
 //       dir: col_NN.f32 (render size, linear), mv_NN.f32 (render px toward the previous frame, no jitter),
@@ -270,7 +272,7 @@ static void Median(std::vector<double>& v, const char* what)
 }
 
 static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps, float cs, uint32_t up, unsigned frames, UINT W, UINT H,
-                    UINT w, UINT h, bool stab)
+                    UINT w, UINT h, bool stab, unsigned period, unsigned delay)
 {
     HMODULE comp = LoadLibraryW(L"d3dcompiler_47.dll");
     auto compile = comp ? reinterpret_cast<pD3DCompile>(GetProcAddress(comp, "D3DCompile")) : nullptr;
@@ -282,7 +284,7 @@ static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps,
         Die(err ? (const char*) err->GetBufferPointer() : "compile");
     // the plugin's root signature (Nr.cpp CreatePipelines)
     D3D12_DESCRIPTOR_RANGE ranges[2] {};
-    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7, 0, 0, 0 };
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 0, 0, 0 };
     ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0 };
     D3D12_ROOT_PARAMETER params[3] {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -309,24 +311,35 @@ static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps,
     ComPtr<ID3D12PipelineState> pso;
     CK(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)));
 
+    ComPtr<ID3D12PipelineState> psoAcc;
+    if (period)
+    {
+        ComPtr<ID3DBlob> ab;
+        if (FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Accumulate", "cs_5_0",
+                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ab, &err)))
+            Die(err ? (const char*) err->GetBufferPointer() : "compile");
+        pd.CS = { ab->GetBufferPointer(), ab->GetBufferSize() };
+        CK(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoAcc)));
+    }
+
     const auto F = DXGI_FORMAT_R32G32B32A32_FLOAT;
     auto src = g.Tex(W, H, F, false), enh = g.Tex(w, h, F, false), fed = g.Tex(w, h, F, false), dst = g.Tex(W, H, F, true);
     auto norm = g.Tex(1, 1, F, false);
-    const auto F16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const auto F16 = DXGI_FORMAT_R16G16B16A16_FLOAT, A16 = DXGI_FORMAT_R16G16_FLOAT;
     ComPtr<ID3D12Resource> hist[2] = { g.Tex(W, H, F16, true), g.Tex(W, H, F16, true) };
+    ComPtr<ID3D12Resource> acc[2] = { g.Tex(W, H, A16, true), g.Tex(W, H, A16, true) };
     auto mvt = g.Tex(W, H, DXGI_FORMAT_R32G32_FLOAT, false);
-    // two descriptor sets (9 each: t0-t6, u0-u1), one per history direction
+    // descriptor sets of 10 (t0-t7, u0-u1): 0 the apply, 1 the accumulated motion; rewritten per frame
     ComPtr<ID3D12DescriptorHeap> heap;
-    D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 18, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 20, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
     CK(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
     const UINT st = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    for (int set = 0; set < 2; set++)
+    auto bind = [&](int set, ID3D12Resource* const srvs[8], const DXGI_FORMAT sf[8], ID3D12Resource* u0, DXGI_FORMAT f0,
+                    ID3D12Resource* u1)
     {
         auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += SIZE_T(set) * 9 * st;
-        ID3D12Resource* srvs[7] = { src.Get(), enh.Get(), fed.Get(), src.Get(), norm.Get(), hist[set].Get(), mvt.Get() };
-        const DXGI_FORMAT sf[7] = { F, F, F, F, F, F16, DXGI_FORMAT_R32G32_FLOAT };
-        for (int i = 0; i < 7; i++)
+        cpu.ptr += SIZE_T(set) * 10 * st;
+        for (int i = 0; i < 8; i++)
         {
             D3D12_SHADER_RESOURCE_VIEW_DESC sd {};
             sd.Format = sf[i];
@@ -336,13 +349,28 @@ static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps,
             g.dev->CreateShaderResourceView(srvs[i], &sd, { cpu.ptr + SIZE_T(i) * st });
         }
         D3D12_UNORDERED_ACCESS_VIEW_DESC ud {};
-        ud.Format = F;
+        ud.Format = f0;
         ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        g.dev->CreateUnorderedAccessView(dst.Get(), nullptr, &ud, { cpu.ptr + SIZE_T(7) * st });
+        g.dev->CreateUnorderedAccessView(u0, nullptr, &ud, { cpu.ptr + SIZE_T(8) * st });
         ud.Format = F16;
-        g.dev->CreateUnorderedAccessView(hist[set ^ 1].Get(), nullptr, &ud, { cpu.ptr + SIZE_T(8) * st });
-    }
+        g.dev->CreateUnorderedAccessView(u1, nullptr, &ud, { cpu.ptr + SIZE_T(9) * st });
+    };
+    auto run = [&](int set, ID3D12PipelineState* p, const ShaderConstants& k)
+    {
+        ID3D12DescriptorHeap* hs[] = { heap.Get() };
+        g.list->SetDescriptorHeaps(1, hs);
+        g.list->SetComputeRootSignature(rs.Get());
+        g.list->SetPipelineState(p);
+        g.list->SetComputeRoot32BitConstants(0, sizeof k / 4, &k, 0);
+        auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(set) * 10 * st;
+        g.list->SetComputeRootDescriptorTable(1, gpu);
+        g.list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(8) * st });
+        g.list->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+    };
     for (auto& t : hist)
+        g.Barrier(t.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    for (auto& t : acc)
         g.Barrier(t.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g.Submit();
 
@@ -357,55 +385,99 @@ static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps,
     c.colorStrength = cs;
     c.upMode = up;
     c.mvToUvX = 1.f / W, c.mvToUvY = 1.f / H;
-    std::vector<double> ms;
-    int cur = 0;
+    std::vector<double> ms, msHold, msAcc;
+    int cur = 0, acur = 0;
+    bool histValid = false;
     for (unsigned t = 0; t < frames; t++)
     {
         auto vs = ReadF(Nn(dir, "src", t), size_t(W) * H * 3, t > 0);
         if (vs.empty())
             break;
         g.Upload(src.Get(), vs, 3);
-        g.Upload(enh.Get(), ReadF(Nn(dir, "enh", t), size_t(w) * h * 3), 3);
-        g.Upload(fed.Get(), ReadF(Nn(dir, "fed", t), size_t(w) * h * 3), 3);
+        // cadence: the pair fed D frames ago, when that frame was a fed one
+        const bool arrive = !period || (t >= delay && (t - delay) % period == 0);
+        if (arrive)
+        {
+            const unsigned s = period ? t - delay : t;
+            g.Upload(enh.Get(), ReadF(Nn(dir, "enh", s), size_t(w) * h * 3), 3);
+            g.Upload(fed.Get(), ReadF(Nn(dir, "fed", s), size_t(w) * h * 3), 3);
+        }
+        bool haveMv = false;
         if (stab)
         {
             auto mv = ReadF(Nn(dir, "mv", t), size_t(W) * H * 2, true);
-            if (!mv.empty())
+            haveMv = !mv.empty();
+            if (haveMv)
                 g.Upload(mvt.Get(), mv, 2);
-            c.histMode = (t == 0 ? 1u : 2u) | (mv.empty() ? 0u : 4u);
+            c.histMode = (histValid ? 2u : 1u) | (haveMv ? 4u : 0u);
         }
+        bool accValid = false;
+        if (period && haveMv && t > 0)
+        {
+            // this frame -> the last fed frame before it; the chain starts again after a fed frame
+            ShaderConstants k = c;
+            k.cadence = (t - 1) % period != 0 ? 4u : 0u;
+            ID3D12Resource* srvs[8] = { acc[acur].Get(), nullptr, nullptr, mvt.Get(), nullptr, nullptr, nullptr, nullptr };
+            const DXGI_FORMAT sf[8] = { A16, F, F, DXGI_FORMAT_R32G32_FLOAT, F, F16, A16, A16 };
+            bind(1, srvs, sf, acc[acur ^ 1].Get(), A16, nullptr);
+            g.Barrier(acc[acur].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            g.Stamp(0);
+            run(1, psoAcc.Get(), k);
+            g.Stamp(1);
+            g.Resolve();
+            g.Barrier(acc[acur].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g.Submit();
+            msAcc.push_back(g.Ms());
+            acur ^= 1;
+            accValid = true;
+        }
+        const bool hold = period && !arrive;
+        if (period)
+            c.cadence = (arrive ? 1u : 2u) | (arrive && accValid ? 8u : 0u);
         g.Barrier(dst.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (hold && !histValid)
+        {
+            // nothing to show yet: the frame as it is
+            WriteF(Nn(dir, "cd", t), vs);
+            g.Barrier(dst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            g.Submit();
+            continue;
+        }
         if (stab)
             g.Barrier(hist[cur].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (accValid)
+            g.Barrier(acc[acur].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        {
+            ID3D12Resource* srvs[8] = { src.Get(), hold ? nullptr : enh.Get(), hold ? nullptr : fed.Get(), src.Get(), norm.Get(),
+                                        hist[cur].Get(), mvt.Get(), accValid && arrive ? acc[acur].Get() : nullptr };
+            const DXGI_FORMAT sf[8] = { F, F, F, F, F, F16, DXGI_FORMAT_R32G32_FLOAT, A16 };
+            bind(0, srvs, sf, dst.Get(), F, stab ? hist[cur ^ 1].Get() : nullptr);
+        }
         for (int r = 0; r < reps; r++)
         {
-            ID3D12DescriptorHeap* hs[] = { heap.Get() };
-            g.list->SetDescriptorHeaps(1, hs);
-            g.list->SetComputeRootSignature(rs.Get());
-            g.list->SetPipelineState(pso.Get());
-            g.list->SetComputeRoot32BitConstants(0, sizeof c / 4, &c, 0);
-            auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
-            gpu.ptr += UINT64(cur) * 9 * st;
-            g.list->SetComputeRootDescriptorTable(1, gpu);
-            g.list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(7) * st });
             g.Stamp(0);
-            g.list->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+            run(0, pso.Get(), c);
             g.Stamp(1);
             g.Resolve();
             g.Submit();
             if (r > 0)
-                ms.push_back(g.Ms());
+                (hold ? msHold : ms).push_back(g.Ms());
         }
-        WriteF(Nn(dir, stab ? "st" : "up", t), g.Download(dst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        WriteF(Nn(dir, period ? "cd" : stab ? "st" : "up", t), g.Download(dst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
         g.Barrier(dst.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        if (accValid)
+            g.Barrier(acc[acur].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (stab)
         {
             g.Barrier(hist[cur].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             cur ^= 1;
+            histValid = true;
         }
         g.Submit();
     }
     Median(ms, entry);
+    Median(msHold, "held frame");
+    Median(msAcc, "Accumulate");
     return 0;
 }
 
@@ -540,6 +612,7 @@ int main(int argc, char** argv)
     float cs = 1, sharp = 0;
     uint32_t up = 0;
     bool stab = false;
+    unsigned period = 0, delay = 1;
     std::string version = "3.1";
     for (int i = 4; i < argc; i++)
     {
@@ -559,6 +632,12 @@ int main(int argc, char** argv)
             version = next();
         else if (a == "--stab")
             stab = true;
+        else if (a == "--cadence")
+        {
+            if (std::sscanf(next(), "%u,%u", &period, &delay) < 1 || period < 1 || delay < 1 || delay > period)
+                Die("--cadence P,D with 1 <= D <= P");
+            stab = true;
+        }
         else if (a == "--sharp")
             sharp = float(std::atof(next()));
     }
@@ -571,7 +650,7 @@ int main(int argc, char** argv)
     Gpu g;
     g.Init(bus);
     if (mode == "apply")
-        return RunApply(g, dir, argv[3], reps, cs, up, frames, W, H, w, h, stab);
+        return RunApply(g, dir, argv[3], reps, cs, up, frames, W, H, w, h, stab, period, delay);
     if (mode == "fsr")
     {
         std::wstring fd(argv[3], argv[3] + std::strlen(argv[3]));

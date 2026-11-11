@@ -10,6 +10,7 @@ Texture2D<float4> Aux : register(t3); // motion vectors (Apply), HUD-less colour
 Texture2D<float4> Norm : register(t4); // Stats' output: x net units per scene unit, y share fed above the guard
 Texture2D<float4> Hist : register(t5);  // edit stabiliser: last frame's accumulated edit ratio (rgb) and guide (a)
 Texture2D<float4> Motion : register(t6); // motion vectors for the history (MvUvScale / MvToUv)
+Texture2D<float4> Acc : register(t7);    // cadence: uv offset from this frame to the frame the pair was fed on
 RWTexture2D<float4> Dst : register(u0);
 RWTexture2D<float4> HistOut : register(u1);
 SamplerState Lin : register(s0);
@@ -34,7 +35,10 @@ cbuffer C : register(b0)
     float ExpoMul;    // Stats: game exposure * ExpoMul = net units per scene unit (1 / pre-exposure); 0 = auto
     float ColorStrength; // 0: network luma on the game's chroma, 1: the network's colour edit as it is
     uint UpMode;         // edit upsample: 0 bilinear + feed residual, 1 guided (EditGuided)
-    uint HistMode;       // guided edit stabiliser: 0 off, 1 history reset (write only), 2 accumulate; | 4 Motion bound
+    uint HistMode;       // guided edit stabiliser: 0 off, 1 history reset (write only), 2 accumulate; | 4 Motion bound,
+                         // | 8 no blend (EditStabilise off: the history only carries the edit between answers)
+    uint Cadence;        // NrCadence: 0 every frame; 1 the pair is of an earlier frame (read at uv + Acc), 2 no pair
+                         // this frame (the accumulated ratio is held); | 4 Acc chains (Accumulate), | 8 Acc bound
 };
 
 static const float kGuard = 1.5; // fed median above this after mapping: bypass
@@ -173,6 +177,8 @@ float3 Up(Texture2D<float4> t, float2 uvScale, float2 uv)
     return t.SampleLevel(Lin, uv * uvScale, 0).rgb + t.SampleLevel(Pt, ci * uvScale, 0).rgb - box * 0.25;
 }
 
+)" // one literal holds 16 KB at most (MSVC)
+R"(
 // Guided upsample: the edit as a ratio to the feed colour, joint bilateral over 3x3 feed pixels (distance and the
 // guide luma of this pixel against each feed pixel), times this pixel's own colour
 static const float kRatioK = 0.01;
@@ -185,68 +191,139 @@ static const float kStabAlpha = 0.1;
 static const float kStabGuideTau = 0.04;
 static const float kStabSd = 1.0;
 static const float kStabBias = 0.02;
-float3 Stabilise(uint2 px, float3 r, float3 sd, float g)
+// Last frame's accumulated ratio at this pixel, following the vectors (the edge's when that is off screen).
+// k: how far it holds here (0 off screen or where the guide changed)
+float3 History(uint2 px, float g, out float k)
 {
-    float3 o = r;
-    if ((HistMode & 3) == 2)
-    {
-        float2 uv = (px + 0.5) / Size, q = uv;
-        if (HistMode & 4)
-            q += Motion.SampleLevel(Pt, uv * MvUvScale, 0).xy * MvToUv;
-        if (all(q >= 0) && all(q <= 1))
-        {
-            float4 h = Hist.SampleLevel(Lin, q, 0);
-            float k = saturate(1 - abs(g - h.a) / kStabGuideTau);
-            float3 b = kStabSd * sd + kStabBias;
-            if (all(isfinite(h)))
-                o = lerp(r, clamp(h.rgb, r - b, r + b), (1 - kStabAlpha) * k);
-        }
-    }
-    if (HistMode & 3)
-        HistOut[px] = float4(o, g);
-    return o;
+    k = 0;
+    float2 uv = (px + 0.5) / Size, q = uv;
+    if (HistMode & 4)
+        q += Motion.SampleLevel(Pt, uv * MvUvScale, 0).xy * MvToUv;
+    float4 h = Hist.SampleLevel(Lin, q, 0);
+    if (!all(isfinite(h)))
+        return 0;
+    if (all(q >= 0) && all(q <= 1))
+        k = saturate(1 - abs(g - h.a) / kStabGuideTau);
+    return h.rgb;
 }
 
-float3 EditGuided(float2 uv, float3 c, float2 fs, uint2 px)
+float3 Stabilise(uint2 px, float3 r, float3 sd, float g)
+{
+    if ((HistMode & 11) != 2)
+        return r;
+    float k;
+    float3 h = History(px, g, k);
+    float3 b = kStabSd * sd + kStabBias;
+    return lerp(r, clamp(h, r - b, r + b), (1 - kStabAlpha) * k);
+}
+
+// Cadence, a pixel without an answer this frame: the history's ratio where it holds, else that of last frame's pixels
+// around this one that looked like it (the history keeps its guide), with the reprojected one as a floor
+static const float kFillSigma = 0.06;
+static const float kFillKeep = 0.25; // weight of the reprojected ratio beside the ring's 16 taps
+static const float kPairGuideTau = 0.1; // an earlier frame's pair at the target size: guide change that drops it
+float3 Held(uint2 px, float g)
+{
+    if ((HistMode & 3) != 2)
+        return 0;
+    float k;
+    float3 h = History(px, g, k);
+    if (k >= 0.999)
+        return h;
+    float2 uv = (px + 0.5) / Size;
+    float s = Size.y / 2160.0;
+    float3 acc = 0;
+    float ws = 0;
+    [loop] for (uint i = 0; i < 16; i++)
+    {
+        float a = (i + (i < 8 ? 0.0 : 0.5)) * 0.785398163;
+        float2 o = round(float2(sin(a), cos(a)) * (i < 8 ? 6.0 : 20.0) * s) / Size;
+        float4 t = Hist.SampleLevel(Lin, uv + o, 0);
+        float d = (g - t.a) / kFillSigma;
+        float w = all(isfinite(t)) ? exp(-0.5 * d * d) : 0;
+        acc += w > 0 ? w * t.rgb : 0;
+        ws += w;
+    }
+    return lerp((acc + kFillKeep * h) / (ws + kFillKeep), h, k);
+}
+
+// pair: Fed / Enh can be read at uv (cadence: there is a pair, and uv, moved to its frame, is on screen)
+float3 EditGuided(float2 uv, float3 c, float2 fs, uint2 px, bool pair)
 {
     float3 n = ToNet(max(ToLinear(c), 0));
     float g = Guide(n);
-    float2 p = uv * fs - 0.5;
-    int2 b = int2(uv * fs);
-    float3 acc = 0, acc2 = 0;
-    float accL = 0, ws = 0;
-    [unroll] for (int dy = -1; dy <= 1; dy++)
-        [unroll] for (int dx = -1; dx <= 1; dx++)
+    float3 r = 0, sd = 0;
+    float lr = 1, conf = 0; // luma ratio; how far the pair is trusted at this pixel
+    if (pair)
+    {
+        float2 p = uv * fs - 0.5;
+        int2 b = int2(uv * fs);
+        float3 acc = 0, acc2 = 0;
+        float accL = 0, ws = 0, wsp = 0;
+        [unroll] for (int dy = -1; dy <= 1; dy++)
+            [unroll] for (int dx = -1; dx <= 1; dx++)
+            {
+                int2 q = clamp(b + int2(dx, dy), 0, int2(fs) - 1);
+                float3 f = Fed.Load(int3(q, 0)).rgb, en = Enh.Load(int3(q, 0)).rgb;
+                float2 d = (q - p) / kSpaceSigma;
+                float dg = (Guide(f) - g) / kRangeSigma;
+                float sp = exp(-0.5 * dot(d, d));
+                float w = sp * exp(-0.5 * dg * dg) + 1e-8;
+                float3 t = clamp((en - f) / (f + kRatioK), -1, 4);
+                acc += w * t;
+                acc2 += w * t * t;
+                if (ColorStrength < 1)
+                    accL += w * clamp((Luma(en) + 1e-3) / (Luma(f) + 1e-3), 0, 4);
+                ws += w;
+                wsp += sp;
+            }
+        r = acc / ws;
+        sd = sqrt(max(acc2 / ws - r * r, 0));
+        lr = accL / ws;
+        // an earlier frame's pair: dropped where no feed pixel around looks like this one (disoccluded since)
+        conf = (Cadence & 1) ? saturate(ws / max(wsp, 1e-8) / 0.1) : 1;
+        if (!any(fs < float2(Size)))
         {
-            int2 q = clamp(b + int2(dx, dy), 0, int2(fs) - 1);
-            float3 f = Fed.Load(int3(q, 0)).rgb, en = Enh.Load(int3(q, 0)).rgb;
-            float2 d = (q - p) / kSpaceSigma;
-            float dg = (Guide(f) - g) / kRangeSigma;
-            float w = exp(-0.5 * (dot(d, d) + dg * dg)) + 1e-8;
-            float3 r = clamp((en - f) / (f + kRatioK), -1, 4);
-            acc += w * r;
-            acc2 += w * r * r;
-            if (ColorStrength < 1)
-                accL += w * clamp((Luma(en) + 1e-3) / (Luma(f) + 1e-3), 0, 4);
-            ws += w;
+            // cadence with the feed at the target size: the pair's own ratio, the 3x3 only gives its spread
+            float3 f = Fed.SampleLevel(Lin, uv * FedUvScale, 0).rgb, en = Enh.SampleLevel(Lin, uv * EnhUvScale, 0).rgb;
+            r = clamp((en - f) / (f + kRatioK), -1, 4);
+            lr = clamp((Luma(en) + 1e-3) / (Luma(f) + 1e-3), 0, 4);
+            conf = saturate(1 - abs(g - Guide(f)) / kPairGuideTau);
         }
-    float3 r = acc / ws;
+    }
     if (HistMode != 0)
-        r = Stabilise(px, r, sqrt(max(acc2 / ws - r * r, 0)), g);
+    {
+        if (pair)
+            r = Stabilise(px, r, sd, g);
+        if (conf < 1)
+            r = lerp(Held(px, g), r, conf);
+        if (HistMode & 3)
+            HistOut[px] = float4(r, g);
+    }
     float3 e = r * (n + kRatioK);
     if (ColorStrength >= 1)
         return e;
-    return lerp(n * (accL / ws - 1), e, saturate(ColorStrength));
+    if (conf < 1) // no pair luma here: the ratio's own
+        lr = clamp((Luma(n + e) + 1e-3) / (Luma(n) + 1e-3), 0, 4);
+    return lerp(n * (lr - 1), e, saturate(ColorStrength));
 }
 
 // Network space edit at uv for colour c: below ColorStrength 1 part of it is the network's luma ratio on c's own chroma
 float3 Edit(float2 uv, float3 c, uint2 px)
 {
+    if (Cadence & 2)
+        return EditGuided(uv, c, 0, px, false);
     float2 fs;
     Fed.GetDimensions(fs.x, fs.y);
     fs = floor(fs * FedUvScale + 0.5);
+    if (Cadence & 1)
+    {
+        if (Cadence & 8)
+            uv += Acc.SampleLevel(Lin, (px + 0.5) / Size, 0).xy;
+        return EditGuided(uv, c, fs, px, all(uv >= 0) && all(uv <= 1));
+    }
     if (UpMode == 1 && any(fs < float2(Size))) // feed at the target size: the edit as it is
-        return EditGuided(uv, c, fs, px);
+        return EditGuided(uv, c, fs, px, true);
     float3 enh = Up(Enh, EnhUvScale, uv), fed = Up(Fed, FedUvScale, uv);
     float3 e = enh - fed;
     if (ColorStrength >= 1)
@@ -276,6 +353,24 @@ void Apply(uint3 id : SV_DispatchThreadID)
             o.rgb = AddEdit(c.rgb, Strength * e);
     }
     Dst[id.xy] = o;
+}
+
+// Cadence: where this pixel was on the frame last fed to the network, as a uv offset: this frame's vector plus the
+// accumulated offset where it points (Src: last frame's). 8 = unknown (left the screen), which stays off screen
+[numthreads(8, 8, 1)]
+void Accumulate(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= Size))
+        return;
+    float2 uv = (id.xy + 0.5) / Size;
+    float2 m = Aux.SampleLevel(Pt, uv * MvUvScale, 0).xy * MvToUv;
+    float2 a = m;
+    if (Cadence & 4)
+    {
+        float2 q = uv + m;
+        a = all(q >= 0) && all(q <= 1) ? m + Src.SampleLevel(Lin, q, 0).xy : 8;
+    }
+    Dst[id.xy] = float4(all(isfinite(a)) ? clamp(a, -8, 8) : 8, 0, 0);
 }
 
 // Terminal: the edit goes onto the back buffer where it matches the HUD-less colour; UI pixels stay as they are
@@ -315,8 +410,9 @@ struct ShaderConstants
     float colorStrength;
     uint32_t upMode;
     uint32_t histMode;
+    uint32_t cadence;
 };
-static_assert(sizeof(ShaderConstants) == 92);
+static_assert(sizeof(ShaderConstants) == 96);
 
 // Flicker meter, tools/seq_metrics.py on the GPU: per pixel of the feed, the change of the network's answer against
 // the change of its input (display encoding), on still pixels and on visible moving pixels (warped with the vectors).

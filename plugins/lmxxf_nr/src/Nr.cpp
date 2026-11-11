@@ -23,7 +23,7 @@ namespace
 {
 constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr uint32_t kHeapSlots = 64;
-constexpr uint32_t kSlotDescriptors = 9; // t0-t6, u0-u1
+constexpr uint32_t kSlotDescriptors = 10; // t0-t7, u0-u1
 
 DXGI_FORMAT ViewFormat(DXGI_FORMAT f)
 {
@@ -178,6 +178,12 @@ void NrEngine::Configure(const NrSettings& s)
     std::lock_guard lock(_mutex);
     if (s.placement != _settings.placement)
         _placementSwitch = true;
+    if (s.cadence != _settings.cadence)
+    {
+        _cadReset = true;
+        _accChain = false;
+        _sinceFeed = 1000;
+    }
     _settings = s;
     // A history session drops adaptive ViT reuse: toggling history rebuilds it off the render thread
     _dirty = s.size != _active.size || s.model != _active.model || s.Style() != _active.Style() ||
@@ -317,7 +323,7 @@ bool NrEngine::CreatePipelines()
         return false;
     }
 
-    ComPtr<ID3DBlob> down, apply, terminal, stats, err;
+    ComPtr<ID3DBlob> down, apply, terminal, stats, accum, err;
     if (FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Down", "cs_5_0",
                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &down, &err)) ||
         FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Apply", "cs_5_0",
@@ -332,7 +338,7 @@ bool NrEngine::CreatePipelines()
     }
 
     D3D12_DESCRIPTOR_RANGE ranges[2] {};
-    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7, 0, 0, 0 };
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 0, 0, 0 };
     ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0 };
     D3D12_ROOT_PARAMETER params[3] {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -373,6 +379,15 @@ bool NrEngine::CreatePipelines()
     pd.CS = { stats->GetBufferPointer(), stats->GetBufferSize() };
     if (FAILED(_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_psoStats))))
         return Fail("pipeline creation failed"), false;
+    if (SUCCEEDED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Accumulate", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &accum, &err)))
+    {
+        pd.CS = { accum->GetBufferPointer(), accum->GetBufferSize() };
+        _device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_psoAcc));
+    }
+    if (!_psoAcc)
+        Log(OptiLog_Warn, "cadence motion shader failed (the edit is held unmoved): %s",
+            err ? (const char*) err->GetBufferPointer() : "?");
     ComPtr<ID3DBlob> meter;
     if (SUCCEEDED(compile(kMeterSource, sizeof(kMeterSource) - 1, "lmxxf_nr_meter", nullptr, nullptr, "Meter", "cs_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &meter, &err)))
@@ -430,12 +445,20 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
         sd.Texture2D.MipLevels = 1;
         _device->CreateShaderResourceView(r, &sd, { cpu.ptr + SIZE_T(5 + i) * _heapStride });
     }
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd {};
+        sd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        _device->CreateShaderResourceView(stab ? stab->acc : nullptr, &sd, { cpu.ptr + SIZE_T(7) * _heapStride });
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC ud {};
     ud.Format = UavFormat(uavFmt);
     ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(7) * _heapStride });
+    _device->CreateUnorderedAccessView(uav, nullptr, &ud, { cpu.ptr + SIZE_T(8) * _heapStride });
     ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    _device->CreateUnorderedAccessView(stab ? stab->out : nullptr, nullptr, &ud, { cpu.ptr + SIZE_T(8) * _heapStride });
+    _device->CreateUnorderedAccessView(stab ? stab->out : nullptr, nullptr, &ud, { cpu.ptr + SIZE_T(9) * _heapStride });
 
     ID3D12DescriptorHeap* heaps[] = { _heap.Get() };
     list->SetDescriptorHeaps(1, heaps);
@@ -443,7 +466,7 @@ void NrEngine::Dispatch(ID3D12GraphicsCommandList* list, ID3D12PipelineState* ps
     list->SetPipelineState(pso);
     list->SetComputeRoot32BitConstants(0, sizeof(ShaderConstants) / 4, &c, 0);
     list->SetComputeRootDescriptorTable(1, gpu);
-    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(7) * _heapStride });
+    list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(8) * _heapStride });
     list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 }
 
@@ -451,7 +474,8 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
                            ID3D12Resource* motion, StabBind& b)
 {
     c.histMode = 0;
-    if (!_settings.stabilise || _settings.upsample != 1)
+    // cadence carries the edit between answers in this history, also with EditStabilise off (no blend then)
+    if ((!_settings.stabilise && c.cadence == 0) || _settings.upsample != 1)
         return _stabValid = false;
     if (!_stab[0] || _stab[0]->GetDesc().Width != w || _stab[0]->GetDesc().Height != h)
     {
@@ -464,7 +488,7 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
         }
         _stab[0]->SetName(L"lmxxf_nr edit history"), _stab[1]->SetName(L"lmxxf_nr edit history");
     }
-    c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u);
+    c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u) | (_settings.stabilise ? 0u : 8u);
     b.hist = _stab[_stabCur].Get();
     b.out = _stab[_stabCur ^ 1].Get();
     b.motion = motion;
@@ -479,6 +503,176 @@ void NrEngine::StabFinish(ID3D12GraphicsCommandList* list, const StabBind& b)
     Barrier(list, b.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
     _stabCur ^= 1;
     _stabValid = true;
+}
+
+// NrCadence != 1, first half: this frame's place in the accumulated motion, the answer that is in (or due), and the
+// edit onto in.color: that answer read where each pixel was when it was fed, or the stabiliser's history reprojected
+bool NrEngine::CadenceApply(ID3D12GraphicsCommandList* list, const CadIn& in, uint64_t* wait, ID3D12Resource** enhOut)
+{
+    *wait = 0;
+    *enhOut = nullptr;
+    _cadFrames++;
+    bool reset = in.reset;
+    const bool mv = in.mv != nullptr && in.mvW > 0 && in.mvH > 0 && _psoAcc;
+    if (mv && (!_acc[0] || _acc[0]->GetDesc().Width != in.mvW || _acc[0]->GetDesc().Height != in.mvH))
+    {
+        ComPtr<ID3D12Resource>* ts[] = { std::addressof(_acc[0]), std::addressof(_acc[1]), std::addressof(_accFed) };
+        for (auto* t : ts)
+        {
+            Retire(*t); // the job in flight may still read its copy
+            *t = Texture(_device.Get(), in.mvW, in.mvH, DXGI_FORMAT_R16G16_FLOAT, t != ts[2], kRead);
+        }
+        reset = reset || _accChain;
+    }
+    if (reset)
+    {
+        _stabValid = false;
+        _accChain = false;
+        _cadReset = true;
+        _cadStale = _jobState == Job::Enqueued;
+    }
+    if (mv && _acc[0] && _acc[1] && _accFed)
+    {
+        const auto md = in.mv->GetDesc();
+        ShaderConstants c {};
+        c.sizeX = in.mvW;
+        c.sizeY = in.mvH;
+        c.mvUvScaleX = float(in.mvW) / float(md.Width);
+        c.mvUvScaleY = float(in.mvH) / float(md.Height);
+        c.mvToUvX = in.mvScaleX / float(in.mvW);
+        c.mvToUvY = in.mvScaleY / float(in.mvH);
+        c.cadence = _accChain ? 4u : 0u;
+        ID3D12Resource* out = _acc[_accCur ^ 1].Get();
+        Barrier(list, out, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12Resource* srv[4] = { _acc[_accCur].Get(), nullptr, nullptr, in.mv };
+        const DXGI_FORMAT fmt[4] = { DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, md.Format };
+        Dispatch(list, _psoAcc.Get(), c, srv, fmt, out, DXGI_FORMAT_R16G16_FLOAT, in.mvW, in.mvH);
+        Barrier(list, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+        _accCur ^= 1;
+        _accChain = true;
+    }
+    // no vectors this frame: no motion, the chain stays
+    ID3D12Resource* acc = _accChain ? _acc[_accCur].Get() : nullptr;
+
+    // Async feeds whenever no job is running and never waits; cadence N feeds every N-th frame and waits there
+    // for an answer that is not in yet
+    ++_sinceFeed;
+    const bool inFlight = _jobState == Job::Enqueued;
+    const bool done = inFlight && _hipFence->GetCompletedValue() >= _jobHipValue;
+    const int32_t period = _settings.cadence;
+    _cadFeed = period <= 0 ? (!inFlight || done) : (_sinceFeed >= uint32_t(period) || !_feedValid);
+    ID3D12Resource* enh = nullptr;
+    if (_jobState != Job::None && (done || _cadFeed))
+    {
+        if (inFlight && !done)
+            _stats.cadenceWaits++;
+        Consume(list, wait, &enh);
+        if (std::exchange(_cadStale, false))
+            enh = nullptr;
+    }
+    if (_cadFrames % 300 == 0)
+        Log(OptiLog_Info, "cadence (%ls): %s, %llu frames, %llu jobs, %llu held, %llu waited for an answer, "
+                          "network+handoff %.2f ms, network %.2f ms", name.c_str(),
+            period <= 0 ? "async" : period == 2 ? "every 2nd frame" : "every 3rd frame", (unsigned long long) _cadFrames,
+            (unsigned long long) _stats.framesRun, (unsigned long long) _stats.framesHeld,
+            (unsigned long long) _stats.cadenceWaits, Median(_hipSamples, _hipCount), Median(_netSamples, _netCount));
+    if (enh == nullptr && !_stabValid)
+        return false;
+
+    ShaderConstants c {};
+    c.sizeX = in.w;
+    c.sizeY = in.h;
+    c.fedUvScaleX = c.fedUvScaleY = 1.0f;
+    DXGI_FORMAT enhFmt = DXGI_FORMAT_UNKNOWN;
+    if (enh != nullptr)
+    {
+        const auto ed = enh->GetDesc();
+        enhFmt = ed.Format;
+        c.enhUvScaleX = float(_feedW) / float(ed.Width);
+        c.enhUvScaleY = float(_feedH) / float(ed.Height);
+    }
+    c.strength = _settings.strength;
+    c.colorStrength = _settings.ColorStrength(false);
+    c.upMode = 1;
+    c.uiLow = _settings.uiLow;
+    c.uiHigh = _settings.uiHigh;
+    c.encoding = in.encoding;
+    c.paperWhite = _settings.paperWhite / 80.0f;
+    if (mv)
+    {
+        const auto md = in.mv->GetDesc();
+        c.mvUvScaleX = float(in.mvW) / float(md.Width);
+        c.mvUvScaleY = float(in.mvH) / float(md.Height);
+        c.mvToUvX = in.mvScaleX / float(in.mvW);
+        c.mvToUvY = in.mvScaleY / float(in.mvH);
+    }
+    c.cadence = (enh != nullptr ? 1u : 2u) | (enh != nullptr && acc != nullptr ? 8u : 0u);
+    StabBind sb;
+    if (!StabPrepare(list, in.w, in.h, false, c, mv ? in.mv : nullptr, sb))
+        return false;
+    sb.acc = enh != nullptr ? acc : nullptr;
+    Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* srv[4] = { in.color, enh, enh != nullptr ? _feed.Get() : nullptr, in.hud };
+    const DXGI_FORMAT fmt[4] = { in.colorFmt, enhFmt, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                 in.hud ? in.hud->GetDesc().Format : DXGI_FORMAT_UNKNOWN };
+    Dispatch(list, in.hud ? _psoTerminal.Get() : _psoApply.Get(), c, srv, fmt, _termOut.Get(), in.colorFmt, in.w, in.h,
+             nullptr, &sb);
+    StabFinish(list, sb);
+    Barrier(list, _termOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (enh != nullptr)
+        Meter(list, enh, _jobMotion.res != nullptr); // against the last fed frame, along the accumulated motion
+    else
+        _stats.framesHeld++;
+    *enhOut = enh;
+    return true;
+}
+
+// Second half, after the caller copied the result out: feeds this frame when CadenceApply planned it. The network's
+// motion is the accumulated one, this frame -> the frame it was last fed, so its history spans the skipped frames
+void NrEngine::CadenceFeed(ID3D12GraphicsCommandList* list, const CadIn& in, uint64_t wait)
+{
+    if (!_cadFeed)
+        return;
+    {
+        ShaderConstants c {};
+        c.sizeX = _feedW;
+        c.sizeY = _feedH;
+        c.srcUvScaleX = in.feedUvX;
+        c.srcUvScaleY = in.feedUvY;
+        c.encoding = in.encoding;
+        c.paperWhite = _settings.paperWhite / 80.0f;
+        Barrier(list, _feed.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12Resource* srv[4] = { in.feedSrc, nullptr, nullptr, nullptr };
+        const DXGI_FORMAT fmt[4] = { in.feedSrc->GetDesc().Format, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                     DXGI_FORMAT_UNKNOWN };
+        Dispatch(list, _psoDown.Get(), c, srv, fmt, _feed.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, _feedW, _feedH);
+        UavBarrier(list, _feed.Get());
+        Barrier(list, _feed.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    }
+    _motion = {};
+    _motionUpscale = 0;
+    if (_accChain && _accFed)
+    {
+        // its own copy: the job reads it while the ping-pong moves on
+        ID3D12Resource* acc = _acc[_accCur].Get();
+        Barrier(list, acc, kRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(list, _accFed.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(_accFed.Get(), acc);
+        Barrier(list, _accFed.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+        Barrier(list, acc, D3D12_RESOURCE_STATE_COPY_SOURCE, kRead);
+        const auto ad = _accFed->GetDesc();
+        _motion.res = _accFed.Get();
+        _motion.state = kRead;
+        _motion.w = (uint32_t) ad.Width;
+        _motion.h = ad.Height;
+        _motion.scaleX = float(_feedW); // uv offsets -> feed pixels
+        _motion.scaleY = float(_feedH);
+        _motion.reset = _cadReset || !_feedValid;
+    }
+    Produce(list, nullptr, wait);
+    _accChain = false; // the next frame's offset starts at this one
+    _cadReset = false;
+    _sinceFeed = 0;
 }
 
 bool NrEngine::CreateSession()
@@ -1520,6 +1714,50 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
 
     uint64_t wait = 0;
     ID3D12Resource* enh = nullptr;
+    // not with the game's FG input edited in place: that path keeps the network on every frame
+    if (_settings.Cadenced() && hudTarget == nullptr)
+    {
+        if (!whole)
+        {
+            Barrier(list, bb, bbState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Barrier(list, _termCopy.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(_termCopy.Get(), bb);
+            Barrier(list, _termCopy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+            Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, bbState);
+        }
+        const auto hd = hud->GetDesc();
+        CadIn ci;
+        ci.color = _termCopy.Get();
+        ci.colorFmt = bd.Format;
+        ci.hud = ci.feedSrc = hud;
+        ci.feedUvX = float(w) / float(hd.Width);
+        ci.feedUvY = float(h) / float(hd.Height);
+        ci.w = w;
+        ci.h = h;
+        ci.encoding = encoding;
+        if (_mvCopy && _mvCap.frameId != 0 && _mvCap.frameId == f->upscaleFrameId && _mvCap.w > 0)
+        {
+            ci.mv = _mvCopy.Get();
+            ci.mvW = _mvCap.w;
+            ci.mvH = _mvCap.h;
+            ci.mvScaleX = _mvCap.scaleX;
+            ci.mvScaleY = _mvCap.scaleY;
+            ci.reset = _mvCap.reset;
+        }
+        if (CadenceApply(list, ci, &wait, &enh))
+        {
+            Barrier(list, bb, bbState, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(bb, _termOut.Get());
+            Barrier(list, bb, D3D12_RESOURCE_STATE_COPY_DEST, bbState);
+            MaybeDump(list, enh, bb, bbState, _termCopy.Get(), hud);
+        }
+        CadenceFeed(list, ci, wait);
+        Barrier(list, hud, kRead, hudState);
+        _mvCap = {};
+        lock.unlock();
+        SubmitOwn(queue, slot, list, wait);
+        return;
+    }
     Consume(list, &wait, &enh);
     if (enh != nullptr)
     {
@@ -1883,6 +2121,46 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     bool wrote = false;
     uint64_t wait = 0;
     ID3D12Resource* enh = nullptr;
+    if (_settings.Cadenced())
+    {
+        auto* list = NextOwnList(&slot);
+        if (list == nullptr)
+            return false;
+        copySource(list);
+        CadIn ci;
+        ci.color = ci.feedSrc = _termCopy.Get();
+        ci.colorFmt = sd.Format;
+        ci.w = w;
+        ci.h = h;
+        ci.encoding = in.encoding;
+        ci.reset = in.reset;
+        const bool mv = in.motion != nullptr && in.motionW > 0 && in.motionH > 0;
+        if (mv)
+        {
+            Barrier(list, in.motion, in.motionState, kRead);
+            ci.mv = in.motion;
+            ci.mvW = in.motionW;
+            ci.mvH = in.motionH;
+            ci.mvScaleX = in.mvScaleX;
+            ci.mvScaleY = in.mvScaleY;
+        }
+        wrote = CadenceApply(list, ci, &wait, &enh);
+        if (wrote)
+        {
+            Barrier(list, in.dst, in.dstState, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(in.dst, _termOut.Get());
+            Barrier(list, in.dst, D3D12_RESOURCE_STATE_COPY_DEST, in.dstState);
+            MaybeDump(list, enh, in.dst, in.dstState, in.src == in.dst ? _termCopy.Get() : nullptr);
+        }
+        CadenceFeed(list, ci, wait);
+        if (mv)
+            Barrier(list, in.motion, kRead, in.motionState);
+        lock.unlock();
+        // async: the answer consumed here is already in, nothing below waits
+        SubmitOwn(queue, slot, list, wait);
+        _answerWait = wait;
+        return wrote;
+    }
     if (in.waitAnswer)
     {
         // This frame's answer: feed and enqueue, then consume it once the network is done
