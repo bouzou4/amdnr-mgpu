@@ -16,5 +16,6 @@ void MgpuOnPresent(OptiPresentFrame* frame);
 void MgpuOnUpscale(OptiUpscaleFrame* frame);
 void MgpuDrawTab(const OptiPluginApi* api);
 bool MgpuOverlayText(char* buf, size_t size);
+bool MgpuOverlayHint(char* buf, size_t size); // links and what limits multi-GPU
 void MgpuEnsureRuntime(NrEngine& e);
 void MgpuLoadRuntime(NrEngine& e); // Plugin.cpp: the runtime search folders

@@ -358,6 +358,7 @@ void Present(OptiPresentFrame* frame, void*)
 }
 
 bool MgpuText(char* buf, size_t size, void*) { return MgpuOverlayText(buf, size); }
+bool MgpuHint(char* buf, size_t size, void*) { return MgpuOverlayHint(buf, size); }
 
 void DrawTab(void*)
 {
@@ -794,7 +795,10 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     {
         api->RegisterOverlayText(plugin, "NR", OverlayText, nullptr);
         if (mgpu)
+        {
             api->RegisterOverlayText(plugin, "MGPU", MgpuText, nullptr);
+            api->RegisterOverlayText(plugin, "Link", MgpuHint, nullptr);
+        }
     }
 
     Log(OptiLog_Info, "lmxxf_nr loaded, plugin API size %u, placement %s, size %s", api->size,

@@ -10,7 +10,10 @@
 #include <detours/detours.h>
 #include <intrin.h>
 
+#include <chrono>
+#include <cmath>
 #include <cstdarg>
+#include <vector>
 #include <filesystem>
 #include <format>
 
@@ -197,6 +200,89 @@ void CaptureHudless(OptiPresentFrame* f, void* res, uint32_t state, bool standIn
 int g_standIn = 1; // MgpuMenuStandIn: 0 off, 1 while the menu is open, 2 every frame (the FPS overlay too)
 
 std::string Busy(double v) { return v < 0 ? std::string("-") : std::format("{:.0f}%", v); }
+
+// One card's link: the slot's PCIe link from the driver, else what the measured copy rate amounts to.
+// Copies reach about 90 % of a link's raw rate (Gen5 x8: 28.4 of 31.5 GB/s, Gen4 x8: 14.1 of 15.8).
+struct Link
+{
+    bool known = false;
+    int gen = 0, lanes = 0;
+    double gbs = 0;      // what copies can reach on it
+    double measured = 0; // GB/s of this card's copy (render: send, display: ingest)
+    std::string Short() const
+    {
+        if (known)
+            return std::format("Gen{} x{}", gen, lanes);
+        return measured > 0 ? std::format("~{:.0f} GB/s", measured) : "?";
+    }
+};
+constexpr double kCopyEff = 0.9;
+Link LinkOf(const Mgpu::AdapterView& a, double measured)
+{
+    Link l;
+    l.measured = measured;
+    if (a.pcieGen > 0 && a.pcieLanes > 0)
+    {
+        l.known = true, l.gen = a.pcieGen, l.lanes = a.pcieLanes;
+        l.gbs = Mgpu::LinkGBs(l.gen, l.lanes) * kCopyEff;
+    }
+    else
+        l.gbs = measured;
+    return l;
+}
+// the x8 generation a measured rate matches (for an unknown link)
+std::string ClassOf(double gbs)
+{
+    int best = 0;
+    double d = 1e9;
+    for (int g = 3; g <= 5; ++g)
+    {
+        const double e = std::abs(std::log(gbs / (Mgpu::LinkGBs(g, 8) * kCopyEff)));
+        if (e < d)
+            d = e, best = g;
+    }
+    return std::format("about Gen{} x8", best);
+}
+const double kGen5x8 = 0.95 * 3.938 * 8 * kCopyEff;
+
+// Plain-language reasons multi-GPU runs slower than it could, most actionable first
+std::vector<std::string> Hints(const Mgpu::Stats& st, bool full)
+{
+    std::vector<std::string> h;
+    const Link r = LinkOf(st.render, st.sendGBs), d = LinkOf(st.display, st.ingestGBs);
+    if (st.displayBusy > 80)
+        h.push_back(full ? std::format("display-card bound ({:.0f}% busy): try a lower preset", st.displayBusy)
+                         : "display-card bound, try a lower preset");
+    // the timed copy is the frame alone; the HUD-less colour and vectors go over the same link
+    const double sendAll = st.sendGBs > 0 ? st.frameBytes / (st.sendGBs * 1e6) : st.sendMs;
+    const double sendShare = st.renderFrameMs > 0 && sendAll > 0 ? sendAll / st.renderFrameMs : 0;
+    const bool rSlow = r.gbs > 0 && r.gbs < kGen5x8, dSlow = d.gbs > 0 && d.gbs < kGen5x8;
+    if (rSlow || dSlow || sendShare > 0.15)
+    {
+        const bool onDisplay = dSlow && !rSlow;
+        const Link& l = onDisplay ? d : r;
+        std::string slot = l.known ? std::format("PCIe Gen{} x{} slot", l.gen, l.lanes)
+                                   : std::format("slot at {:.1f} GB/s ({})", l.measured, ClassOf(l.measured));
+        if (!rSlow && !dSlow)
+            // a full-speed slot: the volume is the cost
+            h.push_back(full ? std::format("link-bound: sending a frame ({:.0f} MB with HUD-less colour and vectors) "
+                                           "takes {:.2f} ms, {:.0f}% of a frame, on the render card's {}",
+                                           st.frameBytes / 1e6, sendAll, sendShare * 100, slot)
+                             : std::format("link-bound: send {:.0f}% of a frame ({:.0f} MB)", sendShare * 100,
+                                           st.frameBytes / 1e6));
+        else if (full)
+            h.push_back(std::format("link-bound: the {} card is in a {}; sending a frame ({:.0f} MB with HUD-less colour and "
+                                    "vectors) takes {:.2f} ms, {:.0f}% of a frame (Gen5 x8: about {:.2f} ms)",
+                                    onDisplay ? "display" : "render", slot, st.frameBytes / 1e6, sendAll,
+                                    sendShare * 100, st.frameBytes / (Mgpu::LinkGBs(5, 8) * kCopyEff * 1e6)));
+        else
+            h.push_back(std::format("link-bound: {} card in a {}", onDisplay ? "display" : "render", slot));
+    }
+    if (st.renderBusy >= 99)
+        h.push_back(full ? "render-card bound: the game's own rendering is the limit, not multi-GPU"
+                         : "render-card bound");
+    return h;
+}
 } // namespace
 
 void MgpuEnsureRuntime(NrEngine& e)
@@ -371,12 +457,40 @@ void MgpuDrawTab(const OptiPluginApi* api)
     line(std::format("Render card: {} (bus {}), {} busy", st.render.name, st.render.bus, Busy(st.renderBusy)));
     line(std::format("Display card: {} (bus {}), {} busy (D3D {}, network {})", st.display.name, st.display.bus,
                      Busy(st.displayBusy), Busy(st.displayD3dBusy), Busy(st.displayNetBusy)));
+    auto linkLine = [&](const char* who, const Mgpu::AdapterView& a, const char* copy, double ms, double gbs)
+    {
+        const Link l = LinkOf(a, gbs);
+        std::string t = l.known ? std::format("{} link: PCIe Gen{} x{} ({:.1f} GB/s raw)", who, l.gen, l.lanes,
+                                              Mgpu::LinkGBs(l.gen, l.lanes))
+                                : std::format("{} link: not reported by the driver", who);
+        if (gbs > 0)
+            t += std::format(", {} {:.2f} ms at {:.1f} GB/s", copy, ms, gbs) +
+                 (l.known ? std::format(" ({:.0f}% of raw)", 100 * gbs / Mgpu::LinkGBs(l.gen, l.lanes))
+                          : std::format(" ({})", ClassOf(gbs)));
+        line(t);
+    };
+    linkLine("Render card", st.render, "send", st.sendMs, st.sendGBs);
+    linkLine("Display card", st.display, "ingest", st.ingestMs, st.ingestGBs);
     line(std::format("Mode: {}, NR every frame {}, motion vectors {}, frames ahead {}", s.hudless ? "HUD-less" : "whole frame",
                      s.nrEveryFrame ? "on" : "off", s.temporal ? "on" : "off", s.maxLead));
-    line(std::format("Frame {}x{}, render {:.2f} ms, display {:.2f} ms, added latency {:.2f} ms", st.width, st.height,
-                     st.renderFrameMs, st.displayFrameMs, st.latencyMs));
-    line(std::format("Send {:.2f} ms ({:.1f} GB/s), ingest {:.2f} ms ({:.1f} GB/s), CPU waits send {:.2f} ms answer {:.2f} ms",
-                     st.sendMs, st.sendGBs, st.ingestMs, st.ingestGBs, st.sendWaitMs, st.answerWaitMs));
+    line(std::format("Frame {}x{}, render {:.2f} ms, display {:.2f} ms", st.width, st.height, st.renderFrameMs,
+                     st.displayFrameMs));
+    if (st.addedMs >= 0)
+        line(std::format("Added latency {:.1f} ms: render card done -> frame on the display card {:.1f} ms, "
+                         "display card (network, UI, present) {:.1f} ms",
+                         st.addedMs, st.renderToDisplayMs, st.displayToPresentMs));
+    else
+        line("Added latency: measuring");
+    api->TextDisabled(std::format("(game Present -> real Present {:.1f} ms: includes queueing a single card has too)",
+                                  st.latencyMs)
+                          .c_str());
+    for (const auto& h : Hints(st, true))
+        api->TextColored(1.0f, 0.8f, 0.3f, 1.0f, h.c_str());
+    line(std::format("Send {:.2f} ms ({:.1f} GB/s), ingest {:.2f} ms ({:.1f} GB/s); per frame {:.1f} MB with the "
+                     "HUD-less colour and vectors, about {:.2f} ms on the render card's link",
+                     st.sendMs, st.sendGBs, st.ingestMs, st.ingestGBs, st.frameBytes / 1e6,
+                     st.sendGBs > 0 ? st.frameBytes / (st.sendGBs * 1e6) : 0.0));
+    line(std::format("CPU waits: send {:.2f} ms, network answer {:.2f} ms", st.sendWaitMs, st.answerWaitMs));
     line(std::format("Frames sent {}, presented {}, skipped {}", st.produced, st.presented, st.skipped));
     if (s.hudless)
         line(std::format("HUD-less frames {}, missed {}, UI {:.1f}% of pixels, gate trips {}", st.hudlessFrames,
@@ -402,6 +516,33 @@ bool MgpuOverlayText(char* buf, size_t size)
         return true;
     }
     snprintf(buf, size, "render %s, display %s, +%.1f ms, NR %.1f ms", Busy(st.renderBusy).c_str(),
-             Busy(st.displayBusy).c_str(), st.latencyMs, nr.hipMs);
+             Busy(st.displayBusy).c_str(), st.addedMs >= 0 ? st.addedMs : st.latencyMs, nr.hipMs);
+    return true;
+}
+
+// Second overlay line: both links and why multi-GPU is slower, if it is
+bool MgpuOverlayHint(char* buf, size_t size)
+{
+    if (!g_on || !Mgpu::Redirected())
+        return false;
+    const auto st = Mgpu::GetStats();
+    if (st.fallback)
+        return false;
+    const Link r = LinkOf(st.render, st.sendGBs), d = LinkOf(st.display, st.ingestGBs);
+    std::string t = std::format("PCIe R {} {:.1f} GB/s, D {} {:.1f} GB/s", r.Short(), st.sendGBs, d.Short(), st.ingestGBs);
+    for (const auto& h : Hints(st, false))
+        t += "; " + h;
+    snprintf(buf, size, "%s", t.c_str());
+    // what the overlay shows, for runs nobody looks at
+    static auto last = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - last > std::chrono::seconds(10))
+    {
+        last = std::chrono::steady_clock::now();
+        char l1[256] {};
+        MgpuOverlayText(l1, sizeof(l1));
+        Log(OptiLog_Info, "[mgpu] overlay: MGPU: %s | Link: %s", l1, buf);
+        for (const auto& h : Hints(st, true))
+            Log(OptiLog_Info, "[mgpu] menu hint: %s", h.c_str());
+    }
     return true;
 }

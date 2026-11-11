@@ -73,6 +73,7 @@
     <ClCompile Include="src\mgpu\MgpuCore.cpp" />
     <ClCompile Include="src\mgpu\MgpuDump.cpp" />
     <ClCompile Include="src\mgpu\MgpuGpuLoad.cpp" />
+    <ClCompile Include="src\mgpu\MgpuLink.cpp" />
     <ClCompile Include="src\mgpu\MgpuSwapChain.cpp" />
     <ClCompile Include="src\mgpu\MgpuLatency.cpp" />
   </ItemGroup>

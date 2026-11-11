@@ -87,6 +87,7 @@ struct AdapterView
     LUID luid {};
     UINT outputs = 0;
     uint64_t vram = 0;
+    int pcieGen = 0, pcieLanes = 0; // the slot's link (ADLX), 0 = unknown
 };
 
 struct Stats
@@ -100,7 +101,11 @@ struct Stats
     double sendMs = 0, ingestMs = 0;                 // GPU time of the copy on each side
     double sendWaitMs = 0, answerWaitMs = 0;         // presenter CPU waits: the send landing, the network answer
     double sendGBs = 0, ingestGBs = 0;
+    double frameBytes = 0; // bytes sent per frame: the frame plus its HUD-less colour and vectors
     double latencyMs = 0;                            // proxy Present -> real Present (CPU)
+    // per frame, from fence completion times: render card done -> ingested on the display card -> display queue
+    // past the real Present. renderToDisplayMs + displayToPresentMs = addedMs (what a single card does not have)
+    double renderToDisplayMs = -1, displayToPresentMs = -1, addedMs = -1;
     double nrMs = 0;                                 // CPU time of the NR record+submit
     uint32_t ringDepth = 0, ringSlots = 0;
     uint64_t slotBytes = 0;
@@ -162,6 +167,8 @@ ID3D12CommandQueue* DisplayQueue();
 Stats& MutableStats();
 std::mutex& StatsMutex();
 void StartLoadSampler();
+void StartLinkQuery();
+double LinkGBs(int gen, int lanes); // theoretical per direction
 bool DumpTexture(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* tex, D3D12_RESOURCE_STATES state,
                  const std::wstring& base);
 } // namespace Mgpu
