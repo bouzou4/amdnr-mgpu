@@ -45,6 +45,9 @@ bool DumpTexture(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* tex, 
         FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a.Get(), nullptr, IID_PPV_ARGS(&l))) ||
         FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))))
         return false;
+    rb->SetName(L"Mgpu dump readback");
+    a->SetName(L"Mgpu dump allocator");
+    l->SetName(L"Mgpu dump list");
     D3D12_RESOURCE_BARRIER br {};
     br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     br.Transition = { tex, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE };
