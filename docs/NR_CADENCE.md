@@ -66,7 +66,7 @@ Held frames take the every-frame path: with multi-GPU that is the frame's own an
 | Satisfactory 2.5 and 5 px/frame, DX11 game 25 px/frame | none (0.02-0.44 times; under 7 % in place) | unchanged | unchanged | unchanged |
 
 - On one GPU nothing cheap helps content that changes in place: every path there applies a late answer, and dropping the edit on changed pixels is worse than the stale one (-11.4 against -8.7 dB on the menu).
-- In the Satisfactory menu the guard holds for 2 s at the scene cuts (the vectors mean nothing across a cut) and nowhere else.
+- In the Satisfactory menu the guard held once per 30 s job, for 2 s, each time outside the measured window; the one the log can place is a scene cut (the vectors mean nothing across a cut).
 
 ## GPU
 - `upsample_bench --cadence P,D` against the numpy prototype: 88-96 dB over 6 frames (cadence 3,2 at 4K), as for the stabiliser alone.
