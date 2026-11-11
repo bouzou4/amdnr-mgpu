@@ -131,6 +131,8 @@ Without history the output changes more than its input from frame to frame (posi
 
 ### Overlap presenter (`MgpuOverlap`)
 
+**Dropped (2026-11-11), this branch is an archive.** With the network asynchronous (`NrCadence=async`, spike/nr-async) the presenter never waits for it, and overlap adds nothing on top: Quality 64.88 against 65.14 fps, Ultra 61.08 against 61.83, latency 14.7-14.9 ms in all four (Satisfactory, cold, `MgpuDred=1`). Async alone gives more than overlap with every-frame NR (Quality 45.4 to 64.9 fps at 14.7 ms, against overlap's 53.1 fps at 27.5 ms). The PCIe link line and hints, the added-latency stats, the device-create race fix and the harness options went to spike/nr-async on their own.
+
 Satisfactory main menu, 3840x2160, FSR 4 output, HUD-less, temporal; one cold launch per preset with a 20 s overlap window, then a 20 s serial window (the presenter switched live). Both links at 28 GB/s (bw.exe). `MgpuDred=1` in all four: DRED breadcrumbs on the display device were the interim mitigation for the display-card losses at that time. Latency is the game's Present to the real Present.
 
 | Preset | serial fps | overlap fps | serial latency ms | overlap latency ms |
