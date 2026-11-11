@@ -327,14 +327,15 @@ class NrEngine
 
     // Cadence guard: on every 4th frame, every 8th pixel against last frame's guide in the history (HistoryCheck),
     // read back a few frames later. Vectors that do not explain the frame, or a lot of content changing in place,
-    // hold the cadence back (the every-frame path runs) until kGuardRelease clean readings in a row
-    static constexpr uint32_t kGuardSlots = 4, kGuardRelease = 30, kGuardEvery = 4;
+    // hold the cadence back (the every-frame path runs) until the readings have been clean for kGuardReleaseMs
+    static constexpr uint32_t kGuardSlots = 4, kGuardEvery = 4, kGuardReleaseMs = 2000;
     ComPtr<ID3D12PipelineState> _psoCheck;
     ComPtr<ID3D12Resource> _guardStat, _guardReadback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT _guardFp {};
     uint64_t _guardBytes = 0;
     uint64_t _guardValue[kGuardSlots] = {};
-    uint32_t _guardNext = 0, _guardGood = 0, _guardTick = 0;
+    uint32_t _guardNext = 0, _guardTick = 0;
+    uint64_t _guardBadMs = 0; // GetTickCount64 of the last reading that held
     bool _guardHold = false;
     void GuardCheck(ID3D12GraphicsCommandList* list, ID3D12Resource* color, DXGI_FORMAT colorFmt, uint32_t w, uint32_t h,
                     uint32_t encoding, ID3D12Resource* mv, uint32_t mvW, uint32_t mvH, float mvScaleX, float mvScaleY);

@@ -194,7 +194,6 @@ void NrEngine::Configure(const NrSettings& s)
         _accChain = false;
         _sinceFeed = 1000;
         _guardHold = false;
-        _guardGood = 0;
         _stats.cadenceHeld.clear();
     }
     if (s.testFailFeed && !_settings.testFailFeed)
@@ -510,8 +509,10 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
                            ID3D12Resource* motion, StabBind& b)
 {
     c.histMode = 0;
-    // cadence carries the edit between answers in this history, also with EditStabilise off (no blend then)
-    if ((!_settings.stabilise && c.cadence == 0) || _settings.upsample != 1)
+    // cadence carries the edit between answers in this history, also with EditStabilise off (no blend then).
+    // Every frame with the feed at the target size the shader writes none: not valid then
+    const bool native = _feedW >= w && _feedH >= h;
+    if ((!_settings.stabilise && c.cadence == 0) || _settings.upsample != 1 || (native && c.cadence == 0))
         return _stabValid = false;
     if (!_stab[0] || _stab[0]->GetDesc().Width != w || _stab[0]->GetDesc().Height != h)
     {
@@ -528,7 +529,8 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
             _stab[i]->SetName(L"lmxxf_nr edit history");
         }
     }
-    c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u) | (_settings.stabilise ? 0u : 8u);
+    c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u) |
+                 (_settings.stabilise && !(native && c.cadence == 16) ? 0u : 8u);
     b.hist = _stab[_stabCur].Get();
     b.out = _stab[_stabCur ^ 1].Get();
     b.motion = motion;
@@ -553,7 +555,7 @@ void NrEngine::GuardCheck(ID3D12GraphicsCommandList* list, ID3D12Resource* color
     if (!_psoCheck || !_stabValid || !_stab[_stabCur] || !_presentFence)
     {
         // nothing to check against: a hold ends after twice the usual wait
-        if (_guardHold && ++_guardGood >= 2 * kGuardRelease)
+        if (_guardHold && GetTickCount64() - _guardBadMs >= 2 * kGuardReleaseMs)
         {
             _guardHold = false;
             _stats.cadenceHeld.clear();
@@ -659,14 +661,14 @@ void NrEngine::GuardRead()
                     name.c_str(), why, 100 * n[0] / total, n[0] ? 100 * n[1] / n[0] : 0.0, n[0] ? 100 * n[2] / n[0] : 0.0,
                     100 * n[3] / total);
             _guardHold = true;
-            _guardGood = 0;
+            _guardBadMs = GetTickCount64();
             _stats.cadenceHeld = why;
         }
-        else if (_guardHold && ++_guardGood >= kGuardRelease)
+        else if (_guardHold && GetTickCount64() - _guardBadMs >= kGuardReleaseMs)
         {
             _guardHold = false;
             _stats.cadenceHeld.clear();
-            Log(OptiLog_Info, "cadence (%ls): resumed after %u clean checks", name.c_str(), kGuardRelease);
+            Log(OptiLog_Info, "cadence (%ls): resumed, checks clean for %u ms", name.c_str(), kGuardReleaseMs);
         }
     }
 }
@@ -2060,7 +2062,9 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
             c.mvToUvY = _mvCap.scaleY / float(_mvCap.h);
         }
         StabBind sb;
-        if (_settings.Cadenced() && hudTarget == nullptr) // held back: checked until it can resume
+        if (_settings.Cadenced() && hudTarget == nullptr) // held back: the history kept, checked until it can resume
+            c.cadence = 16;
+        if (c.cadence == 16)
             GuardCheck(list, _termCopy.Get(), bd.Format, w, h, encoding, mv ? _mvCopy.Get() : nullptr, _mvCap.w, _mvCap.h,
                        _mvCap.scaleX, _mvCap.scaleY);
         const bool stab = StabPrepare(list, w, h, mv && _mvCap.reset, c, mv ? _mvCopy.Get() : nullptr, sb);
@@ -2363,10 +2367,12 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         const DXGI_FORMAT fmt[4] = { sd.Format, ed.Format, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                      in.motion ? in.motion->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT };
         StabBind sb;
+        if (_settings.Cadenced()) // held back: the history kept, checked until it can resume
+            c.cadence = 16;
         const bool stab = StabPrepare(list, w, h, in.reset, c, mv ? in.motion : nullptr, sb);
         if (mv)
             Barrier(list, in.motion, in.motionState, kRead);
-        if (_settings.Cadenced()) // held back: checked until it can resume
+        if (c.cadence == 16)
             GuardCheck(list, _termCopy.Get(), sd.Format, w, h, in.encoding, mv ? in.motion : nullptr, in.motionW,
                        in.motionH, in.mvScaleX, in.mvScaleY);
         Dispatch(list, _psoApply.Get(), c, srv, fmt, _termOut.Get(), sd.Format, w, h, nullptr, stab ? &sb : nullptr);

@@ -38,7 +38,8 @@ cbuffer C : register(b0)
     uint HistMode;       // guided edit stabiliser: 0 off, 1 history reset (write only), 2 accumulate; | 4 Motion bound,
                          // | 8 no blend (EditStabilise off: the history only carries the edit between answers)
     uint Cadence;        // NrCadence: 0 every frame; 1 the pair is of an earlier frame (read at uv + Acc), 2 no pair
-                         // this frame (the accumulated ratio is held); | 4 Acc chains (Accumulate), | 8 Acc bound
+                         // this frame (the accumulated ratio is held); | 4 Acc chains (Accumulate), | 8 Acc bound,
+                         // 16 every frame while the cadence is held back: the history is kept at any feed size
 };
 
 static const float kGuard = 1.5; // fed median above this after mapping: bypass
@@ -288,7 +289,8 @@ float3 EditGuided(float2 uv, float3 c, float2 fs, uint2 px, bool pair)
             float3 f = Fed.SampleLevel(Lin, uv * FedUvScale, 0).rgb, en = Enh.SampleLevel(Lin, uv * EnhUvScale, 0).rgb;
             r = clamp((en - f) / (f + kRatioK), -1, 4);
             lr = clamp((Luma(en) + 1e-3) / (Luma(f) + 1e-3), 0, 4);
-            conf = saturate(1 - abs(g - Guide(f)) / kPairGuideTau);
+            if (Cadence & 1)
+                conf = saturate(1 - abs(g - Guide(f)) / kPairGuideTau);
         }
     }
     if (HistMode != 0)
@@ -322,7 +324,7 @@ float3 Edit(float2 uv, float3 c, uint2 px)
             uv += Acc.SampleLevel(Lin, (px + 0.5) / Size, 0).xy;
         return EditGuided(uv, c, fs, px, all(uv >= 0) && all(uv <= 1));
     }
-    if (UpMode == 1 && any(fs < float2(Size))) // feed at the target size: the edit as it is
+    if (UpMode == 1 && (any(fs < float2(Size)) || (Cadence & 16))) // feed at the target size: the edit as it is
         return EditGuided(uv, c, fs, px, true);
     float3 enh = Up(Enh, EnhUvScale, uv), fed = Up(Fed, FedUvScale, uv);
     float3 e = enh - fed;
