@@ -14,6 +14,7 @@
 #include "GpuWait.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 
@@ -183,9 +184,37 @@ bool NrEngine::LoadRuntime(const RuntimePaths& paths)
     return false;
 }
 
+// A build holds _mutex for seconds: the settings are queued then and applied when it ends
 void NrEngine::Configure(const NrSettings& s)
 {
-    std::lock_guard lock(_mutex);
+    {
+        std::lock_guard p(_pubM);
+        _pub = s;
+        _queued.reset();
+    }
+    std::unique_lock lock(_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        std::lock_guard p(_pubM);
+        _queued = s;
+        return;
+    }
+    ConfigureLocked(s);
+}
+
+void NrEngine::ApplyQueued()
+{
+    std::optional<NrSettings> q;
+    {
+        std::lock_guard p(_pubM);
+        q.swap(_queued);
+    }
+    if (q)
+        ConfigureLocked(*q);
+}
+
+void NrEngine::ConfigureLocked(const NrSettings& s)
+{
     if (s.placement != _settings.placement)
         _placementSwitch = true;
     if (s.cadence != _settings.cadence)
@@ -207,8 +236,8 @@ void NrEngine::Configure(const NrSettings& s)
 
 NrSettings NrEngine::Settings()
 {
-    std::lock_guard lock(_mutex);
-    return _settings;
+    std::lock_guard p(_pubM);
+    return _pub;
 }
 
 NrStats NrEngine::Stats()
@@ -1213,6 +1242,7 @@ bool NrEngine::Build(uint32_t feedW, uint32_t feedH, bool recreate, bool* kept)
 
 void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
 {
+    const auto t0 = std::chrono::steady_clock::now();
     // The game's list holding our last producer must be submitted first, its EnqueueHip needs the session
     for (;;)
     {
@@ -1244,6 +1274,11 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
         s.style = prev.style;
         s.temporal = prev.temporal;
         _settings = s;
+        {
+            std::lock_guard p(_pubM);
+            if (!_queued)
+                _pub = s;
+        }
         Log(OptiLog_Warn, "NR (%ls): new settings not applied, back to %ux%u (%s)", name.c_str(), prevW, prevH,
             kept ? "session kept" : "rebuilding it");
         ok = kept || Build(prevW, prevH, true, &kept);
@@ -1265,6 +1300,9 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
     {
         Fail(_stats.error.empty() ? "rebuild failed, " + DeviceNote() : _stats.error);
     }
+    ApplyQueued();
+    Log(OptiLog_Info, "NR (%ls): build done in %.0f ms (frames meanwhile passed through without NR)", name.c_str(),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     _mutex.unlock();
 }
 
@@ -1330,6 +1368,7 @@ bool NrEngine::Begin(ID3D12Device* device, ID3D12CommandQueue* queue, uint32_t s
     bool dirty;
     {
         std::lock_guard lock(_mutex);
+        ApplyQueued();
         FeedSize(srcW, srcH, &feedW, &feedH);
         dirty = _dirty;
         if (srcW != _histSrcW || srcH != _histSrcH)
@@ -1383,6 +1422,13 @@ void NrEngine::OnUpscale(OptiUpscaleFrame* f, bool after)
 {
     if (f->api != OptiApi_D3D12 || f->device == nullptr || f->commandList == nullptr || !RuntimeLoaded())
         return;
+    if (_state == State::Preparing)
+    {
+        const NrSettings s = Settings();
+        if (s.enabled && s.placement != Placement::Terminal && after == (s.placement == Placement::AfterUpscale))
+            _stats.framesSkipped++, SeqIdle("the network is being built");
+        return;
+    }
 
     const uint32_t gameApi =
         f->size >= offsetof(OptiUpscaleFrame, gameApi) + sizeof(f->gameApi) ? f->gameApi : uint32_t(OptiApi_D3D12);
@@ -1394,11 +1440,7 @@ void NrEngine::OnUpscale(OptiUpscaleFrame* f, bool after)
             (f->flags & OptiUpscale_Bridged) ? ", through OptiScaler's D3D12 bridge" : "");
     }
 
-    NrSettings s;
-    {
-        std::lock_guard lock(_mutex);
-        s = _settings;
-    }
+    const NrSettings s = Settings();
     if (!s.enabled || s.placement == Placement::Terminal)
         return;
     const bool pre = s.placement == Placement::BeforeUpscale;
@@ -1837,6 +1879,8 @@ void NrEngine::CaptureMotion(OptiUpscaleFrame* f)
 {
     auto* mv = static_cast<ID3D12Resource*>(f->motionVectors);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(f->commandList);
+    if (_state == State::Preparing)
+        return; // the next capture after the build replaces _mvCap
     std::lock_guard lock(_mutex);
     _mvCap = {};
     // Also without history: sequence dumps score against the vectors
@@ -1873,13 +1917,14 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         f->backBuffer == nullptr || f->device == nullptr || f->queue == nullptr)
         return;
 
-    NrSettings s;
-    {
-        std::lock_guard lock(_mutex);
-        s = _settings;
-    }
+    const NrSettings s = Settings();
     if (!s.enabled || s.placement != Placement::Terminal)
         return;
+    if (_state == State::Preparing)
+    {
+        _stats.framesSkipped++;
+        return SeqIdle("the network is being built");
+    }
 
     // The game's frame generation presents generated frames here too: whole frame on every present (consistent).
     // At the game's Present on its FG swapchain the HUD-less colour is this frame's FG input: HUD-less NR, and the

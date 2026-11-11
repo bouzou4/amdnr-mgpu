@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -216,6 +217,12 @@ class NrEngine
     Runtime _rt;
     std::mutex _mutex; // every runtime call, the job state and the stats
     NrSettings _settings;
+    // Settings() and a Configure() made while a build holds _mutex: never wait for the build
+    std::mutex _pubM;
+    NrSettings _pub;
+    std::optional<NrSettings> _queued;
+    void ConfigureLocked(const NrSettings& s);
+    void ApplyQueued(); // _mutex held
     NrSettings _active; // what the session was created with
     bool _dirty = false;
     bool _failNextFeed = false; // TestFailFeed
