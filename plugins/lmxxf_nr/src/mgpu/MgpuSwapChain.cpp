@@ -860,6 +860,11 @@ void ProxySwapChain::PresenterLoop()
     SetThreadDescription(GetCurrentThread(), L"Mgpu presenter");
     const auto& env = CurrentEnv();
     UINT64 slotDisplayValue[K] {};
+    UINT64 slotFrame[K] {}, slotGame[K] {}; // the frame last presented from each slot and its game fence value
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const double qpcMs = 1000.0 / double(qf.QuadPart);
+    double toDisplayMs = -1, toPresentMs = -1;
     bool slotCounted[K] {};
     const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     for (;;)
@@ -876,6 +881,7 @@ void ProxySwapChain::PresenterLoop()
         const UINT sync = _sync[s], flags = _flags[s];
         const auto tSched = _tSched[s];
         const SlotMeta meta = _meta[s];
+        const UINT64 gameVal = _gameVal[s];
         lk.unlock();
 
         // Recovery test: <dumpDir>\mgpu_remove.trigger removes the display device
@@ -910,6 +916,7 @@ void ProxySwapChain::PresenterLoop()
                 _dq->Signal(_releasedD.Get(), g);
                 _dq->Signal(_dFence.Get(), ++_dValue);
                 slotDisplayValue[s] = _dValue;
+                slotFrame[s] = 0;
                 slotCounted[s] = false;
                 if (env.nrIdle)
                     env.nrIdle("window minimised or occluded");
@@ -931,6 +938,16 @@ void ProxySwapChain::PresenterLoop()
         // not done (stop or 60 s): the slot is not reused, the loop comes back to the same frame
         if (!WaitReuse(_dFence.Get(), slotDisplayValue[s], "display", &_stop))
             continue;
+        toDisplayMs = toPresentMs = -1;
+        if (slotFrame[s])
+        {
+            // the slot's last frame: render done -> ingested -> display queue past its Present
+            const int64_t tg = _clock.Done(slotGame[s]), ti = _ingestClock.Done(slotFrame[s]),
+                          td = _shownClock.Done(slotDisplayValue[s]);
+            if (tg && ti && td && ti >= tg && td >= ti)
+                toDisplayMs = double(ti - tg) * qpcMs, toPresentMs = double(td - ti) * qpcMs;
+            slotFrame[s] = 0;
+        }
         double ingestMs = -1;
         if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
@@ -1006,6 +1023,7 @@ void ProxySwapChain::PresenterLoop()
             }
             _dq->ExecuteCommandLists(nl, l);
             _dq->Signal(_releasedD.Get(), g);
+            _ingestClock.Push(_releasedD.Get(), g);
             const bool probe = _probeFrames > 0;
             if (probe)
             {
@@ -1214,6 +1232,9 @@ void ProxySwapChain::PresenterLoop()
             for (UINT64 f = _consumed + 1; skipped && f < g; ++f)
                 Latency::Skipped(f);
             slotDisplayValue[s] = _dValue;
+            _shownClock.Push(_dFence.Get(), _dValue);
+            slotFrame[s] = g;
+            slotGame[s] = gameVal;
         }
         if (hr == DXGI_ERROR_INVALID_CALL && SUCCEEDED(_ddev->GetDeviceRemovedReason()) && _renewals < 8)
         {
@@ -1284,6 +1305,12 @@ void ProxySwapChain::PresenterLoop()
             st.displayFrameMs = Ema(st.displayFrameMs, std::chrono::duration<double, std::milli>(now - _lastDisplay).count());
         _lastDisplay = now;
         st.latencyMs = Ema(st.latencyMs, std::chrono::duration<double, std::milli>(now - tSched).count());
+        if (toDisplayMs >= 0)
+        {
+            st.renderToDisplayMs = Ema(st.renderToDisplayMs, toDisplayMs);
+            st.displayToPresentMs = Ema(st.displayToPresentMs, toPresentMs);
+            st.addedMs = st.renderToDisplayMs + st.displayToPresentMs;
+        }
         if (ingestMs > 0)
         {
             st.ingestMs = Ema(st.ingestMs, ingestMs);
@@ -1298,11 +1325,13 @@ void ProxySwapChain::PresenterLoop()
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
                                "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
                                "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {} "
-                               "display D3D {:.0f}% network {:.0f}%",
+                               "display D3D {:.0f}% network {:.0f}% added {:.2f} ms (render done -> display card {:.2f}, -> "
+                               "past present {:.2f})",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
                                st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
-                               st.sendWaitMs, st.answerWaitMs, st.sendStalls, st.displayD3dBusy, st.displayNetBusy));
+                               st.sendWaitMs, st.answerWaitMs, st.sendStalls, st.displayD3dBusy, st.displayNetBusy, st.addedMs,
+                               st.renderToDisplayMs, st.displayToPresentMs));
     }
 }
 
@@ -1401,10 +1430,10 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             Log(0, std::format("early send {} from the trigger at frame {}", _earlySend, next));
         }
     }
-    if (_llMode)
-        _clock.Push(_rgameFence.Get(), _rgameValue);
+    _clock.Push(_rgameFence.Get(), _rgameValue); // low latency pacing and the added latency stat
 
     double sendMs = -1;
+    UINT64 extraBytes = 0; // HUD-less colour and vectors sent beside the frame
     {
         std::unique_lock lk(_m);
         // Bound the lead over the display card ([Mgpu] MaxFramesAhead, default 1).
@@ -1441,7 +1470,9 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
                 {
                     auto sd = srcTex->GetDesc();
                     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-                    _rdev->GetCopyableFootprints(&sd, 0, 1, offset, &fp, nullptr, nullptr, nullptr);
+                    UINT64 bytes = 0;
+                    _rdev->GetCopyableFootprints(&sd, 0, 1, offset, &fp, nullptr, nullptr, &bytes);
+                    extraBytes += bytes;
                     D3D12_TEXTURE_COPY_LOCATION dl { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
                     dl.PlacedFootprint = fp;
                     D3D12_TEXTURE_COPY_LOCATION sl { srcTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
@@ -1460,6 +1491,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             }
         }
         _meta[s] = meta;
+        _gameVal[s] = _rgameValue;
         _rcopy->ExecuteCommandLists(nl, l);
         _rcopy->Signal(_filledR.Get(), g);
         Latency::Mark(g, Latency::Submit);
@@ -1496,6 +1528,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         st.sendMs = Ema(st.sendMs, sendMs);
         st.sendGBs = double(_payloadBytes) / (st.sendMs * 1e6);
     }
+    st.frameBytes = Ema(st.frameBytes, double(_payloadBytes + extraBytes));
     if (_llMode && _presentCount % 600 == 0)
         Log(0, std::format("low latency {}: render queue {:.2f} ms, pacing sleep {:.2f} ms (last {:.2f})",
                            _llMode, _pacer.QueueMs(), _pacer.SleepMs(), slept));
