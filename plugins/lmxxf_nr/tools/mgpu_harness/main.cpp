@@ -128,7 +128,7 @@ int main(int argc, char** argv)
     double cap = 0;
     const char* fuzzClasses = nullptr;
     const char* scriptPath = nullptr;
-    setvbuf(stdout, nullptr, _IOLBF, 4096);
+    setvbuf(stdout, nullptr, _IONBF, 0); // a killed or hung run keeps its step lines
     for (int i = 1; i < argc; ++i)
     {
         if (!strcmp(argv[i], "--nullAdapter"))
