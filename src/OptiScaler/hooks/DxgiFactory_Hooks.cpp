@@ -760,6 +760,16 @@ HRESULT DxgiFactoryHooks::CreateSwapChainForHwnd(IDXGIFactory2* realFactory, IUn
 {
     *ppSwapChain = nullptr;
 
+    // A plugin's FFX frame generation swapchain creating its real swapchain
+    if (PluginApi::FfxSwapchainCreate())
+    {
+        ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
+        ScopedSkipParentWrapping skipParentWrapping {};
+        LOG_INFO("Plugin FFX swapchain: passing CreateSwapChainForHwnd through");
+        return o_CreateSwapChainForHwnd(realFactory, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput,
+                                        ppSwapChain);
+    }
+
     static bool firstCall = static_cast<bool>(State::Instance().gameQuirks & GameQuirk::NoFSRFGFirstSwapchain);
     if (firstCall)
     {

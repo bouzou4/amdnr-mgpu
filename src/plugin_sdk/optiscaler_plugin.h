@@ -344,6 +344,18 @@ extern "C"
                                                   const void* fullscreenDesc, void* restrictToOutput,
                                                   void** swapChain);
 
+        // FidelityFX API (D3D12), added after version 1 (check with OPTI_API_HAS) -----------------------------
+
+        // ffxCreateContext / ffxDestroyContext / ffxConfigure / ffxQuery / ffxDispatch of OptiScaler's own
+        // FidelityFX modules (never the game's, never hooked for inputs). Descs and return codes are the FFX
+        // API's (ffx_api.h); context is an ffxContext*. Creating a frame generation swapchain context here gets a
+        // plain DXGI swapchain from OptiScaler's factory hooks: no swapchain provider, no wrapping.
+        uint32_t (*FfxCreateContextDx12)(void** context, void* desc, const void* memCb);
+        uint32_t (*FfxDestroyContextDx12)(void** context, const void* memCb);
+        uint32_t (*FfxConfigureDx12)(void** context, const void* desc);
+        uint32_t (*FfxQueryDx12)(void** context, void* desc);
+        uint32_t (*FfxDispatchDx12)(void** context, const void* desc);
+
     } OptiPluginApi;
 
 // True when the running OptiScaler has the given field of OptiPluginApi
