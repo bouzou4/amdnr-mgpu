@@ -75,6 +75,7 @@ NrSettings ReadSettings()
     s.wholeFrameFallback = g_keys.Bool("WholeFrameFallback", true);
     s.terminalHudless = g_keys.Bool("TerminalHudless", true);
     s.meter = g_keys.Bool("FlickerMeter", true);
+    s.testFailFeed = g_keys.Bool("TestFailFeed", false);
     return s;
 }
 

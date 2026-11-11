@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <atomic>
@@ -68,6 +69,7 @@ struct NrSettings
     bool wholeFrameFallback = true; // terminal without a HUD-less colour: NR on the whole frame, UI included
     bool terminalHudless = true; // false (test rigs): terminal ignores the HUD-less colour
     bool meter = true; // flicker meter on the network's answers (own-list placements)
+    bool testFailFeed = false; // test rigs: turning it on fails the next feed creation once
 };
 
 struct NrStats
@@ -175,6 +177,12 @@ class NrEngine
     bool CreatePipelines();
     bool EnsureTextures(uint32_t srcW, uint32_t srcH, DXGI_FORMAT, uint32_t feedW, uint32_t feedH);
     void Worker(uint32_t feedW, uint32_t feedH, bool recreate);
+    // Session + feed for feedW x feedH. False with *kept: nothing was touched, the running session is still usable.
+    bool Build(uint32_t feedW, uint32_t feedH, bool recreate, bool* kept);
+    void DestroySession();
+    bool DeviceLost() const { return _device && FAILED(_device->GetDeviceRemovedReason()); }
+    std::string DeviceNote(); // removed reason and this process's VRAM on the adapter, for failure logs
+    std::string VramNote();
     bool CreateSession();
     bool WarmUp();
     void DrainJob(); // consumes an enqueued job on the session queue, cancels a recorded one
@@ -209,12 +217,15 @@ class NrEngine
     NrSettings _settings;
     NrSettings _active; // what the session was created with
     bool _dirty = false;
+    bool _failNextFeed = false; // TestFailFeed
+    uint32_t _refusedW = 0, _refusedH = 0; // a feed size that failed to build: not retried until the settings change
     bool _placementSwitch = false; // the job in flight was fed by the other placement: its edit is dropped
     std::atomic<State> _state { State::Idle };
     std::thread _worker;
     NrStats _stats;
 
     ComPtr<ID3D12Device> _device;
+    ComPtr<IDXGIAdapter3> _adapter; // VRAM queries
     ComPtr<ID3D12CommandQueue> _queue; // session queue (direct), the runtime's EnqueueHip queue
     ComPtr<ID3D12Fence> _gameFence;    // game queue -> session queue
     ComPtr<ID3D12Fence> _hipFence;     // session queue -> game queue, network done
@@ -268,6 +279,7 @@ class NrEngine
     ComPtr<ID3D12Resource> _hudCopy, _hudOut; // the game's FG swapchain: its HUD-less input before / after the edit
     uint64_t _hudlessMissing = 0;
     uint32_t _hudlessStreak = 0; // presents in a row without a usable HUD-less colour
+    uint32_t _copyFails = 0;
     int8_t _termWhole = -1; // last terminal NR frame: 1 whole frame, 0 HUD-less
     ComPtr<ID3D12DescriptorHeap> _heap;
     uint32_t _heapCursor = 0, _heapStride = 0;
