@@ -15,6 +15,15 @@
 //   Hitch rig: --stall <at> --stall-ms <ms> [--stall-every <s>]: from <at> s the render queue waits on a fence the CPU
 //   signals <ms> later (a loading hitch: the send lands late, no long GPU packet on the render card); the game keeps
 //   presenting meanwhile
+//   Fake upscaler (the plugin's TestHooks=true): --upscaler renders the scene at --render-scale <f> (0.667) with motion
+//   vectors, calls the plugin's upscale callbacks around its own scaling pass and copies the result to the back
+//   buffer; --hudless gives the plugin that picture before the frame counter strip as the HUD-less colour
+//   Switch fuzzer: --fuzz <seed> [--fuzz-steps <n>] [--fuzz-classes <letters>] [--cap <fps>] [--mgpu]: a seeded
+//   sequence of live switches through the plugin's trigger files (i ini keys, d frame dumps, s sequence dumps,
+//   g multi-GPU triggers), window changes (r resize, m minimise) and upscaler changes (h HUD-less source on / off,
+//   q render scale, u reset flag / no vectors). Every step is printed with its frame; the same seed and options give
+//   the same steps at the same frames, --fuzz-classes keeps the sequence and drops the other classes. Stops at a
+//   device loss (exit 5) or when NR fails (exit 6)
 #include <windows.h>
 #include <d3dkmthk.h>
 #include <dxgi1_6.h>
@@ -28,7 +37,9 @@
 #include <thread>
 #include <vector>
 #include <d3dcompiler.h>
+#include <d3d12sdklayers.h>
 #include "../../../../src/external/AntiLag2-SDK/ffx_antilag2_dx12.h"
+#include "fuzz.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -110,6 +121,13 @@ int main(int argc, char** argv)
     double stallAt = -1, stallMs = 2500, stallEvery = 0;
     const char* csvPath = nullptr;
     const char* format = "sdr";
+    bool useUpscaler = false, useHudless = false, fuzz = false, mgpuHint = false;
+    float renderScale = 0.667f;
+    UINT64 fuzzSeed = 0;
+    int fuzzSteps = 200;
+    double cap = 0;
+    const char* fuzzClasses = nullptr;
+    setvbuf(stdout, nullptr, _IOLBF, 4096);
     for (int i = 1; i < argc; ++i)
     {
         if (!strcmp(argv[i], "--nullAdapter"))
@@ -148,6 +166,22 @@ int main(int argc, char** argv)
             useReflex = true;
         else if (!strcmp(argv[i], "--waitable"))
             useWaitable = true;
+        else if (!strcmp(argv[i], "--upscaler"))
+            useUpscaler = true;
+        else if (!strcmp(argv[i], "--hudless"))
+            useHudless = true;
+        else if (!strcmp(argv[i], "--mgpu"))
+            mgpuHint = true;
+        else if (!strcmp(argv[i], "--render-scale") && i + 1 < argc)
+            renderScale = (float) atof(argv[++i]);
+        else if (!strcmp(argv[i], "--fuzz") && i + 1 < argc)
+            fuzz = true, fuzzSeed = strtoull(argv[++i], nullptr, 0);
+        else if (!strcmp(argv[i], "--fuzz-steps") && i + 1 < argc)
+            fuzzSteps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fuzz-classes") && i + 1 < argc)
+            fuzzClasses = argv[++i];
+        else if (!strcmp(argv[i], "--cap") && i + 1 < argc)
+            cap = atof(argv[++i]);
         else
             seconds = atof(argv[i]);
     }
@@ -179,6 +213,19 @@ int main(int argc, char** argv)
         return 2;
     }
     printf("device bus=%d\n", PciBus(dev->GetAdapterLuid()));
+    {
+        // The plugin's Validation key turned the debug layer on: our rectangle clears are not what is tested
+        ComPtr<ID3D12InfoQueue> iq;
+        if (SUCCEEDED(dev.As(&iq)))
+        {
+            D3D12_MESSAGE_ID deny[] = { D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE };
+            D3D12_INFO_QUEUE_FILTER filter {};
+            filter.DenyList.NumIDs = 1;
+            filter.DenyList.pIDList = deny;
+            iq->AddStorageFilterEntries(&filter);
+            printf("debug layer on\n");
+        }
+    }
 
     // What the game's device adapter reports after the redirect (outputs forwarded from the display card)
     {
@@ -282,7 +329,32 @@ int main(int argc, char** argv)
     {
         q->Signal(fence.Get(), ++v);
         fence->SetEventOnCompletion(v, ev);
-        WaitForSingleObject(ev, 2000);
+        // validation runs are slow: until done or the device is gone
+        for (int i = 0; i < 30 && WaitForSingleObject(ev, 2000) != WAIT_OBJECT_0; ++i)
+            if (fence->GetCompletedValue() >= v || FAILED(dev->GetDeviceRemovedReason()))
+                break;
+    };
+    // Fake upscaler / HUD-less source through the plugin's test hooks
+    const bool pipe = useUpscaler || useHudless;
+    hx::Hooks hooks;
+    hx::Pipeline pl;
+    bool hudOn = useHudless;
+    if (pipe || fuzz)
+        printf("plugin test hooks: %s\n", hooks.Load() ? "found" : "not found (TestHooks=true, lmxxf_nr.asi loaded?)");
+    if (pipe && (!hooks.upscale || !pl.Init(dev.Get(), q.Get(), fmt, fp16 ? 4.0f : 1.0f)))
+    {
+        printf("fake upscaler unavailable\n");
+        return 6;
+    }
+    auto targets = [&]
+    {
+        if (!pipe)
+            return;
+        hooks.hudless(nullptr, 0);
+        if (!pl.Targets((UINT) W, (UINT) H, useUpscaler ? renderScale : 1.0f))
+            printf("fake upscaler targets failed\n");
+        else
+            printf("fake upscaler: render %ux%u -> %ux%u\n", pl.rw, pl.rh, pl.ow, pl.oh);
     };
     auto resize = [&](int w, int h, const char* why)
     {
@@ -296,7 +368,9 @@ int main(int argc, char** argv)
         W = (int) d.Width;
         H = (int) d.Height;
         views();
+        targets();
     };
+    targets();
 
     HANDLE waitable = nullptr;
     if (useWaitable)
@@ -499,15 +573,151 @@ int main(int argc, char** argv)
                 }
             });
     }
+    // Switch fuzzer state
+    hx::Fuzzer fz;
+    std::wstring dumpDir;
+    {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        dumpDir = exe;
+        dumpDir = dumpDir.substr(0, dumpDir.find_last_of(L'\\')) + L"\\lmxxf_nr_dumps";
+    }
+    UINT64 fuzzNext = 300; // frame of the next step: the first network build is over by then
+    int fuzzDone = 0, fuzzSkipped = 0;
+    UINT64 minimiseEnd = 0, resizeAtFrame = 0;
+    bool fuzzMinimised = false, minResize = false;
+    int pendW = 0, pendH = 0, resetLeft = 0, noMvLeft = 0;
+    uint32_t lastStatus = 0;
+    UINT64 stopAt = 0, fuzzEnd = 0;
+    int result = 0;
+    if (fuzz)
+    {
+        CreateDirectoryW(dumpDir.c_str(), nullptr);
+        fz.Init(fuzzSeed, mgpuHint, useUpscaler, fuzzClasses, fullW, fullH);
+        if (cap <= 0)
+            cap = 120;
+        printf("fuzz seed %llu, %d steps, classes %s, cap %.0f fps, upscaler %d, hudless %d, mgpu %d\n", fuzzSeed,
+               fuzzSteps, fuzzClasses ? fuzzClasses : "all", cap, (int) useUpscaler, (int) useHudless, (int) mgpuHint);
+    }
+    LONGLONG capNext = 0;
     for (;;)
     {
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE))
             DispatchMessageW(&m);
+        if (cap > 0)
+        {
+            const LONGLONG step = LONGLONG(double(fq.QuadPart) / cap);
+            LONGLONG now = qpc();
+            while (now < capNext)
+            {
+                Sleep(capNext - now > fq.QuadPart / 500 ? 1 : 0);
+                now = qpc();
+            }
+            capNext = (std::max)(capNext + step, now - step);
+        }
         QueryPerformanceCounter(&t);
         double el = double(t.QuadPart - t0.QuadPart) / fq.QuadPart;
         if (el > seconds)
             break;
+        if ((stopAt && frames >= stopAt) || (fuzzEnd && frames >= fuzzEnd))
+            break;
+        // Plugin state: a lost device or a failed NR ends the run a few frames later (its log gets the DRED lines)
+        if (hooks.status && frames % 8 == 0 && !stopAt)
+        {
+            const uint32_t st = hooks.status();
+            if (st != lastStatus)
+            {
+                printf("plugin status %x at frame %llu, %.2f s, after step %d%s%s%s%s\n", st, frames, el,
+                       fuzzDone + fuzzSkipped - 1,
+                       (st & 1) ? ": GAME DEVICE REMOVED" : "", (st & 2) ? ": DISPLAY CARD LOST" : "",
+                       (st & 4) ? ": NR FAILED (game card)" : "", (st & 8) ? ": NR FAILED (display card)" : "");
+                lastStatus = st;
+                if (fuzz && st)
+                {
+                    stopAt = frames + 40;
+                    result = (st & 3) ? 5 : 6;
+                }
+            }
+        }
+        if (fuzz && !stopAt)
+        {
+            if (fuzzMinimised && frames >= minimiseEnd)
+            {
+                fuzzMinimised = false;
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                printf("fuzz: restored at frame %llu\n", frames);
+                if (minResize)
+                    resize(W, H, "after restore");
+            }
+            if (resizeAtFrame && frames >= resizeAtFrame)
+            {
+                resizeAtFrame = 0;
+                resize(pendW, pendH, "fuzz");
+            }
+            if (frames >= fuzzNext)
+            {
+                if (fuzzDone + fuzzSkipped >= fuzzSteps)
+                {
+                    // the last switches play out, then the run ends
+                    if (!fuzzEnd)
+                        fuzzEnd = frames + 240;
+                }
+                else
+                {
+                    hx::Action a = fz.Next(frames);
+                    fuzzNext = frames + a.gap;
+                    SYSTEMTIME lt {};
+                    GetLocalTime(&lt);
+                    printf("fuzz %d frame %llu t %.2f at %02u:%02u:%02u.%03u%s: %s\n", fuzzDone + fuzzSkipped, frames, el,
+                           lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds, a.skip ? " (masked)" : "", a.what.c_str());
+                    if (a.skip)
+                        ++fuzzSkipped;
+                    else
+                    {
+                        ++fuzzDone;
+                        for (auto& f : a.files)
+                            if (!hx::WriteTrigger(dumpDir, f.first, f.second))
+                                printf("fuzz: trigger %ls not written\n", f.first.c_str());
+                        switch (a.kind)
+                        {
+                        case hx::Action::Hud:
+                            hudOn = a.a != 0;
+                            break;
+                        case hx::Action::Resize:
+                            SetWindowPos(hwnd, nullptr, 0, 0, a.a, a.b, SWP_NOZORDER | SWP_NOACTIVATE);
+                            pendW = a.a, pendH = a.b;
+                            if (a.c == 0)
+                                resize(pendW, pendH, "fuzz");
+                            else
+                                resizeAtFrame = frames + a.c;
+                            break;
+                        case hx::Action::Minimise:
+                            fuzzMinimised = true;
+                            minResize = a.b != 0;
+                            minimiseEnd = frames + a.a;
+                            ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+                            if (minResize)
+                                resize(W, H, "after minimise");
+                            break;
+                        case hx::Action::Scale:
+                            renderScale = a.f;
+                            idle();
+                            targets();
+                            break;
+                        case hx::Action::Reset:
+                            resetLeft = a.a;
+                            break;
+                        case hx::Action::NoMv:
+                            noMvLeft = a.a;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         if (fseAt >= 0 && fseStep == 0 && el > fseAt)
         {
             fseStep = 1;
@@ -586,11 +796,20 @@ int main(int argc, char** argv)
         D3D12_RESOURCE_BARRIER b {};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition = { bb[i].Get(), 0, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET };
-        cl->ResourceBarrier(1, &b);
         auto h = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += i * inc;
         float bg[4] = { 0.1f, 0.12f, 0.2f, 1 };
-        cl->ClearRenderTargetView(h, bg, 0, nullptr);
+        if (pipe)
+        {
+            pl.Frame(cl.Get(), bb[i].Get(), i, frames, hooks, useUpscaler, resetLeft > 0, noMvLeft > 0);
+            resetLeft -= resetLeft > 0;
+            noMvLeft -= noMvLeft > 0;
+        }
+        else
+        {
+            cl->ResourceBarrier(1, &b);
+            cl->ClearRenderTargetView(h, bg, 0, nullptr);
+        }
         if (iters)
         {
             cl->SetPipelineState(pso.Get());
@@ -600,7 +819,7 @@ int main(int argc, char** argv)
             cl->Dispatch(groups, 1, 1);
         }
         // Moving bars: position from the frame count, so dumps can be matched frame by frame.
-        for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < 8 && !pipe; ++j)
         {
             int x = int((frames * (4 + j * 3) + j * 400) % (UINT64) W);
             D3D12_RECT r { x, j * H / 8, (std::min)(x + W / 16, W), (j + 1) * H / 8 - 8 };
@@ -631,6 +850,8 @@ int main(int argc, char** argv)
         }
         ID3D12CommandList* ls[] = { cl.Get() };
         q->ExecuteCommandLists(1, ls);
+        if (pipe)
+            hooks.hudless(hudOn ? pl.hud.Get() : nullptr, hx::Pipeline::kRead);
         marker(frames + 1, 3); // RENDERSUBMIT_END
         marker(frames + 1, 4); // PRESENT_START
         const LONGLONG tPresent = qpc();
@@ -639,6 +860,13 @@ int main(int argc, char** argv)
         marker(frames + 1, 5); // PRESENT_END
         if (FAILED(hr) && failed++ < 5)
             printf("Present %08lx at frame %llu\n", hr, frames);
+        if (fuzz && !stopAt && (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DEVICE_RESET))
+        {
+            printf("DEVICE LOST: Present %08lx, removed reason %08lx at frame %llu, %.2f s, after step %d\n", hr,
+                   dev->GetDeviceRemovedReason(), frames, el, fuzzDone + fuzzSkipped - 1);
+            stopAt = frames + 3;
+            result = 5;
+        }
         q->Signal(fence.Get(), ++v);
         fv[i] = v;
         if (frames < times.size())
@@ -656,6 +884,11 @@ int main(int argc, char** argv)
     QueryPerformanceCounter(&t);
     double el = double(t.QuadPart - t0.QuadPart) / fq.QuadPart;
     printf("frames=%llu seconds=%.2f fps=%.1f failed=%llu\n", frames, el, frames / el, failed);
+    if (fuzz)
+        printf("fuzz end: seed %llu, %d steps applied, %d masked, result %d (%s)\n", fuzzSeed, fuzzDone, fuzzSkipped, result,
+               result == 5 ? "device lost" : result == 6 ? "NR failed" : fuzzDone + fuzzSkipped >= fuzzSteps ? "all steps" : "time up");
+    if (pipe)
+        hooks.hudless(nullptr, 0);
     if (csvPath)
     {
         idle();
@@ -676,5 +909,7 @@ int main(int argc, char** argv)
     if (fs)
         sc->SetFullscreenState(FALSE, nullptr);
     idle();
+    if (result)
+        return result;
     return failed ? 4 : 0;
 }
