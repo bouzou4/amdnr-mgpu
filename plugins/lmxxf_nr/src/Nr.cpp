@@ -1983,7 +1983,9 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
     }
     _dumpArmed = true;
     _dumpGameValue = 0;
-    _dumpOwnValue = _presentCounter; // own lists: done once the present fence reaches it
+    // own lists: done once the present fence reaches it. A game list: only once OnExecute saw it submitted (the
+    // present fence of an earlier terminal placement is long past)
+    _dumpOwnValue = list == _presentList.Get() ? _presentCounter : 0;
     Log(OptiLog_Info, "dump recorded (%ls): source fmt %u, encoding %u", name.c_str(),
         source ? (unsigned) source->GetDesc().Format : 0u, (unsigned) _stats.encoding);
 }
