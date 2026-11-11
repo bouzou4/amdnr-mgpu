@@ -359,9 +359,12 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
             s.Flags = D3D12_RESOURCE_FLAG_NONE;
             _hudR.resize(_gameCount);
             for (UINT i = 0; i < _gameCount; ++i)
+            {
                 if (FAILED(hr = _rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &s, D3D12_RESOURCE_STATE_COMMON,
                                                                nullptr, IID_PPV_ARGS(&_hudR[i]))))
                     return hr;
+                _hudR[i]->SetName(std::format(L"Mgpu hudless staging {}", i).c_str());
+            }
         }
         if (_wantMv)
         {
@@ -392,6 +395,7 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
     CloseHandle(h);
     if (FAILED(hr))
         return hr;
+    _heapR->SetName(L"Mgpu ring heap R");
 
     D3D12_RESOURCE_DESC b {};
     b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -409,6 +413,8 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
             FAILED(hr = _rdev->CreatePlacedResource(_heapR.Get(), s * _slotBytes, &b, D3D12_RESOURCE_STATE_COMMON,
                                                     nullptr, IID_PPV_ARGS(&_slotR[s]))))
             return hr;
+        _slotD[s]->SetName(std::format(L"Mgpu ring slot D {}", s).c_str());
+        _slotR[s]->SetName(std::format(L"Mgpu ring slot R {}", s).c_str());
     }
 
     // Timestamps: two per slot on each side, resolved to readback at slot * 16.
@@ -425,12 +431,16 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
             FAILED(_rdev->CreateCommittedResource(&rbp, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST,
                                                   nullptr, IID_PPV_ARGS(&_rReadback))))
             _rQuery.Reset();
+        else
+            _rQuery->SetName(L"Mgpu send timestamps"), _rReadback->SetName(L"Mgpu send timestamp readback");
     }
     qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     if (FAILED(_ddev->CreateQueryHeap(&qd, IID_PPV_ARGS(&_dQuery))) ||
         FAILED(_ddev->CreateCommittedResource(&rbp, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                               IID_PPV_ARGS(&_dReadback))))
         _dQuery.Reset();
+    else
+        _dQuery->SetName(L"Mgpu ingest timestamps"), _dReadback->SetName(L"Mgpu ingest timestamp readback");
 
     // Render side: one prerecorded copy per (back buffer, slot).
     _rAlloc.resize(_gameCount * K);
@@ -444,6 +454,8 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
                                                      IID_PPV_ARGS(&_rList[n]))))
                 return hr;
             auto* c = _rList[n].Get();
+            _rAlloc[n]->SetName(L"Mgpu send allocator");
+            c->SetName(std::format(L"Mgpu send list bb{} slot{}", i, s).c_str());
             if (_rQuery)
                 c->EndQuery(_rQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2);
             D3D12_TEXTURE_COPY_LOCATION dst { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
@@ -481,6 +493,12 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
                                                      IID_PPV_ARGS(&_duList[s]))) ||
                 FAILED(hr = _duList[s]->Close()))
                 return hr;
+            _rxAlloc[s]->SetName(L"Mgpu extras send allocator");
+            _rxList[s]->SetName(std::format(L"Mgpu extras send list {}", s).c_str());
+            _dxAlloc[s]->SetName(L"Mgpu extras ingest allocator");
+            _dxList[s]->SetName(std::format(L"Mgpu extras ingest list {}", s).c_str());
+            _duAlloc[s]->SetName(L"Mgpu UI allocator");
+            _duList[s]->SetName(std::format(L"Mgpu UI list {}", s).c_str());
         }
     }
     if (_wantHud)
@@ -538,6 +556,8 @@ HRESULT ProxySwapChain::CreateFallbackLists()
                                                      IID_PPV_ARGS(&_fList[n]))))
                 return hr;
             auto* c = _fList[n].Get();
+            _fAlloc[n]->SetName(L"Mgpu fallback allocator");
+            c->SetName(std::format(L"Mgpu fallback list bb{} real{}", i, m).c_str());
             D3D12_RESOURCE_BARRIER b[2] = { Tr(_bb[i].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                             Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT,
                                                D3D12_RESOURCE_STATE_COPY_DEST) };
@@ -572,6 +592,8 @@ HRESULT ProxySwapChain::CreateIngestLists()
                                                      IID_PPV_ARGS(&_dList[n]))))
                 return hr;
             auto* c = _dList[n].Get();
+            _dAlloc[n]->SetName(L"Mgpu ingest allocator");
+            c->SetName(std::format(L"Mgpu ingest list slot{} real{}", s, m).c_str());
             D3D12_RESOURCE_BARRIER br {};
             br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             br.Transition = { _realBb[m].Get(), 0, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST };
@@ -766,6 +788,7 @@ void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& g
         if (FAILED(_rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &m, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                   IID_PPV_ARGS(&_mvR[i]))))
             return;
+        _mvR[i]->SetName(std::format(L"Mgpu motion staging {}", i).c_str());
         Log(0, std::format("motion staging {} {}x{} fmt {}", i, m.Width, m.Height, (int) m.Format));
     }
     D3D12_RESOURCE_BARRIER b[2] = { Tr(_mvR[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
