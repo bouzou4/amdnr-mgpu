@@ -320,7 +320,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.temporal = g_keys.Bool("MgpuMotionVectors", true);
     s.uiGate = std::clamp(g_keys.Float("MgpuUiGate", 0.90f), 0.0f, 1.0f);
     s.maxLead = (unsigned) std::clamp(g_keys.Int("MgpuMaxFramesAhead", 1), 1, 3);
-    s.overlap = std::clamp(g_keys.Int("MgpuOverlap", 0), 0, 2);
+    s.overlap = std::clamp(g_keys.Int("MgpuOverlap", 0), 0, 1);
     s.lowLatency = std::clamp(g_keys.Int("MgpuLowLatency", 2), 0, 2);
     s.earlySend = g_keys.Bool("MgpuEarlySend", false);
     s.presentIdle = g_keys.Bool("MgpuPresentIdle", false);

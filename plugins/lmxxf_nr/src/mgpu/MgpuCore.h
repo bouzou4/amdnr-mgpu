@@ -24,8 +24,7 @@ struct Settings
     bool temporal = false;     // send the render card's motion vectors; NR keeps a network history
     double uiGate = 0.90;      // HUD-less: above this share of differing pixels the pair is wrong: no NR that frame
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
-    int overlap = 0;           // display card pipeline: 0 serial, 1 overlap with just-in-time sends, 2 overlap with
-                               // a frame queued (see ProxySwapChain::IngestLoop)
+    int overlap = 0;           // display card pipeline: 0 serial, 1 overlap (see ProxySwapChain::IngestLoop)
     int lowLatency = 2;        // 1: Present throttles on the render card, 2: and paces the next frame (Pacer)
     bool earlySend = false;    // the send copy is queued before the wait for the display card
     bool presentIdle = false;  // the real Present goes only to an idle display queue (bounded CPU wait)
@@ -107,7 +106,7 @@ struct Stats
     // per frame, from fence completion times: render card done -> ingested on the display card -> display queue
     // past the real Present. renderToDisplayMs + displayToPresentMs = addedMs (what a single card does not have)
     double renderToDisplayMs = -1, displayToPresentMs = -1, addedMs = -1;
-    double jitLeadMs = 0; // overlap 1: how long before the work stage frees up the game sends the next frame
+    double jitLeadMs = 0; // overlap: how long before the work stage frees up the game sends the next frame
     double nrMs = 0;                                 // CPU time of the NR record+submit
     uint32_t ringDepth = 0, ringSlots = 0;
     uint64_t slotBytes = 0;

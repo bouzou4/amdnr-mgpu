@@ -160,7 +160,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     std::condition_variable _cv;
     UINT64 _scheduled = 0, _consumed = 0; // consumed: presented (the game is released after the Present)
     UINT64 _taken = 0; // overlap: frames the ingest thread took from the ring
-    UINT64 _workFrame = 0; // overlap 1: the frame the work stage is on, and when the game may send the next one
+    UINT64 _workFrame = 0; // overlap: the frame the work stage is on, and when the game may send the next one
     int64_t _grantQpc = 0;
     UINT64 _picked[K] {}; // last frame the display card took from each slot
     UINT _sync[K] {}, _flags[K] {};
@@ -234,8 +234,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
 
     // overlap pipeline
     static constexpr UINT kDepth = 2; // overlap: frames taken from the ring and not yet presented
-    std::atomic<int> _overlap { 0 };  // 0: the serial presenter, 1: overlap with just-in-time sends, 2: overlap with
-                                      // the game up to 2 frames ahead of the presented one
+    std::atomic<int> _overlap { 0 };  // 0: the serial presenter, 1: the overlap pipeline (just-in-time sends)
     int _pipeline = 0;               // what the running presenter threads are (0 serial, 1 overlap)
     UINT64 _phaseN0 = 0;             // presented count and time at the last overlap switch
     std::chrono::steady_clock::time_point _phaseT0 = std::chrono::steady_clock::now();

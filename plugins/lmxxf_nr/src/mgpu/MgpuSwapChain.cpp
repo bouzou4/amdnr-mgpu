@@ -1481,7 +1481,7 @@ HRESULT ProxySwapChain::CreateOverlapBuffers()
     return S_OK;
 }
 
-// <dumpDir>\mgpu_overlap.trigger (0 serial, 1-2 overlap depth), switched live; 0 <-> 1-2 restarts the presenter
+// <dumpDir>\mgpu_overlap.trigger (0 serial, 1 overlap), switched live: the presenter restarts
 void ProxySwapChain::ReadOverlapTrigger(UINT64 next)
 {
     const auto& env = CurrentEnv();
@@ -1492,7 +1492,7 @@ void ProxySwapChain::ReadOverlapTrigger(UINT64 next)
     if (!fp)
         return;
     int v = -1;
-    const bool ok = fscanf(fp, "%d", &v) == 1 && v >= 0 && v <= 2;
+    const bool ok = fscanf(fp, "%d", &v) == 1 && v >= 0 && v <= 1;
     fclose(fp);
     DeleteFileW(trig.c_str());
     if (!ok)
@@ -1527,12 +1527,6 @@ void ProxySwapChain::ReadOverlapTrigger(UINT64 next)
         _overlap = v;
         _nrReset = true;
         StartPresenter();
-    }
-    else
-    {
-        _overlap = v;
-        std::lock_guard g(_pm);
-        _pcv.notify_all();
     }
 }
 
@@ -1708,7 +1702,7 @@ void ProxySwapChain::WorkLoop()
         if (_stopO)
             break;
         {
-            // Just in time (overlap 1): the game may send the next frame so that it is ingested as this stage frees up.
+            // Just in time: the game may send the next frame so that it is ingested as this stage frees up.
             // ready - tFree > 0: this frame's ingest ended after the stage was free (sent too late), < 0: it waited.
             const int64_t ready = _ingestClock.Done(g);
             LARGE_INTEGER q;
@@ -2268,10 +2262,10 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
     {
         std::unique_lock lk(_m);
         // Bound the lead over the display card ([Mgpu] MaxFramesAhead, default 1).
-        // Overlap 2: the game may be 2 frames ahead of the presented one (a frame waits, ingested, for the network).
-        // Overlap 1: one frame ahead, and a second one only when the work stage is about to be free (just in time).
-        const bool jit = _pipeline && _overlap.load() == 1;
-        const UINT64 lead = (std::max)((std::max)(1u, CurrentSettings().maxLead), _pipeline && !jit ? 2u : 1u);
+        // Overlap: one frame ahead, and a second one only when the work stage is about to be free (just in time). A
+        // game free to run 2 frames ahead gave the same frame rate with a whole display frame more latency.
+        const bool jit = _pipeline != 0;
+        const UINT64 lead = (std::max)(1u, CurrentSettings().maxLead);
         // Early send: the copy goes to the GPU before the lead wait (the slot's last reader is done: consumed >= g - 2)
         const bool early = _earlySend && lead == 1 && !jit;
         if (!early)
