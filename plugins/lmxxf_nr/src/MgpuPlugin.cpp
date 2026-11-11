@@ -233,8 +233,9 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.lowLatency = std::clamp(g_keys.Int("MgpuLowLatency", 2), 0, 2);
     s.earlySend = g_keys.Bool("MgpuEarlySend", false);
     s.presentIdle = g_keys.Bool("MgpuPresentIdle", false);
-    // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
-    s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", false) ? 1 : 0), 0, 2);
+    // MgpuDred: 1 (default) breadcrumbs + page faults, 2 page faults only, 0 / false off. With the breadcrumbs the
+    // display card's device loss has not been seen (0 of 17 cold launches, 12 of 39 without)
+    s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", true) ? 1 : 0), 0, 2);
     s.forwardOutputs = g_keys.Bool("MgpuForwardOutputs", true);
 
     g_dir = dumpDir;
