@@ -582,7 +582,7 @@ int main(int argc, char** argv)
         dumpDir = exe;
         dumpDir = dumpDir.substr(0, dumpDir.find_last_of(L'\\')) + L"\\lmxxf_nr_dumps";
     }
-    UINT64 fuzzNext = 300; // frame of the next step: the first network build is over by then
+    UINT64 fuzzNext = 120; // frame of the first step
     int fuzzDone = 0, fuzzSkipped = 0;
     UINT64 minimiseEnd = 0, resizeAtFrame = 0;
     bool fuzzMinimised = false, minResize = false;

@@ -347,11 +347,11 @@ struct Fuzzer
         if (burst > 0)
             return minGap;
         const uint32_t r = rng.Below(100);
-        if (r < 50)
+        if (r < 60)
             return minGap + rng.Below(15);
-        if (r < 85)
-            return 30 + rng.Below(50);
-        return 150 + rng.Below(100);
+        if (r < 90)
+            return 25 + rng.Below(35);
+        return 100 + rng.Below(80);
     }
 
     Action Next(uint64_t frame)

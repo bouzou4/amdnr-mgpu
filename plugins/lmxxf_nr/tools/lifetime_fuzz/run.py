@@ -9,7 +9,7 @@ D3D12 debug layer message, plugin error and device loss with the switches that l
     python run.py --stage DIR --out DIR --opti OptiScaler.dll --asi lmxxf_nr.asi --harness mgpu_harness.exe \
         --ini OptiScaler.ini --runtime-dir DIR [--modules-dir DIR] [--weights-dir DIR] \
         --seeds 1 2 3 --modes single mgpu [--steps 220] [--seconds 105] [--validation 2] \
-        [--reslock reslock.py --owner fuzz --minutes 2] [--classes idsr] [--key K=V ...]
+        [--reslock reslock.py --owner fuzz --minutes 2 --pause 120] [--classes idsr] [--key K=V ...]
 
 A device loss ends its run; the next one starts after --cooldown seconds (Windows bugchecks on 5 TDRs in a minute),
 and the campaign stops after --max-losses of them. `python run.py --out DIR --report` only rebuilds the findings.
@@ -247,6 +247,7 @@ def main():
     ap.add_argument('--owner', default='fuzz')
     ap.add_argument('--res', help='default: display,gpu3 for single, display,gpu3,gpu7 for mgpu')
     ap.add_argument('--minutes', type=int, default=2)
+    ap.add_argument('--pause', type=int, default=0, help='seconds between runs, so other lease holders get turns')
     ap.add_argument('--cooldown', type=int, default=90)
     ap.add_argument('--max-losses', type=int, default=3)
     a = ap.parse_args()
@@ -266,6 +267,8 @@ def main():
                         report(a.out)
                         return 3
                     time.sleep(a.cooldown)
+                elif a.pause:
+                    time.sleep(a.pause)
     runs, items = report(a.out)
     print(f'{len(runs)} runs, {len(items)} distinct findings: {Path(a.out) / "findings.md"}')
     return 0
