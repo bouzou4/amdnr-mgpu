@@ -620,8 +620,10 @@ void NrEngine::GuardCheck(ID3D12GraphicsCommandList* list, ID3D12Resource* color
     _guardNext++;
 }
 
-// Thresholds on recorded sequences: right vectors miss 0-8 % at the moved position and 0.02-0.4 of the in-place
-// misses, wrong-sign ones 1.2 of them; an animated menu changes 27-31 % of the frame in place, gameplay under 7 %
+// Vectors are wrong when the moved read misses as often as the in-place one, on a part of the frame that matters:
+// recorded right vectors miss 0.02-0.4 times as often, wrong-sign ones 1.2 times; a moving object with poor vectors
+// in the Satisfactory menu reached 0.8 on 11 % of the frame and is the per-pixel tests' business, not a hold.
+// An animated menu changes 27-31 % of the frame in place, gameplay under 7 %
 void NrEngine::GuardRead()
 {
     if (!_guardReadback || !_presentFence)
@@ -646,7 +648,7 @@ void NrEngine::GuardRead()
         D3D12_RANGE none { 0, 0 };
         _guardReadback->Unmap(0, &none);
         const double total = 16.0 * _guardFp.Footprint.Width * _guardFp.Footprint.Height;
-        const bool vectors = n[0] >= 0.02 * total && n[1] >= 0.01 * n[0] && n[1] >= 0.75 * n[2];
+        const bool vectors = n[0] >= 0.02 * total && n[1] >= 0.01 * total && n[1] >= 0.9 * n[2];
         const bool changing = n[3] >= 0.15 * total;
         if (vectors || changing)
         {
