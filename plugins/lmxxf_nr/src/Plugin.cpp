@@ -36,6 +36,13 @@ void ConfigureAll(const NrSettings& s)
 }
 bool g_hudlessRequested = false;
 
+// Test rigs (TestHooks=true): a title without an upscaler calls the upscale callbacks itself and gives the HUD-less
+// colour of the frame it presents next, see LmxxfNrTestUpscale / LmxxfNrTestHudless
+bool g_testHooks = false;
+std::atomic<void*> g_testHud { nullptr };
+std::atomic<uint32_t> g_testHudState { 0 };
+std::atomic<uint64_t> g_testUpscaleId { 0 };
+
 const char* const kPlacements[] = { "Before upscaling", "After upscaling", "Terminal (HUD-less)" };
 const char* const kSizes[] = { "1080 tier", "1440 (2560x1440)", "Native" };
 const char* const kModels[] = { "Full (71 blocks)", "Small (31 blocks)" };
@@ -331,6 +338,18 @@ void Present(OptiPresentFrame* frame, void*)
         SettingsTrigger();
         IniTrigger();
         FrameLogTrigger();
+    }
+    if (g_testHooks)
+    {
+        if (const uint64_t id = g_testUpscaleId.load())
+            frame->upscaleFrameId = id;
+        if (void* hud = g_testHud.load(); hud != nullptr && frame->hudless == nullptr)
+        {
+            frame->hudless = hud;
+            frame->hudlessState = g_testHudState.load();
+            if (frame->size >= offsetof(OptiPresentFrame, hudlessSource) + sizeof(uint32_t))
+                frame->hudlessSource = OptiHudless_FfxFG;
+        }
     }
     if (MgpuActive())
         return MgpuOnPresent(frame);
@@ -718,6 +737,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     }
     g_keys.multiGpu = g_keys.Bool("MultiGpu", false);
 
+    g_testHooks = g_keys.Bool("TestHooks", false);
     g_ui = ReadSettings();
     // A profile preset never overrides rows the user set
     const bool presetFromProfile = !g_keys.UserSet("Preset");
@@ -804,6 +824,43 @@ extern "C" __declspec(dllexport) bool OptiPluginShutdown()
     delete &DisplayEngine();
     Log(OptiLog_Info, "shut down for hot reload");
     return true;
+}
+
+// Test rigs (TestHooks=true): the upscale callbacks for a title that has no upscaler. frame as OptiScaler would
+// fill it; before the title's own scaling pass (after = 0), then after it (after = 1).
+extern "C" __declspec(dllexport) void LmxxfNrTestUpscale(OptiUpscaleFrame* frame, int32_t after)
+{
+    if (!g_testHooks || frame == nullptr)
+        return;
+    g_testUpscaleId = frame->frameId;
+    if (after)
+        UpscaleAfter(frame, nullptr);
+    else
+        UpscaleBefore(frame, nullptr);
+}
+
+// Test rigs (TestHooks=true): the HUD-less colour of the frame presented next (the back buffer's size and format,
+// left in state), nullptr for none. Presents get it the way the game's FSR FG input arrives.
+extern "C" __declspec(dllexport) void LmxxfNrTestHudless(void* hudless, uint32_t state)
+{
+    if (!g_testHooks)
+        return;
+    g_testHudState = state;
+    g_testHud = hudless;
+}
+
+// Test rigs: bit 1 the display card is lost (multi-GPU fallback), bit 2 NR failed on the game card, bit 3 on the
+// display card
+extern "C" __declspec(dllexport) uint32_t LmxxfNrTestStatus()
+{
+    uint32_t bits = 0;
+    if (MgpuFallback())
+        bits |= 2;
+    if (Engine().Stats().state == "failed")
+        bits |= 4;
+    if (MgpuActive() && DisplayEngine().Stats().state == "failed")
+        bits |= 8;
+    return bits;
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
