@@ -32,6 +32,9 @@ void Flush();
 
 namespace Mgpu
 {
+int64_t QpcTicks();
+void PreciseSleepUntil(int64_t qpc); // high resolution timer, the last 1.5 ms spun
+
 // Completion time (QPC) of each value of a fence that counts frames, recorded on its own thread
 class RenderClock
 {

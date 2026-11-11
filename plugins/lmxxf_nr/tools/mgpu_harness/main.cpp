@@ -102,6 +102,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l)
 
 int main(int argc, char** argv)
 {
+    setvbuf(stdout, nullptr, _IONBF, 0); // the rig may kill us: keep every line
     double seconds = 10.0, fseAt = -1, resizeAt = -1, minAt = -1;
     int cycles = 1;
     bool nullAdapter = false, minPause = false, fseHold = false;

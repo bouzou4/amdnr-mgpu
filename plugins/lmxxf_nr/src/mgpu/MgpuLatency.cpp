@@ -246,6 +246,9 @@ void SleepUntil(int64_t until)
 }
 } // namespace
 
+int64_t QpcTicks() { return QpcNow(); }
+void PreciseSleepUntil(int64_t qpc) { SleepUntil(qpc); }
+
 RenderClock::~RenderClock()
 {
     if (_thread)

@@ -204,6 +204,25 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
             return hr;
     }
     _rcopy->SetName(L"Mgpu send queue");
+    q.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    if (FAILED(hr = _ddev->CreateCommandQueue(&q, IID_PPV_ARGS(&_iq))))
+        return hr;
+    _iq->SetName(L"Mgpu ingest queue");
+    q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(hr = _ddev->CreateCommandQueue(&q, IID_PPV_ARGS(&_wq))))
+        return hr;
+    _wq->SetName(L"Mgpu work queue");
+    if (FAILED(hr = _ddev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_iFence))) ||
+        FAILED(hr = _ddev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_wFence))) ||
+        FAILED(hr = _ddev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_drainFence))))
+        return hr;
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS3 d3 {};
+        _ddev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &d3, sizeof(d3));
+        _iTimestamps = d3.CopyQueueTimestampQueriesSupported != FALSE;
+        _iq->GetTimestampFrequency(&_iTsFreq);
+    }
+    _overlap = CurrentSettings().overlap;
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 {};
     _rdev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3));
     _rTimestamps = o3.CopyQueueTimestampQueriesSupported != FALSE;
@@ -492,6 +511,9 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
         }
     }
 
+    if (_overlap > 0 && FAILED(hr = CreateOverlapBuffers()))
+        return hr;
+
     std::lock_guard g(StatsMutex());
     auto& st = MutableStats();
     st.width = rd.Width;
@@ -649,6 +671,23 @@ void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
         dropAll(_mvR);
         dropAll(_graveR);
     }
+    for (UINT s = 0; s < K; ++s)
+    {
+        drop(_colO[s]);
+        drop(_hudO[s]);
+        drop(_mvO[s]);
+        drop(_compO[s]);
+        drop(_iList[s]);
+        drop(_iAlloc[s]);
+        drop(_wList[s]);
+        drop(_wAlloc[s]);
+        drop(_wpList[s]);
+        drop(_wpAlloc[s]);
+        drop(_pList[s]);
+        drop(_pAlloc[s]);
+    }
+    drop(_iQuery);
+    drop(_iReadback);
     drop(_hudD);
     drop(_mvD);
     drop(_nrD);
@@ -816,7 +855,29 @@ void ProxySwapChain::StartPresenter()
 {
     _probeFrames = 4;
     _stop = false;
-    _thread = std::thread([this] { PresenterLoop(); });
+    _stopO = false;
+    _pipeline = _overlap > 0 && _colO[0] ? 1 : 0;
+    if (_pipeline)
+    {
+        {
+            std::lock_guard g(_m);
+            _taken = _consumed;
+        }
+        {
+            std::lock_guard g(_pm);
+            _wk.clear();
+            _pq.clear();
+            _inFlight = 0;
+            _presentedG = 0;
+            for (auto& f : _slotFrameO)
+                f = 0;
+        }
+        _thread = std::thread([this] { IngestLoop(); });
+        _wthread = std::thread([this] { WorkLoop(); });
+        _pthread = std::thread([this] { PresentLoop(); });
+    }
+    else
+        _thread = std::thread([this] { PresenterLoop(); });
 }
 
 void ProxySwapChain::StopPresenter()
@@ -825,14 +886,27 @@ void ProxySwapChain::StopPresenter()
         std::lock_guard g(_m);
         _stop = true;
     }
+    {
+        std::lock_guard g(_pm);
+        _stopO = true;
+    }
     _cv.notify_all();
-    if (_thread.joinable())
-        _thread.join();
+    _pcv.notify_all();
+    for (auto* t : { &_thread, &_wthread, &_pthread })
+        if (t->joinable())
+            t->join();
     if (_dq && _dFence)
     {
         _dq->Signal(_dFence.Get(), ++_dValue);
         GpuWaitDone(_dFence.Get(), _dValue);
     }
+    // the overlap queues: frames taken and not presented
+    for (auto* q : { _iq.Get(), _wq.Get() })
+        if (_pipeline && q && _drainFence)
+        {
+            q->Signal(_drainFence.Get(), ++_drainValue);
+            GpuWaitDone(_drainFence.Get(), _drainValue);
+        }
     // the network may still read this side's motion vectors on its own queue
     if (CurrentEnv().nrQuiesce)
         CurrentEnv().nrQuiesce();
@@ -858,6 +932,11 @@ void ProxySwapChain::PresenterLoop()
     const auto& env = CurrentEnv();
     UINT64 slotDisplayValue[K] {};
     bool slotCounted[K] {};
+    UINT64 slotFrame[K] {}, slotGame[K] {}; // the frame last presented from each slot and its game fence value
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const double qpcMs = 1000.0 / double(qf.QuadPart);
+    double toDisplayMs = -1, toPresentMs = -1;
     const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     for (;;)
     {
@@ -873,6 +952,7 @@ void ProxySwapChain::PresenterLoop()
         const UINT sync = _sync[s], flags = _flags[s];
         const auto tSched = _tSched[s];
         const SlotMeta meta = _meta[s];
+        const UINT64 gameVal = _gameVal[s];
         lk.unlock();
 
         // Recovery test: <dumpDir>\mgpu_remove.trigger removes the display device
@@ -907,6 +987,7 @@ void ProxySwapChain::PresenterLoop()
                 _dq->Signal(_releasedD.Get(), g);
                 _dq->Signal(_dFence.Get(), ++_dValue);
                 slotDisplayValue[s] = _dValue;
+                slotFrame[s] = 0;
                 slotCounted[s] = false;
                 if (env.nrIdle)
                     env.nrIdle("window minimised or occluded");
@@ -928,6 +1009,16 @@ void ProxySwapChain::PresenterLoop()
         // not done (stop or 60 s): the slot is not reused, the loop comes back to the same frame
         if (!WaitReuse(_dFence.Get(), slotDisplayValue[s], "display", &_stop))
             continue;
+        toDisplayMs = toPresentMs = -1;
+        if (slotFrame[s])
+        {
+            // the slot's last frame: render done -> ingested -> display queue past its Present
+            const int64_t tg = _clock.Done(slotGame[s]), ti = _ingestClock.Done(slotFrame[s]),
+                          td = _shownClock.Done(slotDisplayValue[s]);
+            if (tg && ti && td && ti >= tg && td >= ti)
+                toDisplayMs = double(ti - tg) * qpcMs, toPresentMs = double(td - ti) * qpcMs;
+            slotFrame[s] = 0;
+        }
         double ingestMs = -1;
         if (slotDisplayValue[s])
             ingestMs = ReadTs(_dReadback.Get(), s, _dTsFreq);
@@ -1003,6 +1094,7 @@ void ProxySwapChain::PresenterLoop()
             }
             _dq->ExecuteCommandLists(nl, l);
             _dq->Signal(_releasedD.Get(), g);
+            _ingestClock.Push(_releasedD.Get(), g);
             const bool probe = _probeFrames > 0;
             if (probe)
             {
@@ -1209,6 +1301,9 @@ void ProxySwapChain::PresenterLoop()
             for (UINT64 f = _consumed + 1; skipped && f < g; ++f)
                 Latency::Skipped(f);
             slotDisplayValue[s] = _dValue;
+            _shownClock.Push(_dFence.Get(), _dValue);
+            slotFrame[s] = g;
+            slotGame[s] = gameVal;
         }
         if (hr == DXGI_ERROR_INVALID_CALL && SUCCEEDED(_ddev->GetDeviceRemovedReason()) && _renewals < 8)
         {
@@ -1240,7 +1335,7 @@ void ProxySwapChain::PresenterLoop()
                 }
                 _lostPending = true;
                 lk.lock();
-                _consumed = _scheduled;
+                _consumed = _taken = _scheduled;
                 lk.unlock();
                 _cv.notify_all();
                 if (_waitable)
@@ -1279,6 +1374,12 @@ void ProxySwapChain::PresenterLoop()
             st.displayFrameMs = Ema(st.displayFrameMs, std::chrono::duration<double, std::milli>(now - _lastDisplay).count());
         _lastDisplay = now;
         st.latencyMs = Ema(st.latencyMs, std::chrono::duration<double, std::milli>(now - tSched).count());
+        if (toDisplayMs >= 0)
+        {
+            st.renderToDisplayMs = Ema(st.renderToDisplayMs, toDisplayMs);
+            st.displayToPresentMs = Ema(st.displayToPresentMs, toPresentMs);
+            st.addedMs = st.renderToDisplayMs + st.displayToPresentMs;
+        }
         if (ingestMs > 0)
         {
             st.ingestMs = Ema(st.ingestMs, ingestMs);
@@ -1292,11 +1393,751 @@ void ProxySwapChain::PresenterLoop()
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
                                "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
-                               "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {}",
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {} "
+                               "added {:.2f} ms (render done -> display card {:.2f}, -> past present {:.2f}) overlap 0",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
                                st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
-                               st.sendWaitMs, st.answerWaitMs, st.sendStalls));
+                               st.sendWaitMs, st.answerWaitMs, st.sendStalls, st.addedMs, st.renderToDisplayMs,
+                               st.displayToPresentMs));
+    }
+}
+
+HRESULT ProxySwapChain::CreateOverlapBuffers()
+{
+    HRESULT hr;
+    const auto& d = _gameDesc;
+    auto lists = [&](D3D12_COMMAND_LIST_TYPE t, ComPtr<ID3D12CommandAllocator>& a, ComPtr<ID3D12GraphicsCommandList>& l)
+    {
+        HRESULT r;
+        if (FAILED(r = _ddev->CreateCommandAllocator(t, IID_PPV_ARGS(&a))) ||
+            FAILED(r = _ddev->CreateCommandList(0, t, a.Get(), nullptr, IID_PPV_ARGS(&l))))
+            return r;
+        return l->Close();
+    };
+    for (UINT s = 0; s < K; ++s)
+    {
+        _colO[s] = Tex(_ddev.Get(), d.Width, d.Height, d.Format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+        if (!_colO[s])
+            return E_OUTOFMEMORY;
+        _colO[s]->SetName(std::format(L"Mgpu overlap colour {}", s).c_str());
+        if (_wantHud)
+        {
+            _hudO[s] = Tex(_ddev.Get(), d.Width, d.Height, d.Format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+            _compO[s] = Tex(_ddev.Get(), d.Width, d.Height, d.Format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COMMON);
+            if (!_hudO[s] || !_compO[s])
+                return E_OUTOFMEMORY;
+            _hudO[s]->SetName(std::format(L"Mgpu overlap hudless {}", s).c_str());
+            _compO[s]->SetName(std::format(L"Mgpu overlap composite {}", s).c_str());
+        }
+        if (FAILED(hr = lists(D3D12_COMMAND_LIST_TYPE_COPY, _iAlloc[s], _iList[s])) ||
+            FAILED(hr = lists(D3D12_COMMAND_LIST_TYPE_DIRECT, _wpAlloc[s], _wpList[s])) ||
+            FAILED(hr = lists(D3D12_COMMAND_LIST_TYPE_DIRECT, _wAlloc[s], _wList[s])) ||
+            FAILED(hr = lists(D3D12_COMMAND_LIST_TYPE_DIRECT, _pAlloc[s], _pList[s])))
+            return hr;
+    }
+    if (_iTimestamps)
+    {
+        D3D12_QUERY_HEAP_DESC qd { D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, 2 * K };
+        D3D12_RESOURCE_DESC rb {};
+        rb.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rb.Width = 16 * K;
+        rb.Height = rb.DepthOrArraySize = rb.MipLevels = 1;
+        rb.SampleDesc.Count = 1;
+        rb.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES rbp { D3D12_HEAP_TYPE_READBACK };
+        if (FAILED(_ddev->CreateQueryHeap(&qd, IID_PPV_ARGS(&_iQuery))) ||
+            FAILED(_ddev->CreateCommittedResource(&rbp, D3D12_HEAP_FLAG_NONE, &rb, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&_iReadback))))
+            _iQuery.Reset();
+    }
+    std::lock_guard g(_pm);
+    for (UINT s = 0; s < K; ++s)
+        _slotFrameO[s] = _slotDispO[s] = 0;
+    return S_OK;
+}
+
+// <dumpDir>\mgpu_overlap.trigger (0 serial, 1-2 overlap depth), switched live; 0 <-> 1-2 restarts the presenter
+void ProxySwapChain::ReadOverlapTrigger(UINT64 next)
+{
+    const auto& env = CurrentEnv();
+    if (env.dumpDir.empty() || next % 30 != 0)
+        return;
+    const std::wstring trig = env.dumpDir + L"\\mgpu_overlap.trigger";
+    FILE* fp = _wfopen(trig.c_str(), L"r");
+    if (!fp)
+        return;
+    int v = -1;
+    const bool ok = fscanf(fp, "%d", &v) == 1 && v >= 0 && v <= 2;
+    fclose(fp);
+    DeleteFileW(trig.c_str());
+    if (!ok)
+        return;
+    {
+        // the phase that ends: displayed frames per second since the last switch
+        Stats st;
+        {
+            std::lock_guard g(StatsMutex());
+            st = MutableStats();
+        }
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - _phaseT0).count();
+        Log(0, std::format("overlap phase {} ended: {} frames in {:.1f} s = {:.1f} fps, render {:.2f} ms, display {:.2f} ms "
+                           "({:.0f}% busy), latency {:.2f} ms, added {:.2f} ms ({:.2f} + {:.2f}), nr {:.2f} ms, cpu wait "
+                           "send {:.2f} answer {:.2f} ms",
+                           _overlap.load(), st.presented - _phaseN0, secs, secs > 0 ? (st.presented - _phaseN0) / secs : 0.0,
+                           st.renderFrameMs, st.displayFrameMs, st.displayBusy, st.latencyMs, st.addedMs,
+                           st.renderToDisplayMs, st.displayToPresentMs, st.nrMs, st.sendWaitMs, st.answerWaitMs));
+        _phaseN0 = st.presented;
+        _phaseT0 = std::chrono::steady_clock::now();
+    }
+    const int pipe = v > 0 ? 1 : 0;
+    Log(0, std::format("overlap {} from the trigger at frame {}{}", v, next, pipe != _pipeline ? ": presenter restarts" : ""));
+    if (pipe != _pipeline)
+    {
+        StopPresenter();
+        if (v > 0 && !_colO[0] && FAILED(CreateOverlapBuffers()))
+        {
+            Log(2, "overlap buffers failed: serial presenter");
+            v = 0;
+        }
+        _overlap = v;
+        _nrReset = true;
+        StartPresenter();
+    }
+    else
+    {
+        _overlap = v;
+        std::lock_guard g(_pm);
+        _pcv.notify_all();
+    }
+}
+
+static bool OverlapStopped(void* x) { return static_cast<std::atomic<bool>*>(x)->load(); }
+
+// Overlap, stage 1: the ring slot into this slot's textures on the copy queue _iq, once the CPU has seen the send land.
+// At most kDepth frames are taken and not yet presented. No queue of the display card waits on a fence: every hand-over
+// between the stages is a CPU wait (the send, the ingest, the network answer, the work before the Present).
+void ProxySwapChain::IngestLoop()
+{
+    SetThreadDescription(GetCurrentThread(), L"Mgpu ingest");
+    const auto& env = CurrentEnv();
+    const auto cm = D3D12_RESOURCE_STATE_COMMON;
+    for (;;)
+    {
+        {
+            std::unique_lock lk(_m);
+            _cv.wait(lk, [&] { return _stop || _stopO.load() || _scheduled > _taken; });
+            if (_stop || _stopO)
+                break;
+        }
+        {
+            std::unique_lock pl(_pm);
+            _pcv.wait(pl, [&] { return _stopO.load() || _inFlight < kDepth; });
+            if (_stopO)
+                break;
+        }
+        Pending p;
+        {
+            std::lock_guard lk(_m);
+            p.g = _scheduled;
+            p.s = UINT(p.g % K);
+            _picked[p.s] = p.g;
+            p.sync = _sync[p.s];
+            p.flags = _flags[p.s];
+            p.tSched = _tSched[p.s];
+            p.gameVal = _gameVal[p.s];
+            p.meta = _meta[p.s];
+        }
+        const UINT64 g = p.g;
+        const UINT s = p.s;
+
+        if (g % 60 == 0 && !env.dumpDir.empty())
+        {
+            const std::wstring trig = env.dumpDir + L"\\mgpu_remove.trigger";
+            if (GetFileAttributesW(trig.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                DeleteFileW(trig.c_str());
+                ComPtr<ID3D12Device5> d5;
+                Log(1, std::format("test: removing the display device at frame {}", g));
+                if (SUCCEEDED(_ddev.As(&d5)))
+                    d5->RemoveDevice();
+            }
+        }
+
+        // The send lands before anything of this frame is queued (see PresenterLoop); not done: back to the newest frame
+        if (!WaitSend(g))
+            continue;
+        UINT64 dispV;
+        {
+            // the slot's last frame must have been presented (a skip can bring it within kDepth)
+            std::unique_lock pl(_pm);
+            _pcv.wait(pl, [&] { return _stopO.load() || _presentedG >= _slotFrameO[s]; });
+            if (_stopO)
+                break;
+            dispV = _slotDispO[s];
+        }
+        // and its present copy done: this slot's textures, lists and timestamps are free
+        if (!WaitReuse(_dFence.Get(), dispV, "overlap display", &_stop))
+            continue;
+        {
+            std::lock_guard lk(_m);
+            p.skipped = _taken && g > _taken ? g - _taken - 1 : 0;
+            _taken = g;
+        }
+        if (dispV && _iQuery)
+            p.ingestMs = ReadTs(_iReadback.Get(), s, _iTsFreq);
+
+        p.dropped = _occluded || IsIconic(_hwnd);
+        p.haveHud = !p.dropped && p.meta.hud && _hudO[s] && _ui;
+        bool mvOk = !p.dropped && p.meta.mv;
+        if (mvOk && (!_mvO[s] || _mvO[s]->GetDesc().Width != p.meta.mvDesc.Width ||
+                     _mvO[s]->GetDesc().Height != p.meta.mvDesc.Height || _mvO[s]->GetDesc().Format != p.meta.mvDesc.Format))
+        {
+            if (_mvO[s])
+                _graveD.push_back(_mvO[s]);
+            D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
+            D3D12_RESOURCE_DESC md = p.meta.mvDesc;
+            _mvO[s].Reset();
+            _ddev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, cm, nullptr, IID_PPV_ARGS(&_mvO[s]));
+            if (_mvO[s])
+                _mvO[s]->SetName(std::format(L"Mgpu overlap motion {}", s).c_str());
+        }
+        p.mvOk = mvOk && _mvO[s];
+
+        // copy queue: COMMON promotes and decays, no barriers
+        _iAlloc[s]->Reset();
+        auto* c = _iList[s].Get();
+        c->Reset(_iAlloc[s].Get(), nullptr);
+        auto ingest = [&](ID3D12Resource* dstTex, UINT64 offset)
+        {
+            auto dd = dstTex->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+            _ddev->GetCopyableFootprints(&dd, 0, 1, offset, &fp, nullptr, nullptr, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION dl { dstTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+            D3D12_TEXTURE_COPY_LOCATION sl { _slotD[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+            sl.PlacedFootprint = fp;
+            c->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+        };
+        if (!p.dropped)
+        {
+            if (_iQuery)
+                c->EndQuery(_iQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2);
+            ingest(_colO[s].Get(), 0);
+            if (_iQuery)
+            {
+                c->EndQuery(_iQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2 + 1);
+                c->ResolveQueryData(_iQuery.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2, 2, _iReadback.Get(), s * 16);
+            }
+            if (p.haveHud)
+                ingest(_hudO[s].Get(), _hudOffset);
+            if (p.mvOk)
+                ingest(_mvO[s].Get(), _mvOffset);
+        }
+        c->Close();
+        ID3D12CommandList* l[] = { c };
+        _iq->ExecuteCommandLists(1, l);
+        _iq->Signal(_releasedD.Get(), g); // the ring slot is free once ingested
+        _iq->Signal(_iFence.Get(), g);
+        _ingestClock.Push(_releasedD.Get(), g);
+        {
+            std::lock_guard pg(_pm);
+            _slotFrameO[s] = g;
+            _inFlight++;
+            _wk.push_back(p);
+        }
+        _pcv.notify_all();
+    }
+}
+
+// Overlap, stage 2: NR and the UI composite into this slot's output on the work queue _wq. The network answer is
+// awaited on the CPU inside nrFrame, while stage 1 ingests the next frame and stage 3 presents the previous one.
+void ProxySwapChain::WorkLoop()
+{
+    SetThreadDescription(GetCurrentThread(), L"Mgpu work");
+    const auto& env = CurrentEnv();
+    const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, cm = D3D12_RESOURCE_STATE_COMMON;
+    bool slotCounted[K] {};
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const double qpcMs = 1000.0 / double(qf.QuadPart);
+    int64_t tFree = 0, tWork = 0;      // QPC: the stage became free, started on a frame
+    double workEma = 0, jitLead = 3.0; // ms: the stage's time per frame, how long before its end the next send starts
+    for (;;)
+    {
+        Pending p;
+        {
+            std::unique_lock pl(_pm);
+            _pcv.wait(pl, [&] { return _stopO.load() || !_wk.empty(); });
+            if (_stopO)
+                break;
+            p = _wk.front();
+            _wk.erase(_wk.begin());
+        }
+        const UINT64 g = p.g;
+        const UINT s = p.s;
+        const SlotMeta& meta = p.meta;
+
+        // the ingest is done before anything that reads it is queued (ends only on stop or device removal)
+        double ingestWait = 0;
+        while (!GpuWaitDone(_iFence.Get(), g, 60000, OverlapStopped, &_stopO, &ingestWait) && !_stopO)
+            Log(2, std::format("frame {}: ingest not done after {:.0f} ms, still waiting", g, ingestWait));
+        if (_stopO)
+            break;
+        {
+            // Just in time (overlap 1): the game may send the next frame so that it is ingested as this stage frees up.
+            // ready - tFree > 0: this frame's ingest ended after the stage was free (sent too late), < 0: it waited.
+            const int64_t ready = _ingestClock.Done(g);
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            if (ready && tFree)
+                jitLead = std::clamp(jitLead + 0.2 * (double(ready - tFree) * qpcMs + 0.3), 0.5, 15.0);
+            tWork = q.QuadPart;
+            std::lock_guard lk(_m);
+            _workFrame = g;
+            _grantQpc = tWork + int64_t((std::max)(0.0, workEma - jitLead) / qpcMs);
+        }
+        _cv.notify_all();
+
+        // the slot's last frame was presented: its UI count is final
+        if (slotCounted[s] && _ui)
+        {
+            p.uiShare = double(_ui->Count(s)) / (double(_gameDesc.Width) * _gameDesc.Height);
+            if (p.uiShare > CurrentSettings().uiGate && !_gateOn)
+            {
+                _gateOn = true;
+                Log(1, std::format("HUD-less gate: {:.1f}% of pixels differ from the back buffer (a wrong pairing?): no NR",
+                                   p.uiShare * 100));
+                std::lock_guard sg(StatsMutex());
+                MutableStats().gateFallbacks++;
+            }
+            else if (p.uiShare <= CurrentSettings().uiGate && _gateOn)
+            {
+                _gateOn = false;
+                Log(0, std::format("HUD-less gate: {:.1f}% of pixels differ: HUD-less again", p.uiShare * 100));
+            }
+        }
+        slotCounted[s] = false;
+
+        ID3D12Resource* out = _colO[s].Get();
+        p.mv = meta.mv;
+        p.hudMissed = !meta.hud;
+        const bool probe = _probeFrames > 0;
+        const bool haveHud = p.haveHud, mvOk = p.mvOk;
+        if (p.dropped)
+        {
+            if (env.nrIdle)
+                env.nrIdle("window minimised or occluded");
+            out = nullptr;
+        }
+        else
+        {
+            const bool useHud = haveHud && !_gateOn;
+            RECT rc {};
+            GetClientRect(_hwnd, &rc);
+            const bool mismatch = UINT(rc.right - rc.left) != _gameDesc.Width || UINT(rc.bottom - rc.top) != _gameDesc.Height;
+            if (!mismatch)
+                _mismatchSince = {};
+            else if (!_mismatchSince.time_since_epoch().count())
+                _mismatchSince = std::chrono::steady_clock::now();
+            const bool sizeHold = mismatch && std::chrono::steady_clock::now() - _mismatchSince < std::chrono::seconds(5);
+            if (sizeHold != _sizeHold)
+            {
+                _sizeHold = sizeHold;
+                Log(0, std::format("window {}x{}, swapchain {}x{}: NR {}", rc.right - rc.left, rc.bottom - rc.top,
+                                   _gameDesc.Width, _gameDesc.Height, sizeHold ? "held" : "resumed"));
+            }
+            _hudMissStreak = haveHud ? 0 : _hudMissStreak + 1;
+            const bool whole = _wantHud && !haveHud && CurrentSettings().wholeFrameFallback && _hudMissStreak > 30;
+            if (whole != _wholeFallback)
+            {
+                _wholeFallback = whole;
+                Log(0, whole ? "no HUD-less colour: NR on the whole frame, UI included"
+                             : "HUD-less colour back: NR on it, the UI kept as drawn");
+                std::lock_guard sg(StatsMutex());
+                MutableStats().nrSource = whole ? "whole frame, UI included (no HUD-less colour)" : "HUD-less colour";
+            }
+            const bool nrOn = env.nrWanted && env.nrWanted() && env.nrFrame;
+            const char* idle = sizeHold ? "NR held: window and swapchain sizes differ"
+                               : !nrOn  ? "NR off"
+                               : _wantHud && !useHud && !whole ? (_gateOn ? "HUD-less gate" : "no HUD-less colour this frame")
+                                                               : nullptr;
+            if (idle && env.nrIdle)
+                env.nrIdle(idle);
+
+            // inputs to their read states; the colour stays COMMON when NR runs on the whole frame
+            D3D12_RESOURCE_BARRIER pre[4];
+            UINT np = 0;
+            if (haveHud)
+            {
+                pre[np++] = Tr(_colO[s].Get(), cm, ns);
+                pre[np++] = Tr(_hudO[s].Get(), cm, ns);
+                pre[np++] = Tr(_compO[s].Get(), cm, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            if (mvOk)
+                pre[np++] = Tr(_mvO[s].Get(), cm, ns);
+            if (np)
+            {
+                _wpAlloc[s]->Reset();
+                auto* c = _wpList[s].Get();
+                c->Reset(_wpAlloc[s].Get(), nullptr);
+                c->ResourceBarrier(np, pre);
+                c->Close();
+                ID3D12CommandList* l[] = { c };
+                _wq->ExecuteCommandLists(1, l);
+            }
+
+            bool wrote = false;
+            if (!idle)
+            {
+                NrInput in;
+                const auto now = std::chrono::steady_clock::now();
+                // a frame dump's stall is not a pause: no history reset
+                const bool dumpStall = g >= _dumpFrom && g <= _dumpTo;
+                const bool gap = _lastNr.time_since_epoch().count() && !dumpStall &&
+                                 std::chrono::duration<double, std::milli>(now - _lastNr).count() > 250.0;
+                _lastNr = now;
+                if (mvOk)
+                {
+                    in.motion = _mvO[s].Get();
+                    in.motionState = ns;
+                    in.guides = meta.g;
+                }
+                const bool mvResized = mvOk && (meta.g.motionW != _lastMvW || meta.g.motionH != _lastMvH);
+                if (mvOk)
+                {
+                    _lastMvW = meta.g.motionW;
+                    _lastMvH = meta.g.motionH;
+                }
+                in.reset = _nrReset.exchange(false) || gap || mvResized || (mvOk && meta.g.reset);
+                in.waitAnswer = CurrentSettings().nrEveryFrame;
+                if (useHud)
+                {
+                    in.src = _hudO[s].Get();
+                    in.srcState = ns;
+                    in.dst = _nrD.Get();
+                    in.dstState = ns;
+                }
+                else
+                {
+                    in.src = in.dst = _colO[s].Get();
+                    in.srcState = in.dstState = haveHud ? ns : cm;
+                }
+                double answerMs = 0;
+                in.answerWaitMs = &answerMs;
+                const auto t0 = std::chrono::steady_clock::now();
+                wrote = env.nrFrame(_ddev.Get(), _wq.Get(), in);
+                p.nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - answerMs;
+                p.answerMs = answerMs;
+                // an answer that never came: its lists were dropped, the frame is not shown
+                if (env.nrSettle && !env.nrSettle())
+                    p.show = false;
+            }
+
+            // UI composite (or only the count), then everything back to COMMON for the next queue
+            _wAlloc[s]->Reset();
+            auto* c = _wList[s].Get();
+            c->Reset(_wAlloc[s].Get(), nullptr);
+            if (haveHud)
+            {
+                const bool comp = useHud && !idle;
+                _ui->Record(c, s, _colO[s].Get(), _hudO[s].Get(), comp ? (wrote ? _nrD.Get() : _hudO[s].Get()) : nullptr,
+                            comp ? _compO[s].Get() : nullptr, _gameDesc.Width, _gameDesc.Height);
+                slotCounted[s] = true;
+                if (comp)
+                    out = _compO[s].Get(), p.hudFrame = true;
+            }
+            for (UINT i = 0; i < np; ++i)
+                std::swap(pre[i].Transition.StateBefore, pre[i].Transition.StateAfter);
+            if (np)
+                c->ResourceBarrier(np, pre);
+            c->Close();
+            ID3D12CommandList* l[] = { c };
+            _wq->ExecuteCommandLists(1, l);
+        }
+        _wq->Signal(_wFence.Get(), g);
+        p.out = out;
+        if (out && g >= _dumpFrom && g < _dumpTo)
+        {
+            DumpTexture(_ddev.Get(), _wq.Get(), _colO[s].Get(), cm, env.dumpDir + std::format(L"\\f{:06}_ingest", g));
+            if (haveHud)
+                DumpTexture(_ddev.Get(), _wq.Get(), _hudO[s].Get(), cm, env.dumpDir + std::format(L"\\f{:06}_hudless", g));
+            if (mvOk)
+                DumpTexture(_ddev.Get(), _wq.Get(), _mvO[s].Get(), cm, env.dumpDir + std::format(L"\\f{:06}_mv", g));
+            if (p.hudFrame)
+                DumpTexture(_ddev.Get(), _wq.Get(), _nrD.Get(), ns, env.dumpDir + std::format(L"\\f{:06}_nr", g));
+            DumpTexture(_ddev.Get(), _wq.Get(), out, cm, env.dumpDir + std::format(L"\\f{:06}_display", g));
+        }
+        if (probe)
+        {
+            _probeFrames--;
+            GpuWaitDone(_wFence.Get(), g, 2000);
+            Alive(mvOk ? "overlap ingest, NR and UI (colour, HUD-less, motion)" : "overlap ingest, NR and UI");
+        }
+        {
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            tFree = q.QuadPart;
+            const double ms = double(tFree - tWork) * qpcMs;
+            if (ms < 250)
+                workEma = workEma <= 0 ? ms : workEma * 0.9 + ms * 0.1;
+            p.jitLead = jitLead;
+        }
+        {
+            std::lock_guard pg(_pm);
+            _pq.push_back(p);
+        }
+        _pcv.notify_all();
+    }
+}
+
+// Overlap, stage 3: presents in order, each once the CPU has seen its work done. _dq only ever gets the copy into the
+// back buffer and the Present: nothing is queued on it behind a wait.
+void ProxySwapChain::PresentLoop()
+{
+    SetThreadDescription(GetCurrentThread(), L"Mgpu present");
+    UINT64 slotFrame[K] {}, slotGame[K] {}, slotDisp[K] {};
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const double qpcMs = 1000.0 / double(qf.QuadPart);
+    for (;;)
+    {
+        Pending p;
+        {
+            std::unique_lock pl(_pm);
+            _pcv.wait(pl, [&] { return _stopO.load() || !_pq.empty(); });
+            if (_stopO)
+                break;
+            p = _pq.front();
+            _pq.erase(_pq.begin());
+        }
+        const UINT s = p.s;
+        double workWait = 0;
+        while (!GpuWaitDone(_wFence.Get(), p.g, 60000, OverlapStopped, &_stopO, &workWait) && !_stopO)
+            Log(2, std::format("frame {}: display work not done after {:.0f} ms, still waiting", p.g, workWait));
+        if (_stopO)
+            break;
+        const bool removed = FAILED(_ddev->GetDeviceRemovedReason());
+
+        double toDisplayMs = -1, toPresentMs = -1;
+        if (slotFrame[s])
+        {
+            const int64_t tg = _clock.Done(slotGame[s]), ti = _ingestClock.Done(slotFrame[s]),
+                          td = _shownClock.Done(slotDisp[s]);
+            if (tg && ti && td && ti >= tg && td >= ti)
+                toDisplayMs = double(ti - tg) * qpcMs, toPresentMs = double(td - ti) * qpcMs;
+            slotFrame[s] = 0;
+        }
+
+        HRESULT hr = removed ? _ddev->GetDeviceRemovedReason() : S_OK;
+        UINT pfUsed = 0;
+        bool presented = false;
+        ID3D12Resource* out = removed || !p.show ? nullptr : p.out;
+        if (out && (_occluded || IsIconic(_hwnd)))
+            out = nullptr;
+        if (removed)
+        {
+        }
+        else if (!out)
+        {
+            if (p.show)
+            {
+                // minimised or occluded: nothing on the real back buffers until a test present says the window shows
+                const HRESULT t = IsIconic(_hwnd) ? DXGI_STATUS_OCCLUDED : _real->Present(0, DXGI_PRESENT_TEST);
+                if (t == DXGI_STATUS_OCCLUDED)
+                {
+                    if (!_occluded)
+                        Log(0, std::format("window minimised or occluded at frame {}: frames dropped until it shows", p.g));
+                    _occluded = true;
+                }
+                else
+                {
+                    if (_occluded)
+                        Log(0, std::format("window shows again at frame {} (test present {:X}): presenting", p.g, (uint32_t) t));
+                    _occluded = false;
+                    _nrReset = true;
+                }
+            }
+            _dq->Signal(_dFence.Get(), ++_dValue);
+        }
+        else
+        {
+            const UINT m = _real->GetCurrentBackBufferIndex();
+            _pAlloc[s]->Reset();
+            auto* c = _pList[s].Get();
+            c->Reset(_pAlloc[s].Get(), nullptr);
+            D3D12_RESOURCE_BARRIER b[2] = { Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                                            Tr(out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE) };
+            c->ResourceBarrier(2, b);
+            c->CopyResource(_realBb[m].Get(), out);
+            for (auto& x : b)
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            c->ResourceBarrier(2, b);
+            c->Close();
+            ID3D12CommandList* l[] = { c };
+            _dq->ExecuteCommandLists(1, l);
+            bool idle = true;
+            double idleMs = -1;
+            if (CurrentSettings().presentIdle)
+            {
+                _dq->Signal(_dFence.Get(), ++_dValue);
+                idle = GpuWaitDone(_dFence.Get(), _dValue, kPresentIdleMs, nullptr, nullptr, &idleMs);
+                if (!idle && _idleSkips++ < 20)
+                    Log(2, std::format("frame {}: display queue not idle after {:.0f} ms: Present skipped", p.g, idleMs));
+            }
+            _lastIdleMs = idle ? idleMs : -2;
+            BOOL fs = FALSE;
+            _real->GetFullscreenState(&fs, nullptr);
+            _fsCached = fs;
+            UINT pf = p.flags & ~(UINT) DXGI_PRESENT_ALLOW_TEARING;
+            if (p.sync == 0 && _tearing && !fs && !_tearingOff)
+                pf |= DXGI_PRESENT_ALLOW_TEARING;
+            pfUsed = pf;
+            const auto tp = std::chrono::steady_clock::now();
+            hr = idle ? _real->Present(p.sync, pf) : S_OK;
+            const double presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+            if (presentMs > 250 || hr != _lastPresentHr)
+                Log(presentMs > 250 ? 1 : 0, std::format("real Present {:X} in {:.0f} ms (frame {})", (uint32_t) hr, presentMs, p.g));
+            _lastPresentHr = hr;
+            if (hr == DXGI_STATUS_OCCLUDED)
+                _occluded = true;
+            if (hr == DXGI_ERROR_INVALID_CALL && (pf & DXGI_PRESENT_ALLOW_TEARING))
+            {
+                _tearingOff = true;
+                Log(1, "Present with tearing refused during a fullscreen change: tearing off until the next one");
+                hr = _real->Present(p.sync, pf & ~(UINT) DXGI_PRESENT_ALLOW_TEARING);
+            }
+            Latency::Mark(p.g, Latency::RealPresent);
+            _dq->Signal(_dFence.Get(), ++_dValue);
+            Latency::Watch(_dFence.Get(), _dValue, p.g, Latency::DisplayDone);
+            _shownClock.Push(_dFence.Get(), _dValue);
+            slotFrame[s] = p.g;
+            slotGame[s] = p.gameVal;
+            presented = true;
+        }
+        slotDisp[s] = _dValue;
+        {
+            std::lock_guard pg(_pm);
+            _slotDispO[s] = _dValue;
+            _presentedG = p.g;
+            if (_inFlight)
+                _inFlight--;
+        }
+        _pcv.notify_all();
+        // the game is released after the Present, as in the serial presenter
+        UINT64 released = 0;
+        {
+            std::lock_guard g(_m);
+            for (UINT64 f = _consumed + 1; p.skipped && f < p.g; ++f)
+                Latency::Skipped(f);
+            if (p.g > _consumed)
+                released = p.g - _consumed, _consumed = p.g;
+        }
+        _cv.notify_all();
+        if (_waitable && released)
+            ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(released, 8), nullptr);
+
+        if (hr == DXGI_ERROR_INVALID_CALL && SUCCEEDED(_ddev->GetDeviceRemovedReason()) && _renewals < 8)
+        {
+            _renewals++;
+            if (SUCCEEDED(RenewReal()))
+                hr = S_OK, _presentFails = 0;
+        }
+        if (FAILED(hr) || (p.g % 30 == 0 && FAILED(_ddev->GetDeviceRemovedReason())))
+        {
+            if (_presentFails++ < 3)
+            {
+                DXGI_SWAP_CHAIN_DESC1 rd {};
+                DXGI_SWAP_CHAIN_FULLSCREEN_DESC fd {};
+                _real->GetDesc1(&rd);
+                _real->GetFullscreenDesc(&fd);
+                Log(2, std::format("real Present({}, {:X}) failed {:X}: fullscreen {}, {}x{} fmt {} flags {:X}, windowed {}, "
+                                   "overlap {}, queue idle before it {} ({:.0f} ms)",
+                                   p.sync, pfUsed, (uint32_t) hr, (int) _fsCached, rd.Width, rd.Height, (int) rd.Format,
+                                   rd.Flags, fd.Windowed, _overlap.load(),
+                                   _lastIdleMs >= 0 ? "yes" : _lastIdleMs < -1.5 ? "no" : "unchecked", _lastIdleMs));
+            }
+            LogDeviceRemoved(_ddev.Get(), "display");
+            const HRESULT why = _ddev->GetDeviceRemovedReason();
+            if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG ||
+                FAILED(why))
+            {
+                {
+                    std::lock_guard sg(StatsMutex());
+                    MutableStats().fallbackReason = std::format("display device removed ({:X})", (uint32_t) why);
+                }
+                _lostPending = true;
+                {
+                    std::lock_guard g(_m);
+                    _consumed = _taken = _scheduled;
+                }
+                {
+                    // the other stages stop too: nothing more goes to the removed device
+                    std::lock_guard pg(_pm);
+                    _stopO = true;
+                }
+                _cv.notify_all();
+                _pcv.notify_all();
+                if (_waitable)
+                    ReleaseSemaphore(_waitable, 1, nullptr);
+                Log(2, "presenter stopped: the next frame presents from the render card");
+                break;
+            }
+        }
+        if (!_retired.empty() && _presentCount >= _retireAfter)
+            ReleaseRetired();
+
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard sg(StatsMutex());
+        auto& st = MutableStats();
+        st.presented++;
+        st.skipped += p.skipped;
+        if (_wantHud)
+        {
+            if (p.hudFrame)
+                st.hudlessFrames++;
+            else if (p.hudMissed)
+                st.hudlessMissed++;
+            if (p.uiShare >= 0)
+                st.uiShare = p.uiShare;
+        }
+        if (p.mv)
+            st.guideFrames++;
+        if (presented)
+        {
+            if (_lastDisplay.time_since_epoch().count())
+                st.displayFrameMs = Ema(st.displayFrameMs, std::chrono::duration<double, std::milli>(now - _lastDisplay).count());
+            _lastDisplay = now;
+            st.latencyMs = Ema(st.latencyMs, std::chrono::duration<double, std::milli>(now - p.tSched).count());
+        }
+        if (toDisplayMs >= 0)
+        {
+            st.renderToDisplayMs = Ema(st.renderToDisplayMs, toDisplayMs);
+            st.displayToPresentMs = Ema(st.displayToPresentMs, toPresentMs);
+            st.addedMs = st.renderToDisplayMs + st.displayToPresentMs;
+        }
+        if (p.ingestMs > 0)
+        {
+            st.ingestMs = Ema(st.ingestMs, p.ingestMs);
+            st.ingestGBs = double(_payloadBytes) / (st.ingestMs * 1e6);
+        }
+        if (p.nrMs > 0)
+            st.nrMs = Ema(st.nrMs, p.nrMs);
+        if (p.answerMs >= 0 && p.answerMs < 250)
+            st.answerWaitMs = Ema(st.answerWaitMs, p.answerMs);
+        st.jitLeadMs = p.jitLead;
+        st.ringDepth = UINT(_scheduled - p.g);
+        if (st.presented % 600 == 0)
+            Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
+                               "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {} "
+                               "added {:.2f} ms (render done -> display card {:.2f}, -> past present {:.2f}) overlap {} "
+                               "send lead {:.2f} ms",
+                               st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
+                               st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
+                               st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
+                               st.sendWaitMs, st.answerWaitMs, st.sendStalls, st.addedMs, st.renderToDisplayMs,
+                               st.displayToPresentMs, _overlap.load(), st.jitLeadMs));
     }
 }
 
@@ -1317,6 +2158,8 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         if (FAILED(hr))
             return hr;
     }
+    if (!_lost)
+        ReadOverlapTrigger(_scheduled + 1);
     const UINT i = _bbIndex;
     const UINT64 next = _scheduled + 1;
     if (!_lost)
@@ -1395,18 +2238,45 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             Log(0, std::format("early send {} from the trigger at frame {}", _earlySend, next));
         }
     }
-    if (_llMode)
-        _clock.Push(_rgameFence.Get(), _rgameValue);
+    _clock.Push(_rgameFence.Get(), _rgameValue); // low latency pacing and the added latency stat
 
     double sendMs = -1;
+    UINT64 extraBytes = 0; // HUD-less colour and vectors sent beside the frame
     {
         std::unique_lock lk(_m);
         // Bound the lead over the display card ([Mgpu] MaxFramesAhead, default 1).
-        const UINT64 lead = (std::max)(1u, CurrentSettings().maxLead);
+        // Overlap 2: the game may be 2 frames ahead of the presented one (a frame waits, ingested, for the network).
+        // Overlap 1: one frame ahead, and a second one only when the work stage is about to be free (just in time).
+        const bool jit = _pipeline && _overlap.load() == 1;
+        const UINT64 lead = (std::max)((std::max)(1u, CurrentSettings().maxLead), _pipeline && !jit ? 2u : 1u);
         // Early send: the copy goes to the GPU before the lead wait (the slot's last reader is done: consumed >= g - 2)
-        const bool early = _earlySend && lead == 1;
+        const bool early = _earlySend && lead == 1 && !jit;
         if (!early)
-            _cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return _scheduled < _consumed + lead || _stop; });
+        {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            LARGE_INTEGER qf;
+            QueryPerformanceFrequency(&qf);
+            const int64_t limitQpc = QpcTicks() + qf.QuadPart / 4;
+            auto granted = [&] { return jit && _scheduled < _consumed + 2 && _workFrame >= _scheduled; };
+            auto ready = [&] {
+                return _stop || _scheduled < _consumed + lead || (granted() && QpcTicks() >= _grantQpc);
+            };
+            while (!ready())
+            {
+                if (granted())
+                {
+                    // the time is known: a precise sleep outside the lock (a condition variable wakes a tick late)
+                    const int64_t at = (std::min)(_grantQpc, limitQpc);
+                    lk.unlock();
+                    PreciseSleepUntil(at);
+                    lk.lock();
+                    if (at >= limitQpc)
+                        break;
+                }
+                else if (_cv.wait_until(lk, limit) == std::cv_status::timeout)
+                    break;
+            }
+        }
         const UINT64 g = _scheduled + 1;
         const UINT s = UINT(g % K);
         if (g > K && _filledR->GetCompletedValue() >= g - K && _rQuery)
@@ -1434,7 +2304,9 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
                 {
                     auto sd = srcTex->GetDesc();
                     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-                    _rdev->GetCopyableFootprints(&sd, 0, 1, offset, &fp, nullptr, nullptr, nullptr);
+                    UINT64 bytes = 0;
+                    _rdev->GetCopyableFootprints(&sd, 0, 1, offset, &fp, nullptr, nullptr, &bytes);
+                    extraBytes += bytes;
                     D3D12_TEXTURE_COPY_LOCATION dl { _slotR[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
                     dl.PlacedFootprint = fp;
                     D3D12_TEXTURE_COPY_LOCATION sl { srcTex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
@@ -1453,6 +2325,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             }
         }
         _meta[s] = meta;
+        _gameVal[s] = _rgameValue;
         _rcopy->ExecuteCommandLists(nl, l);
         _rcopy->Signal(_filledR.Get(), g);
         Latency::Mark(g, Latency::Submit);
@@ -1489,6 +2362,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         st.sendMs = Ema(st.sendMs, sendMs);
         st.sendGBs = double(_payloadBytes) / (st.sendMs * 1e6);
     }
+    st.frameBytes = Ema(st.frameBytes, double(_payloadBytes + extraBytes));
     if (_llMode && _presentCount % 600 == 0)
         Log(0, std::format("low latency {}: render queue {:.2f} ms, pacing sleep {:.2f} ms (last {:.2f})",
                            _llMode, _pacer.QueueMs(), _pacer.SleepMs(), slept));
@@ -1512,7 +2386,7 @@ HRESULT ProxySwapChain::EnterFallback()
     DrainRender();
     {
         std::lock_guard g(_m);
-        _consumed = _scheduled;
+        _consumed = _taken = _scheduled;
     }
     {
         std::lock_guard g(_capM);
@@ -1595,7 +2469,7 @@ HRESULT ProxySwapChain::PresentFallback(UINT sync, UINT flags)
     }
     {
         std::lock_guard g(_m);
-        _consumed = ++_scheduled;
+        _consumed = _taken = ++_scheduled;
     }
     _presentCount++;
     if (_waitable)
@@ -1751,7 +2625,7 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers(UINT n, UINT w, UINT h, 
         // frames sent but not presented belong to the old buffers
         std::lock_guard g(_m);
         const UINT64 dropped = _scheduled - _consumed;
-        _consumed = _scheduled;
+        _consumed = _taken = _scheduled;
         if (dropped && _waitable)
             ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(dropped, 8), nullptr);
         if (dropped)

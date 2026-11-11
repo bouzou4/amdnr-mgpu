@@ -96,6 +96,14 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     void StartPresenter();
     void StopPresenter();
     void PresenterLoop();
+    // Overlap (MgpuOverlap): ingest on a copy queue, NR and the UI composite on a work queue, the copy into the back
+    // buffer and the real Present on _dq, one thread each. Frame N's network runs while N+1 is ingested and N-1
+    // presents. Every hand-over is a CPU wait: no queue waits on a fence.
+    void IngestLoop();
+    void WorkLoop();
+    void PresentLoop();
+    HRESULT CreateOverlapBuffers();
+    void ReadOverlapTrigger(UINT64 next);
     void DrainRender();
     bool WaitSend(UINT64 g);
     HRESULT DoPresent(UINT sync, UINT flags);
@@ -150,7 +158,10 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     // ring state, guarded by _m
     std::mutex _m;
     std::condition_variable _cv;
-    UINT64 _scheduled = 0, _consumed = 0;
+    UINT64 _scheduled = 0, _consumed = 0; // consumed: presented (the game is released after the Present)
+    UINT64 _taken = 0; // overlap: frames the ingest thread took from the ring
+    UINT64 _workFrame = 0; // overlap 1: the frame the work stage is on, and when the game may send the next one
+    int64_t _grantQpc = 0;
     UINT64 _picked[K] {}; // last frame the display card took from each slot
     UINT _sync[K] {}, _flags[K] {};
     std::chrono::steady_clock::time_point _tSched[K];
@@ -217,7 +228,49 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     bool _wholeFallback = false;
     std::chrono::steady_clock::time_point _lastNr {};
     UINT64 _lastMvW = 0, _lastMvH = 0;
-    RenderClock _clock; // render card frame completions (low latency)
+    RenderClock _clock; // render card frame completions (low latency, added latency)
+    RenderClock _ingestClock, _shownClock; // display card: ingest done (releasedD), past the real Present (dFence)
+    UINT64 _gameVal[K] {}; // game fence value of the frame in each slot, guarded by _m
+
+    // overlap pipeline
+    static constexpr UINT kDepth = 2; // overlap: frames taken from the ring and not yet presented
+    std::atomic<int> _overlap { 0 };  // 0: the serial presenter, 1: overlap with just-in-time sends, 2: overlap with
+                                      // the game up to 2 frames ahead of the presented one
+    int _pipeline = 0;               // what the running presenter threads are (0 serial, 1 overlap)
+    UINT64 _phaseN0 = 0;             // presented count and time at the last overlap switch
+    std::chrono::steady_clock::time_point _phaseT0 = std::chrono::steady_clock::now();
+    std::thread _wthread, _pthread;
+    std::atomic<bool> _stopO { false };
+    ComPtr<ID3D12CommandQueue> _iq, _wq; // copy: ingest; direct: NR + UI
+    ComPtr<ID3D12Fence> _iFence, _wFence;
+    ComPtr<ID3D12Fence> _drainFence; // StopPresenter: _wq and _iq idle
+    UINT64 _drainValue = 0;
+    ComPtr<ID3D12Resource> _colO[K], _hudO[K], _mvO[K], _compO[K]; // per slot, COMMON at rest
+    ComPtr<ID3D12CommandAllocator> _iAlloc[K], _wpAlloc[K], _wAlloc[K], _pAlloc[K]; // ingest, work pre / post, present
+    ComPtr<ID3D12GraphicsCommandList> _iList[K], _wpList[K], _wList[K], _pList[K];
+    ComPtr<ID3D12QueryHeap> _iQuery;
+    ComPtr<ID3D12Resource> _iReadback;
+    UINT64 _iTsFreq = 0;
+    bool _iTimestamps = false;
+    struct Pending
+    {
+        UINT64 g = 0;
+        UINT s = 0, sync = 0, flags = 0;
+        SlotMeta meta;
+        ID3D12Resource* out = nullptr; // null: dropped (minimised or occluded)
+        std::chrono::steady_clock::time_point tSched;
+        UINT64 gameVal = 0, skipped = 0;
+        bool dropped = false, haveHud = false, mvOk = false; // set at ingest
+        bool show = true; // false: the network answer never came, no Present
+        bool hudFrame = false, hudMissed = false, mv = false;
+        double nrMs = 0, answerMs = -1, ingestMs = -1, uiShare = -1, jitLead = 0;
+    };
+    std::mutex _pm; // guards the fields below
+    std::condition_variable _pcv;
+    std::vector<Pending> _wk, _pq; // ingested -> work, worked -> present
+    UINT _inFlight = 0;            // frames taken from the ring and not yet presented
+    UINT64 _presentedG = 0;
+    UINT64 _slotFrameO[K] {}, _slotDispO[K] {}; // last frame submitted from each slot, its _dFence value once presented
     Pacer _pacer;
     int _llMode = -1; // MgpuLowLatency, switchable by trigger
     bool _earlySend = false;
