@@ -464,6 +464,61 @@ struct Fuzzer
     }
 };
 
+// A fixed sequence instead of a seed, one step per line: "<frames after the previous step> <what> <arguments>"
+//   ini Key=Value[;Key=Value...]   file <trigger file> <content>   hud 0|1   resize <w> <h> [frames]
+//   minimise <frames> [0|1]   scale <f>   reset <frames>   nomv <frames>
+inline bool LoadScript(const char* path, std::vector<Action>& steps)
+{
+    FILE* f = fopen(path, "r");
+    if (f == nullptr)
+        return false;
+    char line[1024];
+    while (fgets(line, sizeof(line), f))
+    {
+        unsigned gap = 0;
+        char what[32] = {}, rest[900] = {};
+        if (line[0] == '#' || sscanf(line, "%u %31s %899[^\r\n]", &gap, what, rest) < 2)
+            continue;
+        Action a;
+        a.gap = gap;
+        a.what = std::string(what) + " " + rest;
+        const std::string w = what;
+        std::string text = rest;
+        if (w == "ini")
+        {
+            for (auto& c : text)
+                if (c == ';')
+                    c = '\n';
+            a.kind = Action::Ini;
+            a.files.push_back({ L"lmxxf_nr_ini.trigger", text + "\n" });
+        }
+        else if (w == "file")
+        {
+            const size_t sp = text.find(' ');
+            const std::string name = text.substr(0, sp);
+            a.kind = Action::Dump;
+            a.files.push_back({ std::wstring(name.begin(), name.end()), (sp == std::string::npos ? "" : text.substr(sp + 1)) + "\n" });
+        }
+        else if (w == "hud")
+            a.kind = Action::Hud, a.a = atoi(rest);
+        else if (w == "resize")
+            a.kind = Action::Resize, sscanf(rest, "%d %d %d", &a.a, &a.b, &a.c);
+        else if (w == "minimise")
+            a.kind = Action::Minimise, sscanf(rest, "%d %d", &a.a, &a.b);
+        else if (w == "scale")
+            a.kind = Action::Scale, a.f = (float) atof(rest);
+        else if (w == "reset")
+            a.kind = Action::Reset, a.a = atoi(rest);
+        else if (w == "nomv")
+            a.kind = Action::NoMv, a.a = atoi(rest);
+        else
+            continue;
+        steps.push_back(a);
+    }
+    fclose(f);
+    return !steps.empty();
+}
+
 // tmp + rename: the plugin never reads half a file
 inline bool WriteTrigger(const std::wstring& dir, const std::wstring& name, const std::string& text)
 {
