@@ -25,6 +25,13 @@ enum Stage : uint32_t
     ApplyOut,
     UiIn,
     UiOut,
+    // display frame generation: values are FFX frame ids
+    FgPrepIn,
+    FgPrepOut,
+    FgGenIn,
+    FgGenOut,
+    FgCopyIn,
+    FgCopyOut,
     StageCount
 };
 
@@ -39,6 +46,10 @@ enum Phase : uint32_t
     UiRecord,
     Settle,
     Present,
+    FgQueueWait,
+    FgIdleWait,
+    FgConfigure,
+    FgPrepare,
     PhaseCount
 };
 
@@ -61,6 +72,9 @@ struct State
     std::atomic<uint32_t> phase { Idle };
     std::atomic<uint64_t> lastPresented { 0 };
     std::atomic<int64_t> lastPresentQpc { 0 };
+    // FFX's callbacks (its present thread): frame ids entered / returned
+    std::atomic<uint64_t> fgGenIn { 0 }, fgGenOut { 0 }, fgCopyIn { 0 }, fgCopyOut { 0 };
+    std::atomic<bool> fg { false };
     bool logged = false;
 };
 inline State& S()
@@ -135,6 +149,15 @@ inline void Presented(uint64_t g)
     detail::S().lastPresentQpc = detail::Qpc();
 }
 
+// A marker with the caller's own value (FFX frame ids)
+inline void Mark(ID3D12GraphicsCommandList* c, Stage st, uint64_t value, bool in) { detail::Write(c, st, uint32_t(value), in); }
+inline void FgCallback(bool generate, bool in, uint64_t id)
+{
+    auto& s = detail::S();
+    s.fg = true;
+    (generate ? (in ? s.fgGenIn : s.fgGenOut) : (in ? s.fgCopyIn : s.fgCopyOut)) = id;
+}
+
 // Into a list recorded this frame: In at its start, Out at its end
 inline void In(ID3D12GraphicsCommandList* c, Stage st) { detail::Write(c, st, uint32_t(detail::S().frame.load()), true); }
 inline void Out(ID3D12GraphicsCommandList* c, Stage st) { detail::Write(c, st, uint32_t(detail::S().frame.load()), false); }
@@ -189,7 +212,8 @@ inline ID3D12CommandList* NetAfter(uint32_t slot)
 inline const char* PhaseName(uint32_t p)
 {
     static const char* n[] = { "idle", "send wait", "slot reuse wait", "ingest", "NR record", "answer wait",
-                               "UI record", "settle", "Present" };
+                               "UI record", "settle", "Present", "FG queue wait", "FG wait for the presenter queue",
+                               "FG configure", "FG prepare" };
     return p < PhaseCount ? n[p] : "?";
 }
 
@@ -208,10 +232,16 @@ inline std::string Describe(const char* where)
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     const double sincePresent = s.lastPresentQpc ? double(detail::Qpc() - s.lastPresentQpc) * 1000.0 / double(f.QuadPart) : -1;
-    return std::format("display progress ({}): frame {}, presenter in {}, last Present returned frame {} {:.0f} ms ago; "
-                       "GPU started/finished: ingest -/{} feed {}/{} network {}/{} apply {}/{} UI {}/{}",
-                       where, s.frame.load(), PhaseName(s.phase.load()), s.lastPresented.load(), sincePresent,
-                       v[IngestOut], v[FeedIn], v[FeedOut], net(v[NetIn]), net(v[NetOut]), v[ApplyIn], v[ApplyOut], v[UiIn],
-                       v[UiOut]);
+    std::string t = std::format("display progress ({}): frame {}, presenter in {}, last Present returned frame {} {:.0f} "
+                                "ms ago; GPU started/finished: ingest -/{} feed {}/{} network {}/{} apply {}/{} UI {}/{}",
+                                where, s.frame.load(), PhaseName(s.phase.load()), s.lastPresented.load(), sincePresent,
+                                v[IngestOut], v[FeedIn], v[FeedOut], net(v[NetIn]), net(v[NetOut]), v[ApplyIn],
+                                v[ApplyOut], v[UiIn], v[UiOut]);
+    if (s.fg)
+        t += std::format("; FG (FFX frame ids) GPU started/finished: prepare {}/{} generation {}/{} present copy {}/{}; "
+                         "callbacks entered/returned: generation {}/{} present {}/{}",
+                         v[FgPrepIn], v[FgPrepOut], v[FgGenIn], v[FgGenOut], v[FgCopyIn], v[FgCopyOut], s.fgGenIn.load(),
+                         s.fgGenOut.load(), s.fgCopyIn.load(), s.fgCopyOut.load());
+    return t;
 }
 } // namespace Progress

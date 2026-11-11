@@ -1,6 +1,7 @@
 #include "MgpuCommon.h"
 #include "MgpuFrameGen.h"
 #include "../GpuWait.h"
+#include "../Progress.h"
 
 #include <ffx_api.h>
 #include <ffx_framegeneration.h>
@@ -16,7 +17,8 @@ namespace Mgpu
 {
 namespace
 {
-std::atomic<int> s_liveFg { -1 }, s_liveNr { -1 }, s_liveFgHud { -1 }, s_liveFgSyn { -1 }, s_liveFgOrder { -1 };
+std::atomic<int> s_liveFg { -1 }, s_liveNr { -1 }, s_liveFgHud { -1 }, s_liveFgSyn { -1 }, s_liveFgOrder { -1 },
+    s_liveFgVer { -1 };
 std::atomic<bool> s_gameFg { false };
 std::atomic<DisplayFg*> s_timed { nullptr };
 
@@ -135,14 +137,53 @@ HRESULT DisplayFg::CreateSwapChain(IDXGIFactory2* factory, ID3D12CommandQueue* q
     return S_OK;
 }
 
-bool DisplayFg::EnsureContext(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt, uint32_t flags, DXGI_FORMAT hudFmt)
+bool DisplayFg::EnsureContext(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt, uint32_t flags, DXGI_FORMAT hudFmt,
+                              const std::string& version)
 {
-    if (_fg && w == _w && h == _h && fmt == _fmt && flags == _flags && hudFmt == _hudFmt)
+    if (_fg && w == _w && h == _h && fmt == _fmt && flags == _flags && hudFmt == _hudFmt && version == _version)
         return true;
     ReleaseContext();
+    // FG providers of the host, newest first; a version prefix picks one (FSR 4.x FG is the driver's ML model)
+    ffxQueryDescGetVersions vq {};
+    vq.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    vq.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    vq.device = dev;
+    uint64_t count = 0;
+    vq.outputCount = &count;
+    std::vector<uint64_t> ids;
+    std::vector<std::string> vers;
+    if (Ffx().query && Ffx().query(nullptr, &vq.header) == FFX_API_RETURN_OK && count)
+    {
+        ids.resize(count);
+        std::vector<const char*> names(count);
+        vq.versionIds = ids.data();
+        vq.versionNames = names.data();
+        if (Ffx().query(nullptr, &vq.header) == FFX_API_RETURN_OK)
+            for (uint64_t i = 0; i < count; ++i)
+                vers.push_back(names[i] ? names[i] : "?");
+    }
+    std::string ver = vers.empty() ? "?" : vers[0];
+    ffxOverrideVersion ov {};
+    ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    bool pick = false;
+    for (size_t i = 0; i < vers.size() && !version.empty() && !pick; ++i)
+        if (vers[i].rfind(version, 0) == 0)
+            ov.versionId = ids[i], ver = vers[i], pick = true;
+    if (!_loggedVersions)
+    {
+        std::string all;
+        for (const auto& v : vers)
+            all += (all.empty() ? "" : ", ") + v;
+        Log(0, "display FG: providers: " + (all.empty() ? std::string("none listed") : all));
+        _loggedVersions = true;
+    }
+    if (!version.empty() && !pick)
+        Log(1, std::format("display FG: no provider version starts with '{}': the default", version));
     ffxCreateBackendDX12Desc be {};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
     be.device = dev;
+    if (pick)
+        be.header.pNext = &ov.header;
     ffxCreateContextDescFrameGenerationHudless hd {};
     hd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS;
     hd.hudlessBackBufferFormat = ffxApiGetSurfaceFormatDX12(hudFmt);
@@ -163,7 +204,7 @@ bool DisplayFg::EnsureContext(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt
         _fg = nullptr;
         return false;
     }
-    _w = w, _h = h, _fmt = fmt, _flags = flags, _hudFmt = hudFmt;
+    _w = w, _h = h, _fmt = fmt, _flags = flags, _hudFmt = hudFmt, _version = version;
     _frameId = 0;
     if (!_list)
     {
@@ -174,25 +215,8 @@ bool DisplayFg::EnsureContext(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt
         if (_list)
             _list->Close();
     }
-    // version of the FG provider that answered
-    ffxQueryDescGetVersions vq {};
-    vq.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-    vq.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
-    vq.device = dev;
-    uint64_t count = 0;
-    vq.outputCount = &count;
-    std::string ver = "?";
-    if (Ffx().query && Ffx().query(nullptr, &vq.header) == FFX_API_RETURN_OK && count)
-    {
-        std::vector<uint64_t> ids(count);
-        std::vector<const char*> names(count);
-        vq.versionIds = ids.data();
-        vq.versionNames = names.data();
-        if (Ffx().query(nullptr, &vq.header) == FFX_API_RETURN_OK && names[0])
-            ver = names[0];
-    }
-    Log(0, std::format("display FG: context {}x{} fmt {} flags {:X} hudless fmt {}, provider {}", w, h, (int) fmt, flags,
-                       (int) hudFmt, ver));
+    Log(0, std::format("display FG: context {}x{} fmt {} flags {:X} hudless fmt {}, provider {}{}", w, h, (int) fmt, flags,
+                       (int) hudFmt, ver, pick ? " (picked)" : ""));
     return true;
 }
 
@@ -246,8 +270,10 @@ uint32_t DisplayFg::OnPresent(void* p)
     auto* src = static_cast<ID3D12Resource*>(c->currentBackBuffer.resource);
     auto* dst = static_cast<ID3D12Resource*>(c->outputSwapChainBuffer.resource);
     const auto ss = D3dState(c->currentBackBuffer.state), ds = D3dState(c->outputSwapChainBuffer.state);
+    Progress::FgCallback(false, true, c->frameID);
     if (src && dst && src != dst)
     {
+        Progress::Mark(cl, Progress::FgCopyIn, c->frameID, true);
         D3D12_RESOURCE_BARRIER b[2] = { Tr(src, ss, D3D12_RESOURCE_STATE_COPY_SOURCE),
                                         Tr(dst, ds, D3D12_RESOURCE_STATE_COPY_DEST) };
         const UINT nb0 = ss == D3D12_RESOURCE_STATE_COPY_SOURCE ? 1 : 0;
@@ -282,7 +308,9 @@ uint32_t DisplayFg::OnPresent(void* p)
         for (auto& x : b)
             std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
         cl->ResourceBarrier(2 - nb0, b + nb0);
+        Progress::Mark(cl, Progress::FgCopyOut, c->frameID, false);
     }
+    Progress::FgCallback(false, false, c->frameID);
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard g(_tm);
     if (_lastCb.time_since_epoch().count())
@@ -438,7 +466,8 @@ void DisplayFg::Frame(ID3D12Device* dev, ID3D12CommandQueue* q, IDXGISwapChain4*
     if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || d.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
         flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE * (CurrentSettings().fgHdr ? 1 : 0);
     const DXGI_FORMAT hudFmt = in->hudMode ? d.Format : DXGI_FORMAT_UNKNOWN;
-    if (!EnsureContext(dev, d.Width, d.Height, d.Format, flags, hudFmt))
+    const std::string version = LiveFgVer() > 0 ? std::format("{}.", LiveFgVer()) : CurrentSettings().fgVersion;
+    if (!EnsureContext(dev, d.Width, d.Height, d.Format, flags, hudFmt, version))
         return;
 
     const uint64_t id = ++_frameId;
@@ -478,12 +507,15 @@ void DisplayFg::Frame(ID3D12Device* dev, ID3D12CommandQueue* q, IDXGISwapChain4*
     uint32_t rc = FFX_API_RETURN_OK;
     if (docOrder)
     {
+        Progress::SetPhase(Progress::FgConfigure);
         cf.frameGenerationEnabled = true;
         rc = Ffx().configure(&_fg, &cf.header);
     }
 
+    Progress::SetPhase(Progress::FgPrepare);
     _alloc[s]->Reset();
     _list->Reset(_alloc[s].Get(), nullptr);
+    Progress::Mark(_list.Get(), Progress::FgPrepIn, id, true);
     ffxDispatchDescFrameGenerationPrepare pr {};
     pr.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
     pr.frameID = id;
@@ -501,6 +533,7 @@ void DisplayFg::Frame(ID3D12Device* dev, ID3D12CommandQueue* q, IDXGISwapChain4*
     pr.depth = ffxApiGetResourceDX12(in->depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     pr.motionVectors = ffxApiGetResourceDX12(in->motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     uint32_t r = Ffx().dispatch(&_fg, &pr.header);
+    Progress::Mark(_list.Get(), Progress::FgPrepOut, id, false);
     _list->Close();
     if (r == FFX_API_RETURN_OK)
     {
@@ -512,6 +545,7 @@ void DisplayFg::Frame(ID3D12Device* dev, ID3D12CommandQueue* q, IDXGISwapChain4*
 
     if (!docOrder)
     {
+        Progress::SetPhase(Progress::FgConfigure);
         cf.frameGenerationEnabled = r == FFX_API_RETURN_OK;
         rc = Ffx().configure(&_fg, &cf.header);
     }
@@ -528,6 +562,17 @@ void DisplayFg::Frame(ID3D12Device* dev, ID3D12CommandQueue* q, IDXGISwapChain4*
                                     gd.motionW, gd.motionH, gd.depthInverted, gd.jitteredMv, in->hudless != nullptr));
         if (!on)
             _loggedFail = true;
+        // third-party Present hooks draw on the swapchain's queue inside each Present
+        std::string hooks;
+        for (const wchar_t* m : { L"GameOverlayRenderer64.dll", L"RTSSHooks64.dll", L"DiscordHook64.dll",
+                                  L"graphics-hook64.dll", L"EOSOVH-Win64-Shipping.dll", L"overlay64.dll" })
+            if (GetModuleHandleW(m))
+            {
+                char n[64] {};
+                WideCharToMultiByte(CP_UTF8, 0, m, -1, n, sizeof(n) - 1, nullptr, nullptr);
+                hooks += (hooks.empty() ? "" : ", ") + std::string(n);
+            }
+        Log(0, "display FG: overlay modules in the process: " + (hooks.empty() ? std::string("none") : hooks));
     }
     _lastEnabled = on;
 }
@@ -536,7 +581,15 @@ void DisplayFg::Frame(ID3D12Device* dev, ID3D12CommandQueue* q, IDXGISwapChain4*
 uint32_t DisplayFg::OnGenerate(void* params)
 {
     auto* p = static_cast<ffxDispatchDescFrameGeneration*>(params);
-    return Ffx().dispatch(&_fg, &p->header);
+    auto* cl = static_cast<ID3D12GraphicsCommandList*>(p->commandList);
+    Progress::FgCallback(true, true, p->frameID);
+    if (cl)
+        Progress::Mark(cl, Progress::FgGenIn, p->frameID, true);
+    const uint32_t r = Ffx().dispatch(&_fg, &p->header);
+    if (cl)
+        Progress::Mark(cl, Progress::FgGenOut, p->frameID, false);
+    Progress::FgCallback(true, false, p->frameID);
+    return r;
 }
 
 void DisplayFg::FlushDumps(ID3D12Device* dev, ID3D12CommandQueue* q, const std::wstring& dir)
@@ -561,7 +614,7 @@ bool PollLive(const std::wstring& dir)
     if (!f)
         return false;
     char line[64];
-    int fg = s_liveFg, nr = s_liveNr, fh = s_liveFgHud, fs = s_liveFgSyn, fo = s_liveFgOrder;
+    int fg = s_liveFg, nr = s_liveNr, fh = s_liveFgHud, fs = s_liveFgSyn, fo = s_liveFgOrder, fv = s_liveFgVer;
     while (fgets(line, sizeof(line), f))
     {
         int v = 0;
@@ -571,26 +624,31 @@ bool PollLive(const std::wstring& dir)
             fs = v;
         else if (sscanf(line, "fgorder=%d", &v) == 1)
             fo = v;
+        else if (sscanf(line, "fgver=%d", &v) == 1)
+            fv = v;
         else if (sscanf(line, "fg=%d", &v) == 1)
             fg = v;
         else if (sscanf(line, "nr=%d", &v) == 1)
             nr = v;
     }
     fclose(f);
-    const bool changed = fg != s_liveFg || nr != s_liveNr || fh != s_liveFgHud || fs != s_liveFgSyn || fo != s_liveFgOrder;
+    const bool changed = fg != s_liveFg || nr != s_liveNr || fh != s_liveFgHud || fs != s_liveFgSyn ||
+                         fo != s_liveFgOrder || fv != s_liveFgVer;
     if (changed)
-        Log(0, std::format("live: fg {} nr {} fghud {} fgsyn {} fgorder {}", fg, nr, fh, fs, fo));
+        Log(0, std::format("live: fg {} nr {} fghud {} fgsyn {} fgorder {} fgver {}", fg, nr, fh, fs, fo, fv));
     s_liveFg = fg;
     s_liveNr = nr;
     s_liveFgHud = fh;
     s_liveFgSyn = fs;
     s_liveFgOrder = fo;
+    s_liveFgVer = fv;
     return changed;
 }
 int LiveFg() { return s_liveFg; }
 int LiveFgHud() { return s_liveFgHud; }
 int LiveFgSyn() { return s_liveFgSyn; }
 int LiveFgOrder() { return s_liveFgOrder; }
+int LiveFgVer() { return s_liveFgVer; }
 int LiveNr() { return s_liveNr; }
 void SetGameFg(bool on)
 {

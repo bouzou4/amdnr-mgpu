@@ -1,6 +1,6 @@
 # Frame generation on the display card: productising design
 
-Status: spike (branch `spike/displayfg`). This note says what the shipped feature would look like, what it costs and what has to be true before it ships.
+Status: prototype (branch `feat/displayfg2`, the spike ported onto the hang-fix presenter). This note says what the shipped feature would look like, what it costs and what has to be true before it ships.
 
 ## What it is
 
@@ -11,15 +11,20 @@ UI: the presenter already has the frame's HUD-less colour (after NR) and the bac
 ## Data path per real frame
 
 1. Render card: colour, HUD-less colour, MVs, depth plane 0 into the ring slot (depth is ~12 MB at 2304x1296 D32S8, ~0.8 ms of render time by the 0.065 ms/MB rule).
-2. Display card `_dq`: ingest, NR, UI composite into the FFX swapchain's back buffer (unchanged path).
-3. `_dq` signals, `_fq` (FFX's game queue) waits on it. FG prepare (depth, MVs, camera) runs on `_fq`, then configure (HUD-less colour, present callback) and the real Present through the FFX swapchain.
+2. Display card `_dq`: ingest, NR, UI composite into the FFX swapchain's back buffer (unchanged path), queued only once the CPU has seen the send land.
+3. The presenter waits on the CPU until `_dq` is done with the frame. Then FG prepare (depth, MVs, camera) runs on `_fq` (FFX's game queue), then configure (HUD-less colour, present callback) and the real Present through the FFX swapchain.
 4. FFX's present thread presents generated, then real, paced by FFX.
+5. Before the next frame is queued, the presenter waits on the CPU until `_fq` is past this Present: FFX reads the HUD-less colour, depth and vectors the next ingest overwrites.
 
-`_fq` exists so FFX never queues behind `_dq`'s waits on the HIP answer. Measured: pacing is the same on either queue once it settles, so `_fq` is kept for isolation, not for speed.
+No queue of ours waits on a fence (the display-hang rules): both hand-overs between `_dq` and `_fq` are CPU waits. FFX's own queues wait on each other inside its swapchain, as in any game with FSR frame generation.
+
+`_fq` is separate from `_dq` so FFX's work never shares a queue with the presenter's. Measured in the spike: pacing is the same on either queue once it settles.
 
 ## Settings (shipped shape)
 
 One row: `Frame generation (display card)`: off / on. It only shows when multi-GPU is active and the host exposes the FFX API. It is off automatically while the game's own frame generation is on (the game's FG presents through the proxy).
+
+`MgpuFgVersion` picks the FG provider by version prefix (`3` = FSR 3.1 frame generation of OptiScaler's FidelityFX module, default = the newest, which is the driver's FSR 4 ML frame generation on RDNA 4).
 
 Everything else stays an ini key for diagnostics, not a menu row: `MgpuFgHudless`, `MgpuFgAsync`, `MgpuFgOwnQueue`, `MgpuFgPacing*`, `MgpuFgCamera*`, `MgpuFgVerticalFov`, `MgpuFgSynthetic*`, `MgpuFgDebug`.
 

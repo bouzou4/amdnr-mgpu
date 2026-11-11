@@ -248,6 +248,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.fgCameraFar = g_keys.Float("MgpuFgCameraFar", 100000.0f);
     s.fgVFov = g_keys.Float("MgpuFgVerticalFov", 60.0f) * 3.14159265f / 180.0f;
     s.fgStartOn = g_keys.Bool("MgpuFgOn", true);
+    g_keys.Lookup("MgpuFgVersion", &s.fgVersion);
     s.fgSyntheticScale = g_keys.Float("MgpuFgSyntheticScale", 1.0f);
     s.fgOwnQueue = g_keys.Bool("MgpuFgOwnQueue", true);
     s.fgPtMargin = g_keys.Float("MgpuFgPacingMarginMs", -1.0f);

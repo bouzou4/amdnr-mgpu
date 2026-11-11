@@ -35,6 +35,7 @@ struct Settings
     bool fgAsync = false, fgHdr = true, fgInfiniteDepth = true, fgDebug = false, fgSynthetic = false;
     float fgCameraNear = 0.1f, fgCameraFar = 100000.0f, fgVFov = 1.0472f;
     bool fgStartOn = true; // FG on before any live switch (MgpuFgOn)
+    std::string fgVersion; // FG provider by version name prefix ("3.1"), empty: the host's default (the newest)
     float fgSyntheticScale = 1.0f; // synthetic depth / motion size relative to the frame
     bool fgOwnQueue = true; // FFX on its own queue (_fq); false: on the presenter's queue (_dq)
     // FFX swapchain pacing tuning; fgPtMargin < 0: FFX defaults

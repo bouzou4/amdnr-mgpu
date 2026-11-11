@@ -1011,6 +1011,7 @@ void ProxySwapChain::PresenterLoop()
         if (!WaitSend(g))
             continue;
         // FFX's work of the previous Present reads the HUD-less colour, depth and vectors this frame overwrites
+        Progress::SetPhase(Progress::FgQueueWait);
         if (_fq && _fqValue && !WaitReuse(_fqFence.Get(), _fqValue, "FG queue", &_stop))
             continue;
 
@@ -1338,7 +1339,7 @@ void ProxySwapChain::PresenterLoop()
                 Alive("NR and UI composite");
             }
             // FFX's queue gets this frame only once the presenter's work on it is done (false: no Present)
-            if (settled && _fgen && !FgStep(g, meta, haveMv, haveDp, haveHud, useHud, nrWrote, sizeHold, dump, tSched))
+            if (settled && _fgen && !FgStep(g, s, m, meta, haveMv, haveDp, haveHud, useHud, nrWrote, sizeHold, dump, tSched))
                 settled = false;
             BOOL fs = FALSE;
             _real->GetFullscreenState(&fs, nullptr);
@@ -1382,7 +1383,7 @@ void ProxySwapChain::PresenterLoop()
             if (SUCCEEDED(RenewReal()))
                 hr = S_OK, _presentFails = 0;
         }
-        if (FAILED(hr) || (g % 30 == 0 && FAILED(_ddev->GetDeviceRemovedReason())))
+        if (FAILED(hr) || ((g % 30 == 0 || _fgen) && FAILED(_ddev->GetDeviceRemovedReason())))
         {
             if (_presentFails++ < 3)
             {
@@ -1469,7 +1470,7 @@ void ProxySwapChain::PresenterLoop()
 }
 
 // Display FG for one frame, right before its real Present
-bool ProxySwapChain::FgStep(UINT64 g, const SlotMeta& meta, bool haveMv, bool haveDp, bool haveHud, bool useHud,
+bool ProxySwapChain::FgStep(UINT64 g, UINT s, UINT m, const SlotMeta& meta, bool haveMv, bool haveDp, bool haveHud, bool useHud,
                             bool nrWrote, bool sizeHold, bool dump, std::chrono::steady_clock::time_point tSched)
 {
     const auto& env = CurrentEnv();
@@ -1519,8 +1520,26 @@ bool ProxySwapChain::FgStep(UINT64 g, const SlotMeta& meta, bool haveMv, bool ha
             fi.motion = _fgZeroMv.Get();
             fi.g.motionW = rw, fi.g.motionH = rh;
         }
-        if (!real && fi.hudMode && !fi.hudless && _hudD)
+        if (!real && fi.hudMode && !fi.hudless && !haveHud && _hudD && _duList[s])
+        {
+            // no HUD-less colour either: the frame itself stands in (an empty one makes the whole frame UI, which
+            // FFX keeps as drawn: generated frames then equal the next real one)
+            _duAlloc[s]->Reset();
+            auto* c = _duList[s].Get();
+            c->Reset(_duAlloc[s].Get(), nullptr);
+            const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            D3D12_RESOURCE_BARRIER b[2] = { Tr(_realBb[m].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                            Tr(_hudD.Get(), ns, D3D12_RESOURCE_STATE_COPY_DEST) };
+            c->ResourceBarrier(2, b);
+            c->CopyResource(_hudD.Get(), _realBb[m].Get());
+            for (auto& x : b)
+                std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            c->ResourceBarrier(2, b);
+            c->Close();
+            ID3D12CommandList* cl[] = { c };
+            _dq->ExecuteCommandLists(1, cl);
             fi.hudless = _hudD.Get();
+        }
     }
     fi.tGame = tSched;
     fi.frameMs = _prevSched.time_since_epoch().count()
@@ -1534,6 +1553,7 @@ bool ProxySwapChain::FgStep(UINT64 g, const SlotMeta& meta, bool haveMv, bool ha
         Log(0, std::format("display FG: dumping the next presented frames from frame {}", g));
     }
     // FFX reads what the presenter's queue wrote: that work is done first, on the CPU (no queue waits on another)
+    Progress::SetPhase(Progress::FgIdleWait);
     _dq->Signal(_dFence.Get(), ++_dValue);
     if (!WaitReuse(_dFence.Get(), _dValue, "FG after the presenter", &_stop))
         return false;

@@ -60,7 +60,8 @@ class DisplayFg
     static void InstallPresentTiming(PFN_CreateSwapChainForHwnd original, IDXGIFactory2* f, ID3D12CommandQueue* q);
 
   private:
-    bool EnsureContext(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt, uint32_t flags, DXGI_FORMAT hudFmt);
+    bool EnsureContext(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt, uint32_t flags, DXGI_FORMAT hudFmt,
+                       const std::string& version);
     uint32_t OnPresent(void* params);
     uint32_t OnGenerate(void* params);
 
@@ -70,6 +71,8 @@ class DisplayFg
     UINT _w = 0, _h = 0;
     DXGI_FORMAT _fmt = DXGI_FORMAT_UNKNOWN, _hudFmt = DXGI_FORMAT_UNKNOWN;
     uint32_t _flags = 0;
+    std::string _version; // provider preference the context was made with
+    bool _loggedVersions = false;
     uint64_t _frameId = 0;
     bool _lastEnabled = false, _loggedFail = false;
     ComPtr<ID3D12CommandAllocator> _alloc[4];
@@ -109,6 +112,7 @@ int LiveNr();
 int LiveFgHud(); // "fghud=0|1": HUD-less colour to FFX, -1: setting
 int LiveFgSyn(); // "fgsyn=<mask>": 1 synthetic depth, 2 synthetic motion, -1: setting
 int LiveFgOrder(); // "fgorder=0|1": 1 configure before prepare (4.0.2 order, default), 0 prepare first
+int LiveFgVer();   // "fgver=<major>": FG provider of that major version (3: FSR 3.1), 0 / -1: setting
 void SetGameFg(bool on); // the game's own FG presents through the proxy: no display FG
 bool GameFg();
 } // namespace Mgpu
