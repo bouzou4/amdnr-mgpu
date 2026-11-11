@@ -222,12 +222,26 @@ Bus 7 came up as Gen2 (warm boot), so a send takes 2-8 ms instead of about 0.5 m
 | **Crysis 2 in a level** (`Downtown`, standing), 2560x1440 fullscreen (multi: `MgpuFullscreen=1`) | **24.1 / 29.4** | 36.3 / 67.4 | 29.1-29.6 | 0 / 0 | none |
 | Crysis 2 in the level, NR bypassed | 174 / 64-128 | - | - | 0 / 0 | none |
 
-- Where the game's own rendering costs time (the Crysis 2 level: about 5.7 ms per frame), the second card gives +22 %. Single-GPU, render and NR add up on one card. Multi-GPU, NR alone sets the frame time.
+- Where the game's own rendering costs time (the Crysis 2 level: about 5.7 ms per frame), the second card gives +22 % here (+48 % in the 7.2 launch). Single-GPU, render and NR add up on one card. Multi-GPU, NR alone sets the frame time.
 - Where the game is nearly free (test title, Ep2, Crysis 2 title), NR sets the frame time on both, and the second card only adds one frame of latency.
 - The multi-GPU ceiling is the host round trip, 33.6 ms against 29.5 ms of NR GPU time. The presenter is serial: it ingests frame N+1 only after N is presented, and the host idles meanwhile. Pipelining that would bring it to about 33 fps.
-- Bypassed, multi-GPU is send-bound at Gen2: 7-8 ms for a 14.4 MB 1440p frame. Re-time at Gen5 (`data\hang\bw\link.exe`) after a cold boot.
+- Bypassed, the presenter waits 7-8 ms for each 14.4 MB 1440p send at Gen2. Section 7.2 has the re-time at Gen5.
 - Crysis 2 levels load from the command line: `-dx9 -devmode +map Downtown`. The run creates `Saved Games\Crysis2\SaveGames\default_downtown_*`, and the probe removes it.
 - Quality is unchanged: the same host, the same network, the same OF.
+
+### 7.2 Re-time at PCIe 5.0 (2026-11-10 20:03-20:27, perf leases)
+
+Both cards read PCIe 5.0 x8 before the runs. Same settings and builds as 7.1, one launch per case.
+
+| Case | fps single / multi | latency ms single / multi | send wait ms (multi) | failed presents | device errors |
+|---|---|---|---|---|---|
+| Test title, 1920x1080 windowed | 49.2 / 48.9 | 20.1 / 40.5 | under 0.4 | 0 / 0 | none |
+| Ep2 `ep2_outland_01`, 1920x1080 windowed | 46.5 / 48.8 | 20.5 / 40.6 | under 0.9 | 0 / 0 | none |
+| Crysis 2 in a level (`Downtown`), 2560x1440 fullscreen | 19.4 / 28.7 | 38.9 / 68.9 | 0.0 (NR on) | 0 / 0 | none |
+
+- The link speed does not change the NR-on numbers. Multi-GPU is bound by the host round trip (34.3 ms per frame in Crysis 2), and the game waits for a ring slot (24-28 ms), not for the send.
+- Crysis 2 single-GPU varies between launches: 19.4 fps here against 24.1 in 7.1. NR bypassed, the same two launches ran 105 and 174 fps, so the scene cost differed. Multi-GPU was 28.7 and 29.4. The gain is therefore between +22 % and +48 %, from one launch per case.
+- Open: with NR bypassed in the level, multi-GPU shows 64 fps against 105 single, with the send at about 4 ms. What costs the rest is not found (candidates: the render-card copy on the game's direct queue, the skipped 9On12 Present). It does not limit the NR-on case.
 
 ## 8. Effort estimates
 
