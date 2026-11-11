@@ -690,8 +690,9 @@ bool NrEngine::CadenceApply(ID3D12GraphicsCommandList* list, const CadIn& in, ui
         _sinceFeed = 1000;
     }
     _cadLastList = _presentCounter;
-    GuardCheck(list, in.color, in.colorFmt, in.w, in.h, in.encoding, mv ? in.mv : nullptr, in.mvW, in.mvH, in.mvScaleX,
-               in.mvScaleY);
+    if (!reset) // a cut the game flags: the vectors mean nothing across it
+        GuardCheck(list, in.color, in.colorFmt, in.w, in.h, in.encoding, mv ? in.mv : nullptr, in.mvW, in.mvH,
+                   in.mvScaleX, in.mvScaleY);
     if (mv && (!_acc[0] || _acc[0]->GetDesc().Width != in.mvW || _acc[0]->GetDesc().Height != in.mvH))
     {
         ComPtr<ID3D12Resource>* ts[] = { std::addressof(_acc[0]), std::addressof(_acc[1]), std::addressof(_accFed) };
@@ -2064,7 +2065,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         StabBind sb;
         if (_settings.Cadenced() && hudTarget == nullptr) // held back: the history kept, checked until it can resume
             c.cadence = 16;
-        if (c.cadence == 16)
+        if (c.cadence == 16 && !(mv && _mvCap.reset))
             GuardCheck(list, _termCopy.Get(), bd.Format, w, h, encoding, mv ? _mvCopy.Get() : nullptr, _mvCap.w, _mvCap.h,
                        _mvCap.scaleX, _mvCap.scaleY);
         const bool stab = StabPrepare(list, w, h, mv && _mvCap.reset, c, mv ? _mvCopy.Get() : nullptr, sb);
@@ -2372,7 +2373,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         const bool stab = StabPrepare(list, w, h, in.reset, c, mv ? in.motion : nullptr, sb);
         if (mv)
             Barrier(list, in.motion, in.motionState, kRead);
-        if (c.cadence == 16)
+        if (c.cadence == 16 && !in.reset)
             GuardCheck(list, _termCopy.Get(), sd.Format, w, h, in.encoding, mv ? in.motion : nullptr, in.motionW,
                        in.motionH, in.mvScaleX, in.mvScaleY);
         Dispatch(list, _psoApply.Get(), c, srv, fmt, _termOut.Get(), sd.Format, w, h, nullptr, stab ? &sb : nullptr);
