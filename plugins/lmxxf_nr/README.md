@@ -129,22 +129,22 @@ Full 1080 tier, multi-GPU, same menu, 12-frame dumps (`seq_metrics.py`, flk_stat
 
 Without history the output changes more than its input from frame to frame (positive flicker); with history it changes less, on still and on motion-compensated pixels, and the edit on disoccluded pixels does not grow (no ghosting signal). Panning sequences (1-5 px/frame, 6-20 % of pixels moving): flk_mc +0.00095 / psnr_mc 35.8 off against -0.00026..-0.00060 / 37.5-44.1 on. The vectors' sign checks out on every sequence (warping with +mv beats -mv and no motion).
 
-### Overlap presenter (`MgpuOverlap`), harness
+### Overlap presenter (`MgpuOverlap`)
 
-`tools/mgpu_harness` at 3840x2160 with no render load, so the display card is the bound; both cards on PCIe 5.0 x8; 12-13 s windows after the network is built. Latency is the game's Present to the real Present; "added" is the render card's last work on a frame to the display queue past its Present.
+Satisfactory main menu, 3840x2160, FSR 4 output, HUD-less, temporal; one cold launch per preset with a 20 s overlap window, then a 20 s serial window (the presenter switched live). Both links at 28 GB/s (bw.exe). `MgpuDred=1` in all four: DRED breadcrumbs on the display device were the interim mitigation for the display-card losses at that time. Latency is the game's Present to the real Present.
 
-| Preset | Presenter | fps | latency ms | added ms |
+| Preset | serial fps | overlap fps | serial latency ms | overlap latency ms |
 |---|---|---|---|---|
-| Performance | serial | 114.5 | 8.8 | 17.8 |
-| Performance | overlap | 136.2 | 12.0 | 19.2 |
-| Quality | serial | 51.7 | 19.1 | 38.6 |
-| Quality | overlap | 55.6 | 23.7 | 41.3 |
-| Balanced | serial | 79.9 | 12.5 | 25.2 |
-| Balanced | overlap | 91.3 | 15.5 | 26.6 |
-| Ultra | serial | 24.9 | 40.1 | 81.6 |
-| Ultra | overlap | 25.4 | 45.8 | 85.8 |
+| Performance | 67.26 | 64.15 | 14.8 | 16.8 |
+| Balanced | 63.80 | 64.08 | 15.6 | 19.0 |
+| Quality | 45.37 | 53.12 (+17 %) | 22.0 | 27.5 |
+| Ultra | 22.73 | 24.11 (+6 %) | 44.0 | 51.6 |
 
-The overlap cycle is the network's time plus about 0.4 ms. It only helps when the display card is the bound. A variant that let the game run 2 frames ahead gave the same frame rates with a whole display frame more latency (Quality: 35.9 ms against 23.7) and was removed. Render queue stalls of 2.5 s and 3.5 s, live presenter switches, and the upscaler-start sequence (a HUD-less colour of a wrong pairing, gate frames, the right pairing, with 1.7 s stalls) pass on both. Not measured in a game yet: the one game run lost the display device at the upscaler-start / HUD-less gate transition, where a serial presenter run had lost it five minutes earlier.
+Satisfactory's render card needs about 14.9 ms per frame. At Performance and Balanced it is the bound, and overlap gains nothing: at Performance it loses 3 fps, because with the grant held back each frame runs its three stages nearly one after another. At Quality and Ultra the display card is the bound, and overlap gains what ingest and present no longer add to the network time.
+
+The game may send the next frame early ("just in time") only while the display card's work stage is about to be free and the render card has already finished the frame being presented. Without that last condition, a render-bound game queued a second frame on the render card: same frame rate, 11 ms more latency. A variant that let the game run 2 frames ahead was removed: same frame rates, a whole display frame more latency.
+
+Harness (`tools/mgpu_harness`, no render load, so the display card is the bound): Performance 116.5 to 138.0 fps, Balanced 79.9 to 91.3, Quality 52.9 to 56.1, Ultra 24.9 to 25.4; with a 20 ms render load (render-bound) 61.4 to 68.6 fps and 16.3 to 14.6 ms. Render-queue stalls of 2.5 s and 3.5 s, live presenter switches, and the upscaler-start / HUD-less gate sequence (fake upscaler, `--upscaler --hudless --upscaler-late --script`) pass.
 
 ## Robustness
 
