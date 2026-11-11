@@ -24,6 +24,8 @@ struct Settings
     bool temporal = false;     // send the render card's motion vectors; NR keeps a network history
     double uiGate = 0.90;      // HUD-less: above this share of differing pixels the pair is wrong: no NR that frame
     unsigned maxLead = 1;      // frames the game may be ahead of the display card
+    int overlap = 0;           // display card pipeline: 0 serial, 1 overlap with just-in-time sends, 2 overlap with
+                               // a frame queued (see ProxySwapChain::IngestLoop)
     int lowLatency = 2;        // 1: Present throttles on the render card, 2: and paces the next frame (Pacer)
     bool earlySend = false;    // the send copy is queued before the wait for the display card
     bool presentIdle = false;  // the real Present goes only to an idle display queue (bounded CPU wait)
@@ -86,6 +88,7 @@ struct AdapterView
     LUID luid {};
     UINT outputs = 0;
     uint64_t vram = 0;
+    int pcieGen = 0, pcieLanes = 0; // the slot's link (ADLX), 0 = unknown
 };
 
 struct Stats
@@ -99,7 +102,12 @@ struct Stats
     double sendMs = 0, ingestMs = 0;                 // GPU time of the copy on each side
     double sendWaitMs = 0, answerWaitMs = 0;         // presenter CPU waits: the send landing, the network answer
     double sendGBs = 0, ingestGBs = 0;
+    double frameBytes = 0; // bytes sent per frame: the frame plus its HUD-less colour and vectors
     double latencyMs = 0;                            // proxy Present -> real Present (CPU)
+    // per frame, from fence completion times: render card done -> ingested on the display card -> display queue
+    // past the real Present. renderToDisplayMs + displayToPresentMs = addedMs (what a single card does not have)
+    double renderToDisplayMs = -1, displayToPresentMs = -1, addedMs = -1;
+    double jitLeadMs = 0; // overlap 1: how long before the work stage frees up the game sends the next frame
     double nrMs = 0;                                 // CPU time of the NR record+submit
     uint32_t ringDepth = 0, ringSlots = 0;
     uint64_t slotBytes = 0;
@@ -158,6 +166,8 @@ ID3D12CommandQueue* DisplayQueue();
 Stats& MutableStats();
 std::mutex& StatsMutex();
 void StartLoadSampler();
+void StartLinkQuery();
+double LinkGBs(int gen, int lanes); // theoretical per direction
 bool DumpTexture(ID3D12Device* dev, ID3D12CommandQueue* q, ID3D12Resource* tex, D3D12_RESOURCE_STATES state,
                  const std::wstring& base);
 } // namespace Mgpu

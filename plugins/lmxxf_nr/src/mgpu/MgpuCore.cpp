@@ -152,6 +152,7 @@ static void BuildTopology()
     s_stats.render = t->rv;
     s_stats.display = t->dv;
     StartLoadSampler();
+    StartLinkQuery();
     Log(0, std::format("render card bus {} '{}', display card bus {} '{}'", t->rv.bus, t->rv.name, t->dv.bus,
                        t->dv.name));
 }
