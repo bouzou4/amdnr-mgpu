@@ -11,6 +11,7 @@ Versioning for all of them: the new functions are appended to the end of `OptiPl
 | 2 | Present callback + HUD-less colour without frame generation | `RegisterPresentCallback` | built, used by the plugin |
 | 5 | Adapter override + unhooked device creation | `RegisterAdapterOverride`, `CreateD3D12DeviceUnhooked`, `CreateDxgiFactoryUnhooked`, `RunUnspoofed` | built, used by the plugin's multi-GPU mode |
 | 6 | Swapchain provider | `RegisterSwapchainProvider`, `CreateSwapChainForHwndUnhooked` | built, used by the plugin's multi-GPU mode |
+| 7 | FFX API for plugins (D3D12) | `FfxCreateContextDx12`, `FfxDestroyContextDx12`, `FfxConfigureDx12`, `FfxQueryDx12`, `FfxDispatchDx12` | spike (`spike/displayfg`), used by the plugin's display-card frame generation |
 
 ## 1. Upscale callbacks and command list state restore
 
@@ -167,3 +168,25 @@ int32_t (*CreateSwapChainForHwndUnhooked)(void* factory, void* device, void* hwn
 
 - Registering a provider turns OptiScaler's FG swapchain off for that process even when the provider then declines; FG output and a plugin presenter are exclusive anyway (the multi-GPU design suppresses FG output), and deciding later would mean building the FG swapchain first and discarding it.
 - CONTROL creates its swapchain with the legacy `CreateSwapChain`: the device went to the render card but no proxy was made until that path called the provider too. CoreWindow and composition swapchains have no `HWND` for the provider's real swapchain; they stay uncovered until a game needs them.
+
+## 7. FFX API for plugins (D3D12)
+
+**Why.** A plugin that presents on its own swapchain (the multi-GPU presenter) can only get frame generation by running it itself. OptiScaler already loads, versions and routes the FidelityFX modules (FSR 3.1 / 4 FG, the FSR 4 driver provider on RDNA 4); a plugin that loads them again meets OptiScaler's `LoadLibrary` and `GetModuleHandle` redirection and the game's own hooked copies.
+
+**ABI.**
+
+```c
+uint32_t (*FfxCreateContextDx12)(void** context, void* desc, const void* memCb);
+uint32_t (*FfxDestroyContextDx12)(void** context, const void* memCb);
+uint32_t (*FfxConfigureDx12)(void** context, const void* desc);
+uint32_t (*FfxQueryDx12)(void** context, void* desc);
+uint32_t (*FfxDispatchDx12)(void** context, const void* desc);
+```
+
+**Behaviour.**
+
+- They are `ffxCreateContext` / `ffxDestroyContext` / `ffxConfigure` / `ffxQuery` / `ffxDispatch` of `FfxApiProxy`'s own modules (never the game's, never hooked for inputs); descs, contexts and return codes are the FFX API's (`ffx_api.h`, MIT). The first call loads the modules if OptiScaler has not yet.
+- A frame generation swapchain context (`FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12`) created through `FfxCreateContextDx12` gets a plain DXGI swapchain: on that thread the `CreateSwapChainForHwnd` hook passes the call through (no swapchain provider, no `WrappedIDXGISwapChain4`, no `State` capture), so the FFX swapchain can sit under a plugin's proxy without OptiScaler taking it for the game's.
+
+**What the plugin taught.** On the display card of the multi-GPU mode the FG swapchain and context (provider 4.0.2 from OptiScaler's `amd_fidelityfx_framegeneration_dx12.dll`) are created on the plugin's own device and queue; nothing else of OptiScaler's FG is involved. The `CreateSwapChainForHwnd` pass-through was the only host change it needed.
+

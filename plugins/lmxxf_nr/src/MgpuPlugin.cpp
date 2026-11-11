@@ -5,6 +5,7 @@
 #include "Autoconfig.h"
 #include "Nr.h"
 #include "mgpu/MgpuCore.h"
+#include "mgpu/MgpuFrameGen.h"
 #include "GpuWait.h"
 
 #include <detours/detours.h>
@@ -181,6 +182,10 @@ void CaptureHudless(OptiPresentFrame* f, void* res, uint32_t state, bool standIn
         g_cap.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!g_cap.list || !g_cap.fence)
             return;
+        for (auto& a : g_cap.alloc)
+            if (a)
+                a->SetName(L"Mgpu hudless capture allocator");
+        g_cap.list->SetName(L"Mgpu hudless capture list");
         g_cap.list->Close();
     }
     const uint32_t s = uint32_t(g_cap.counter % 4);
@@ -325,6 +330,25 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", true) ? 1 : 0), 0, 2);
     s.forwardOutputs = g_keys.Bool("MgpuForwardOutputs", true);
     g_standIn = std::clamp(g_keys.Int("MgpuMenuStandIn", 1), 0, 2);
+    s.frameGen = g_keys.Bool("MgpuFrameGen", false);
+    s.fgHudless = g_keys.Bool("MgpuFgHudless", true);
+    s.fgAsync = g_keys.Bool("MgpuFgAsync", false);
+    s.fgHdr = g_keys.Bool("MgpuFgHdr", true);
+    s.fgInfiniteDepth = g_keys.Bool("MgpuFgInfiniteDepth", true);
+    s.fgDebug = g_keys.Bool("MgpuFgDebug", false);
+    s.fgSynthetic = g_keys.Bool("MgpuFgSynthetic", false);
+    s.fgCameraNear = g_keys.Float("MgpuFgCameraNear", 0.1f);
+    s.fgCameraFar = g_keys.Float("MgpuFgCameraFar", 100000.0f);
+    s.fgVFov = g_keys.Float("MgpuFgVerticalFov", 60.0f) * 3.14159265f / 180.0f;
+    s.fgStartOn = g_keys.Bool("MgpuFgOn", true);
+    g_keys.Lookup("MgpuFgVersion", &s.fgVersion);
+    s.fgSyntheticScale = g_keys.Float("MgpuFgSyntheticScale", 1.0f);
+    s.fgOwnQueue = g_keys.Bool("MgpuFgOwnQueue", true);
+    s.fgSwapOnDemand = g_keys.Bool("MgpuFgSwapOnDemand", false);
+    s.fgPtMargin = g_keys.Float("MgpuFgPacingMarginMs", -1.0f);
+    s.fgPtVariance = std::clamp(g_keys.Float("MgpuFgPacingVariance", 0.1f), 0.0f, 1.0f);
+    s.fgPtHybridSpin = g_keys.Bool("MgpuFgPacingHybridSpin", false);
+    s.fgPtFenceWait = g_keys.Bool("MgpuFgPacingFenceWait", false);
 
     g_dir = dumpDir;
     Mgpu::Env e;
@@ -377,6 +401,11 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
                            st.error);
     };
     e.dumpDir = dumpDir;
+    if (OPTI_API_HAS(api, FfxDispatchDx12))
+        e.ffx = { api->FfxCreateContextDx12, api->FfxDestroyContextDx12, api->FfxConfigureDx12, api->FfxQueryDx12,
+                  api->FfxDispatchDx12 };
+    else if (s.frameGen)
+        Log(OptiLog_Error, "display frame generation needs the host's FFX API: off");
     Mgpu::Configure(s, e);
     DisplayEngine().name = L"display";
     DisplayEngine().dumpDir = dumpDir;
@@ -384,8 +413,9 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     api->RegisterAdapterOverride(plugin, AdapterOverride, nullptr);
     api->RegisterSwapchainProvider(plugin, SwapchainProvider, nullptr);
     g_on = true;
-    Log(OptiLog_Info, "multi-GPU on: hudless %d, NR every frame %d, motion vectors %d, UI gate %.2f, frames ahead %u",
-        s.hudless, s.nrEveryFrame, s.temporal, s.uiGate, s.maxLead);
+    Log(OptiLog_Info,
+        "multi-GPU on: hudless %d, NR every frame %d, motion vectors %d, UI gate %.2f, frames ahead %u, frame generation %d",
+        s.hudless, s.nrEveryFrame, s.temporal, s.uiGate, s.maxLead, s.frameGen);
     return true;
 }
 
@@ -402,6 +432,8 @@ void MgpuOnPresent(OptiPresentFrame* f)
         return;
     g_colorSpace = f->colorSpace;
     static bool fgHud = false; // this frame's HUD-less colour came at the game's FG swapchain, before PreOverlay
+    if (f->size >= offsetof(OptiPresentFrame, frameGeneration) + sizeof(f->frameGeneration))
+        Mgpu::SetGameFg(f->frameGeneration == OptiFrameGen_Game);
     if (f->phase == OptiPresent_AfterOverlay && f->hudless != nullptr && Mgpu::WantHudless())
     {
         CaptureHudless(f, f->hudless, f->hudlessState, false);
@@ -436,6 +468,12 @@ void MgpuOnUpscale(OptiUpscaleFrame* f)
     g.jitterY = f->jitterY;
     g.reset = (f->flags & OptiUpscale_Reset) != 0;
     g.depthInverted = (f->flags & OptiUpscale_DepthInverted) != 0;
+    g.jitteredMv = (f->flags & OptiUpscale_JitteredMV) != 0;
+    if (Mgpu::CurrentSettings().frameGen && f->depth)
+    {
+        g.depth = static_cast<ID3D12Resource*>(f->depth);
+        g.depthState = (D3D12_RESOURCE_STATES) f->depthState;
+    }
     Mgpu::CaptureGuides(static_cast<ID3D12GraphicsCommandList*>(f->commandList), g);
 }
 

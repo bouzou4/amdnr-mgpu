@@ -4,6 +4,7 @@
 #include "MgpuPlugin.h"
 #include "Nr.h"
 #include "Presets.h"
+#include "Validation.h"
 #include "mgpu/MgpuCore.h"
 #include "mgpu/MgpuLatency.h"
 
@@ -35,6 +36,7 @@ void ConfigureAll(const NrSettings& s)
     DisplayEngine().Configure(d);
 }
 bool g_hudlessRequested = false;
+uint32_t g_triggerEvery = 30; // presents between looks at the trigger files (TriggerEvery, test rigs)
 
 // Test rigs (TestHooks=true): a title without an upscaler calls the upscale callbacks itself and gives the HUD-less
 // colour of the frame it presents next, see LmxxfNrTestUpscale / LmxxfNrTestHudless
@@ -42,6 +44,8 @@ bool g_testHooks = false;
 std::atomic<void*> g_testHud { nullptr };
 std::atomic<uint32_t> g_testHudState { 0 };
 std::atomic<uint64_t> g_testUpscaleId { 0 };
+std::atomic<bool> g_gameRemoved { false };
+
 
 const char* const kPlacements[] = { "Before upscaling", "After upscaling", "Terminal (HUD-less)" };
 const char* const kSizes[] = { "1080 tier", "1440 (2560x1440)", "Native" };
@@ -195,7 +199,7 @@ std::wstring g_dumpDir;
 void SettingsTrigger()
 {
     static uint32_t n = 0;
-    if (g_dumpDir.empty() || n++ % 30 != 0)
+    if (g_dumpDir.empty() || n++ % g_triggerEvery != 0)
         return;
     const std::wstring path = g_dumpDir + L"\\lmxxf_nr_settings.trigger";
     FILE* f = _wfopen(path.c_str(), L"r");
@@ -246,7 +250,7 @@ bool RestartOnly(const std::string& k)
 void IniTrigger()
 {
     static uint32_t n = 0;
-    if (g_dumpDir.empty() || n++ % 30 != 15)
+    if (g_dumpDir.empty() || n++ % g_triggerEvery != g_triggerEvery / 2)
         return;
     const std::wstring path = g_dumpDir + L"\\lmxxf_nr_ini.trigger";
     FILE* f = _wfopen(path.c_str(), L"r");
@@ -332,6 +336,30 @@ void FrameLogTrigger()
 
 void Present(OptiPresentFrame* frame, void*)
 {
+    if (Validation::Level() != 0)
+    {
+        auto* device = static_cast<ID3D12Device*>(frame->device);
+        Validation::Attach(device, MgpuActive() ? "render" : "game");
+        if (Validation::CheckRemoved(device, MgpuActive() ? "render" : "game"))
+            g_gameRemoved = true;
+        if (MgpuActive())
+        {
+            Validation::Attach(Mgpu::DisplayDevice(), "display");
+            Validation::CheckRemoved(Mgpu::DisplayDevice(), "display");
+        }
+    }
+    if (g_testHooks)
+    {
+        if (const uint64_t id = g_testUpscaleId.load())
+            frame->upscaleFrameId = id;
+        if (void* hud = g_testHud.load(); hud != nullptr && frame->hudless == nullptr)
+        {
+            frame->hudless = hud;
+            frame->hudlessState = g_testHudState.load();
+            if (frame->size >= offsetof(OptiPresentFrame, hudlessSource) + sizeof(uint32_t))
+                frame->hudlessSource = OptiHudless_FfxFG;
+        }
+    }
     if (frame->phase == OptiPresent_AfterOverlay)
     {
         FramePacing(frame);
@@ -737,8 +765,11 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
             Log(OptiLog_Info, "no profile for %ls in %ls", exeName.c_str(), profilePath.c_str());
     }
     g_keys.multiGpu = g_keys.Bool("MultiGpu", false);
-
+    // Before any device: the debug layer can't be turned on under a live one
+    Validation::Enable(std::clamp(g_keys.Int("Validation", 0), 0, 2));
+    g_triggerEvery = (uint32_t) std::clamp(g_keys.Int("TriggerEvery", 30), 2, 600);
     g_testHooks = g_keys.Bool("TestHooks", false);
+
     g_ui = ReadSettings();
     // A profile preset never overrides rows the user set
     const bool presetFromProfile = !g_keys.UserSet("Preset");
@@ -853,11 +884,11 @@ extern "C" __declspec(dllexport) void LmxxfNrTestHudless(void* hudless, uint32_t
     g_testHud = hudless;
 }
 
-// Test rigs: bit 1 the display card is lost (multi-GPU fallback), bit 2 NR failed on the game card, bit 3 on the
-// display card
+// Test rigs: bit 0 the game's device was found removed at a present (validation runs), bit 1 the display card is
+// lost (multi-GPU fallback), bit 2 NR failed on the game card, bit 3 on the display card
 extern "C" __declspec(dllexport) uint32_t LmxxfNrTestStatus()
 {
-    uint32_t bits = 0;
+    uint32_t bits = g_gameRemoved.load() ? 1u : 0u;
     if (MgpuFallback())
         bits |= 2;
     if (Engine().Stats().state == "failed")
