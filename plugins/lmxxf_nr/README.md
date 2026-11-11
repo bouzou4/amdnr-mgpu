@@ -129,6 +129,21 @@ Full 1080 tier, multi-GPU, same menu, 12-frame dumps (`seq_metrics.py`, flk_stat
 
 Without history the output changes more than its input from frame to frame (positive flicker); with history it changes less, on still and on motion-compensated pixels, and the edit on disoccluded pixels does not grow (no ghosting signal). Panning sequences (1-5 px/frame, 6-20 % of pixels moving): flk_mc +0.00095 / psnr_mc 35.8 off against -0.00026..-0.00060 / 37.5-44.1 on. The vectors' sign checks out on every sequence (warping with +mv beats -mv and no motion).
 
+### Overlap presenter (`MgpuOverlap`), harness
+
+`tools/mgpu_harness` at 3840x2160 with no render load, so the display card is the bound; both cards on PCIe 5.0 x8; 12-13 s windows after the network is built. Latency is the game's Present to the real Present; "added" is the render card's last work on a frame to the display queue past its Present.
+
+| Preset | Presenter | fps | latency ms | added ms |
+|---|---|---|---|---|
+| Performance | serial | 114.5 | 8.8 | 17.8 |
+| Performance | overlap 1 (just in time) | 136.2 | 12.0 | 19.2 |
+| Performance | overlap 2 (a frame queued) | 136.3 | 14.8 | 21.9 |
+| Quality | serial | 51.7 | 19.1 | 38.6 |
+| Quality | overlap 1 | 55.6 | 23.7 | 41.3 |
+| Quality | overlap 2 | 55.4 | 35.9 | 53.8 |
+
+The overlap cycle is the network's time plus about 0.4 ms. It only helps when the display card is the bound. Render queue stalls of 2.5 s and 3.5 s, live presenter switches, and the upscaler-start sequence (a HUD-less colour of a wrong pairing, gate frames, the right pairing, with 1.7 s stalls) pass on all three. Not measured in a game yet: the one game run lost the display device at the upscaler-start / HUD-less gate transition, where a serial presenter run had lost it five minutes earlier.
+
 ## Robustness
 
 Checked on the Satisfactory main menu (3840x2160, FSR 4, Small 1080 tier with history) with in-process logs and frame dumps only; the rig scripts live in the git-ignored `data/`.
