@@ -79,6 +79,22 @@ Generated frame against its neighbours: 31.4 dB against their mean, 26.9 / 28.8 
 
 Satisfactory (on feat/displayfg2, every-frame NR, `MgpuDred=1`, no dumps): FSR 3.1.6 and 4.0.2 both ran synthetic inputs, then the game's depth, vectors and HUD-less colour, then NR on, with no loss: 63-64 real fps, 128-129 presented per second. The spike's 4.0.2 losses (dfg4, dfg5) ran with DRED page faults only, without breadcrumbs. These passes ran with breadcrumbs (`MgpuDred=1`), the interim mitigation for the display-card losses, so they do not clear 4.0.2 without it.
 
+Games on this branch (cold launches, `MgpuDred=1`, no dumps, uncapped; FG off at start and switched on live, so the real swapchain is swapped to the FFX one on demand, 0.24-0.32 s). Real fps from the rig's frame log; presented/s and game->DXGI (game Present to the real Present of the frame) from the plugin's `fg:` lines; pacing is the gap between DXGI Presents (generated->real / real->generated, medians). No PresentMon on the rig: with AMD flip metering on, these are submit times, not scanout.
+
+| Game, preset | phase | real fps | presented/s | game->DXGI | pacing |
+|---|---|---|---|---|---|
+| Satisfactory Quality | async | 64.1 | 64 | 15.0 ms (stats latency) | |
+| | async + FG 3.1.6 | 65.4 | 123-126 | 19.0 ms | 0.4 / 14.6-17.9 ms |
+| | async + FG 4.0.2 | 62.1 | 120-122 | 19.9 ms | 0.4 / 14.6-14.7 ms |
+| Satisfactory Ultra | async | 60.2 | 60 | 14.9 ms (stats latency) | |
+| | async + FG 3.1.6 | 54.0 | 102-116 | 20.5-22.9 ms | 0.3 / 17.6-18.0 ms |
+| | async + FG 4.0.2 | 52.8 | 99-114 | 21.6-23.7 ms | 0.4 / 15.8-15.9 ms |
+| Hellraiser Quality, FSR input | async | 85.3 | 85 | 11.5 ms (stats latency) | |
+| | async + FG 3.1.6 | 82.5 | 154-165 | 14.9-15.9 ms | 0.4 / 11.6-11.8 ms |
+| | async + FG 4.0.2 | 82.9 | 162-166 | 15.4-15.8 ms | 0.4 / 11.3-11.5 ms |
+
+No loss or failed present in the four launches. Hellraiser's DLSS input (`UpscalerOption=3`, the one the earlier Hellraiser jobs used) carries no depth: OptiScaler logs `Depth not exist` on every evaluate, FG is on with no generated frames (the plugin now says so once). Its FSR input (`UpscalerOption=2`) carries depth. The generated frame goes out 0.3-0.4 ms before the real one and the real one 11-18 ms after it, the same pattern as on the hang-fix presenter; whether flip metering spreads them at scanout needs PresentMon or a capture card.
+
 ## Failure handling
 
 - FFX swapchain creation fails: plain swapchain, FG row greyed out with the reason.
