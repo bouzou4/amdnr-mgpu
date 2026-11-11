@@ -1766,10 +1766,13 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::GetDesc(DXGI_SWAP_CHAIN_DESC* d)
 HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers(UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
     Log(0, std::format("ResizeBuffers {} {}x{} fmt {} flags {:X}", n, w, h, (int) f, flags));
+    const auto tDrain = std::chrono::steady_clock::now();
     if (!_lost)
         StopPresenter();
     Alive("resize: presenter stopped");
     DrainRender();
+    Log(0, std::format("ResizeBuffers: presenter stopped and both cards drained in {:.1f} ms",
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tDrain).count()));
     {
         // frames sent but not presented belong to the old buffers
         std::lock_guard g(_m);

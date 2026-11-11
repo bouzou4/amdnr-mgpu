@@ -781,8 +781,12 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
     _stats.state = "preparing";
     if (_ctx != nullptr)
     {
+        // what a drain costs: the job in flight plus what both queues still hold
+        const auto t0 = std::chrono::steady_clock::now();
         DrainJob();
         WaitIdle();
+        Log(OptiLog_Info, "NR (%ls): rebuild, queues drained in %.1f ms", name.c_str(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
     if (recreate && _ctx != nullptr)
     {
