@@ -372,7 +372,15 @@ bool IdentifyGpu::gameUsesVkd3dProton() { return State::Instance().api == DX12 &
 void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3D12CreateDevice)
 {
     if (hasD3d12Capabilities)
+    {
+        // Still probing on another thread: a caller about to create its own device waits for it. A device created
+        // while the probe creates and releases its devices crashed at start-up now and then
+        if (probing)
+            std::scoped_lock wait(probeMutex);
         return;
+    }
+
+    std::scoped_lock probe(probeMutex);
 
     // Making sure the cache is filled
     getAllGpus();
@@ -387,8 +395,14 @@ void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3
         std::scoped_lock lock(mutex);
         if (hasD3d12Capabilities)
             return;
+        probing = true;
         hasD3d12Capabilities = true;
     }
+
+    struct Probing
+    {
+        ~Probing() { probing = false; }
+    } probingScope;
 
     struct D3d12Result
     {

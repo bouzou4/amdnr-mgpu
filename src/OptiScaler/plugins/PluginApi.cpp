@@ -9,6 +9,7 @@
 #include "proxies/D3D12_Proxy.h"
 #include "proxies/Dxgi_Proxy.h"
 #include "upscalers/IFeature.h"
+#include "misc/IdentifyGpu.h"
 
 #include <imgui/imgui_internal.h>
 
@@ -651,6 +652,9 @@ int32_t Api_CreateD3D12DeviceUnhooked(void* adapter, int32_t minimumFeatureLevel
     auto create = D3d12Proxy::D3D12CreateDevice_Hooked();
     if (create == nullptr || riid == nullptr || device == nullptr)
         return E_INVALIDARG;
+
+    // Not beside the GPU capability probe's devices (it runs on its own thread at start-up)
+    IdentifyGpu::updateD3d12Capabilities();
 
     // OptiScaler's D3D12CreateDevice hooks pass the call straight through
     _unhookedDeviceCreate = true;

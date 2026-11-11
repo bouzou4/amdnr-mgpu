@@ -86,6 +86,9 @@ class IdentifyGpu
 {
     inline static bool hasD3d12Capabilities = false;
     inline static std::mutex mutex {};
+    // Held while updateD3d12Capabilities creates and releases its devices (recursive: they come back through the hooks)
+    inline static std::recursive_mutex probeMutex {};
+    inline static std::atomic<bool> probing = false;
     inline static std::vector<GpuInformation> cache {};
 
     static std::vector<GpuInformation> checkGpuInfo();
