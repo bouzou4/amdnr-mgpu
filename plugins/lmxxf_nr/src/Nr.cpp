@@ -561,6 +561,8 @@ void NrEngine::GuardCheck(ID3D12GraphicsCommandList* list, ID3D12Resource* color
         }
         return;
     }
+    if (_guardTick++ % kGuardEvery != 0)
+        return;
     const uint32_t bw = (w + 31) / 32, bh = (h + 31) / 32;
     if (!_guardStat || _guardStat->GetDesc().Width != bw || _guardStat->GetDesc().Height != bh)
     {
