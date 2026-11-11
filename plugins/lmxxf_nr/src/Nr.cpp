@@ -512,6 +512,9 @@ bool NrEngine::CreateSession()
 
 // The runtime keeps the pass count of the last FULL_NETWORK frame process-wide (dlss5_mode::Request)
 static bool g_fullSent = false;
+// Its mode once a FULL frame was sent: 1 while pinned, then what the release read from DLSS5_MULTI_PASS (0 Small,
+// 2, 3). It follows the variable again only at the next release; -1: no FULL frame yet, it reads the variable
+static int g_runtimeMode = -1;
 
 bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* frame)
 {
@@ -529,9 +532,9 @@ bool NrEngine::PrepareJob(ID3D12GraphicsCommandList* list, const OptiUpscaleFram
     fi.flags = full ? LMXXF_NR_FRAME_FLAG_FULL_NETWORK_EXT : 0;
     // a FULL frame then one without it in the same session releases the pin
     if (full)
-        g_fullSent = _sessionFull = true;
+        g_fullSent = _sessionFull = true, g_runtimeMode = 1;
     else if (_sessionFull)
-        g_fullSent = _sessionFull = false;
+        g_fullSent = _sessionFull = false, g_runtimeMode = _settings.model == 1 ? 0 : _settings.Passes();
     fi.transfer_strength = 1.0f;
     fi.color_strength = 1.0f;
     fi.model_scale = 1.0f;
@@ -734,7 +737,8 @@ bool NrEngine::WarmUp()
 {
     const DWORD t0 = GetTickCount();
     // A pin from an earlier Full session is released only by a FULL frame followed by one without it
-    if (_rt.Native() && g_fullSent && !(_settings.model == 0 && _settings.Passes() == 1) && !_forceFull)
+    const bool stale = g_fullSent || (g_runtimeMode >= 0 && g_runtimeMode != (_settings.model == 1 ? 0 : _settings.Passes()));
+    if (_rt.Native() && stale && !(_settings.model == 0 && _settings.Passes() == 1) && !_forceFull)
     {
         _forceFull = true;
         const bool ok = WarmUp();
