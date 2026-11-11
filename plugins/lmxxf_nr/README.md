@@ -140,7 +140,13 @@ Without history the output changes more than its input from frame to frame (posi
 | Performance | overlap 2 (a frame queued) | 136.3 | 14.8 | 21.9 |
 | Quality | serial | 51.7 | 19.1 | 38.6 |
 | Quality | overlap 1 | 55.6 | 23.7 | 41.3 |
+| Balanced | serial | 79.9 | 12.5 | 25.2 |
+| Balanced | overlap 1 | 91.3 | 15.5 | 26.6 |
+| Balanced | overlap 2 | 91.5 | 21.9 | 32.9 |
 | Quality | overlap 2 | 55.4 | 35.9 | 53.8 |
+| Ultra | serial | 24.9 | 40.1 | 81.6 |
+| Ultra | overlap 1 | 25.4 | 45.8 | 85.8 |
+| Ultra | overlap 2 | 25.4 | 78.7 | 118.8 |
 
 The overlap cycle is the network's time plus about 0.4 ms. It only helps when the display card is the bound. Render queue stalls of 2.5 s and 3.5 s, live presenter switches, and the upscaler-start sequence (a HUD-less colour of a wrong pairing, gate frames, the right pairing, with 1.7 s stalls) pass on all three. Not measured in a game yet: the one game run lost the display device at the upscaler-start / HUD-less gate transition, where a serial presenter run had lost it five minutes earlier.
 
