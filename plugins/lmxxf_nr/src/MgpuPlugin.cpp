@@ -255,6 +255,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     g_keys.Lookup("MgpuFgVersion", &s.fgVersion);
     s.fgSyntheticScale = g_keys.Float("MgpuFgSyntheticScale", 1.0f);
     s.fgOwnQueue = g_keys.Bool("MgpuFgOwnQueue", true);
+    s.fgSwapOnDemand = g_keys.Bool("MgpuFgSwapOnDemand", false);
     s.fgPtMargin = g_keys.Float("MgpuFgPacingMarginMs", -1.0f);
     s.fgPtVariance = std::clamp(g_keys.Float("MgpuFgPacingVariance", 0.1f), 0.0f, 1.0f);
     s.fgPtHybridSpin = g_keys.Bool("MgpuFgPacingHybridSpin", false);

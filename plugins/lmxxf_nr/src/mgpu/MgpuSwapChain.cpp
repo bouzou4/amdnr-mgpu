@@ -187,7 +187,9 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
             _fq->SetName(L"Mgpu FG game queue");
         _ddev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_fqFence));
         ComPtr<IDXGISwapChain4> sc4;
-        if (_fq && _fqFence && SUCCEEDED(_fgen->CreateSwapChain(factory, _fq.Get(), hwnd, &d, fs, &sc4)) && sc4)
+        // on demand: a plain swapchain until FG comes on (the FFX one costs frame rate with FG off)
+        const bool later = CurrentSettings().fgSwapOnDemand && !CurrentSettings().fgStartOn;
+        if (!later && _fq && _fqFence && SUCCEEDED(_fgen->CreateSwapChain(factory, _fq.Get(), hwnd, &d, fs, &sc4)) && sc4)
             _real = sc4;
         else
         {
@@ -1035,8 +1037,14 @@ void ProxySwapChain::PresenterLoop()
             continue;
         // FFX's work of the previous Present reads the HUD-less colour, depth and vectors this frame overwrites
         Progress::SetPhase(Progress::FgQueueWait);
-        if (_fq && _fqValue && !WaitReuse(_fqFence.Get(), _fqValue, "FG queue", &_stop))
-            continue;
+        if (_fgen && _fq && _fqValue)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool done = WaitReuse(_fqFence.Get(), _fqValue, "FG queue", &_stop);
+            _fgQueueWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (!done)
+                continue;
+        }
 
         // Minimised or occluded (an exclusive fullscreen left by DXGI): nothing goes to the real back buffers until a
         // test present says the window shows again. A present on them then hung the display card (DEVICE_HUNG).
@@ -1379,12 +1387,14 @@ void ProxySwapChain::PresenterLoop()
             if (SUCCEEDED(hr))
                 Progress::Presented(g);
             const double presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+            if (_fgen)
+                _fgPresentMs += presentMs;
             if (presentMs > 250 || hr != _lastPresentHr)
                 Log(presentMs > 250 ? 1 : 0, std::format("real Present {:X} in {:.0f} ms (frame {})", (uint32_t) hr, presentMs, g));
             _lastPresentHr = hr;
             if (hr == DXGI_STATUS_OCCLUDED)
                 _occluded = true;
-            if (_fq)
+            if (_fgen && _fq)
                 _fq->Signal(_fqFence.Get(), ++_fqValue);
             if (hr == DXGI_ERROR_INVALID_CALL && (pf & DXGI_PRESENT_ALLOW_TEARING))
             {
@@ -1577,10 +1587,14 @@ bool ProxySwapChain::FgStep(UINT64 g, UINT s, UINT m, const SlotMeta& meta, bool
     }
     // FFX reads what the presenter's queue wrote: that work is done first, on the CPU (no queue waits on another)
     Progress::SetPhase(Progress::FgIdleWait);
+    const auto tIdle = std::chrono::steady_clock::now();
     _dq->Signal(_dFence.Get(), ++_dValue);
     if (!WaitReuse(_dFence.Get(), _dValue, "FG after the presenter", &_stop))
         return false;
+    const auto tFrame = std::chrono::steady_clock::now();
     _fgen->Frame(_ddev.Get(), _fq.Get(), _real.Get(), &fi, fgOn);
+    _fgIdleWaitMs += std::chrono::duration<double, std::milli>(tFrame - tIdle).count();
+    _fgFrameMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tFrame).count();
     if (_fgDumpAt && g >= _fgDumpAt)
     {
         _fgen->FlushDumps(_ddev.Get(), _dq.Get(), env.dumpDir);
@@ -1612,6 +1626,11 @@ bool ProxySwapChain::FgStep(UINT64 g, UINT s, UINT m, const SlotMeta& meta, bool
         busy = std::format("render {:.0f}% display {:.0f}% busy, game frame {:.2f} ms", st.renderBusy, st.displayBusy,
                            st.renderFrameMs);
     }
+    const double n = (double) (std::max<UINT64>)(1, _fgPresents);
+    Log(0, std::format("fg presenter ms per frame: wait for FFX's queue {:.2f}, wait for the presenter queue {:.2f}, "
+                       "prepare + configure {:.2f}, Present call {:.2f}",
+                       _fgQueueWaitMs / n, _fgIdleWaitMs / n, _fgFrameMs / n, _fgPresentMs / n));
+    _fgQueueWaitMs = _fgIdleWaitMs = _fgFrameMs = _fgPresentMs = 0;
     Log(0, std::format("fg: {:.1f} s{}, presenter {} ({:.1f}/s), callbacks real {} generated {}; DXGI presents real {} "
                        "generated {} unknown {} ({:.1f}/s), {}; {}; {}; fg {} nr live {}",
                        secs, switched ? " (to a live switch)" : "", _fgPresents, _fgPresents / secs, t.real,
@@ -1627,10 +1646,110 @@ bool ProxySwapChain::FgStep(UINT64 g, UINT s, UINT m, const SlotMeta& meta, bool
     return true;
 }
 
+// MgpuFgSwapOnDemand: the real swapchain becomes the FFX frame generation one when FG comes on and a plain one when it
+// goes off. On the game's thread, between two of its frames; frames sent and not presented are dropped.
+HRESULT ProxySwapChain::SwapReal(bool fg)
+{
+    Log(0, fg ? "display FG on: the real swapchain becomes the FFX frame generation one"
+              : "display FG off: the real swapchain becomes a plain one");
+    const auto t0 = std::chrono::steady_clock::now();
+    StopPresenter();
+    DrainRender();
+    {
+        std::lock_guard g(_m);
+        const UINT64 dropped = _scheduled - _consumed;
+        _consumed = _scheduled;
+        if (dropped && _waitable)
+            ReleaseSemaphore(_waitable, (LONG) (std::min<UINT64>)(dropped, 8), nullptr);
+    }
+    ReleaseBuffers(true);
+    if (_fgen)
+        _fgen->ReleaseContext();
+    {
+        // releasing a swapchain in exclusive fullscreen raises an exception in DXGI
+        std::lock_guard g(_scMutex);
+        BOOL fs = FALSE;
+        if (SUCCEEDED(_real->GetFullscreenState(&fs, nullptr)) && fs)
+        {
+            _real->SetFullscreenState(FALSE, nullptr);
+            _fsCached = FALSE;
+        }
+        _real.Reset();
+    }
+    if (_fgen)
+    {
+        _fgen->Destroy();
+        delete _fgen;
+        _fgen = nullptr;
+    }
+    DXGI_SWAP_CHAIN_DESC1 d = _gameDesc;
+    d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    d.BufferCount = _realCount;
+    d.Flags = RealFlags(_gameDesc.Flags, _tearing);
+    d.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 4 && FAILED(hr); ++attempt)
+    {
+        if (attempt)
+            Sleep(100); // the removed swapchain may still be leaving the window
+        // the last attempt is always a plain swapchain
+        if (fg && attempt < 3 && _fq && _fqFence)
+        {
+            _fgen = new DisplayFg();
+            ComPtr<IDXGISwapChain4> sc4;
+            hr = _fgen->CreateSwapChain(_factory.Get(), _fq.Get(), _hwnd, &d, _hasFs ? &_fsDesc : nullptr, &sc4);
+            if (SUCCEEDED(hr) && sc4)
+                _real = sc4;
+            else
+            {
+                hr = FAILED(hr) ? hr : E_FAIL;
+                delete _fgen;
+                _fgen = nullptr;
+            }
+        }
+        else
+        {
+            ComPtr<IDXGISwapChain1> sc1;
+            hr = _original(_factory.Get(), _dq.Get(), _hwnd, &d, _hasFs ? &_fsDesc : nullptr, nullptr, &sc1);
+            if (SUCCEEDED(hr))
+                hr = sc1.As(&_real);
+        }
+    }
+    if (FAILED(hr))
+    {
+        _broken = true;
+        Log(2, std::format("real swapchain could not be made again {:X}", (uint32_t) hr));
+        return hr;
+    }
+    if (_csSet)
+        _real->SetColorSpace1(_cs);
+    if (!_hdrData.empty())
+        _real->SetHDRMetaData(_hdrType, (UINT) _hdrData.size(), _hdrData.data());
+    {
+        std::lock_guard g(_capM);
+        _wantMv = CurrentSettings().temporal || _fgen != nullptr;
+    }
+    _wantDp = _fgen != nullptr;
+    hr = CreateBuffers(true);
+    _nrReset = true;
+    StartPresenter();
+    Log(FAILED(hr) ? 2 : 0, std::format("real swapchain swapped in {:.0f} ms ({:X}), frame generation swapchain {}",
+                                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                                        (uint32_t) hr, _fgen != nullptr));
+    return hr;
+}
+
 HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
 {
     if (flags & DXGI_PRESENT_TEST)
         return _occluded && !_lost ? DXGI_STATUS_OCCLUDED : S_OK;
+    if (!_lost && !_broken && _fq && CurrentSettings().fgSwapOnDemand && _scheduled % 30 == 0)
+    {
+        PollLive(CurrentEnv().dumpDir);
+        const bool want = (LiveFg() >= 0 ? LiveFg() != 0 : CurrentSettings().fgStartOn) && !GameFg();
+        if (want != (_fgen != nullptr))
+            SwapReal(want);
+    }
     LARGE_INTEGER tEntry;
     QueryPerformanceCounter(&tEntry);
     const auto& env = CurrentEnv();
@@ -2277,6 +2396,8 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::SetColorSpace1(DXGI_COLOR_SPACE_TYPE c
     {
         std::lock_guard g(_scMutex);
         hr = _real->SetColorSpace1(c);
+        if (SUCCEEDED(hr))
+            _csSet = true, _cs = c;
     }
     if ((UINT) c != _loggedCs)
     {
@@ -2298,6 +2419,8 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::SetHDRMetaData(DXGI_HDR_METADATA_TYPE 
     {
         std::lock_guard g(_scMutex);
         hr = _real->SetHDRMetaData(t, s, m);
+        if (SUCCEEDED(hr) && m && s)
+            _hdrType = t, _hdrData.assign((const uint8_t*) m, (const uint8_t*) m + s);
     }
     static bool logged = false;
     if (!logged)

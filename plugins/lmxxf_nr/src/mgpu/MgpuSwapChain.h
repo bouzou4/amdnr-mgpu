@@ -91,6 +91,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     HRESULT CreateFallbackLists();
     HRESULT CreateIngestLists();
     HRESULT RenewReal();
+    HRESULT SwapReal(bool fg);
     HRESULT EnterFallback();
     HRESULT PresentFallback(UINT sync, UINT flags);
     void LogOutput();
@@ -220,6 +221,13 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT64 _fqValue = 0;
     std::chrono::steady_clock::time_point _prevSched {}, _fgLog {};
     UINT64 _fgDumpAt = 0, _fgPresents = 0;
+    // what the game set on the swapchain, for a real swapchain made later (SwapReal)
+    bool _csSet = false;
+    DXGI_COLOR_SPACE_TYPE _cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    DXGI_HDR_METADATA_TYPE _hdrType = DXGI_HDR_METADATA_TYPE_NONE;
+    std::vector<uint8_t> _hdrData;
+    // presenter time per frame spent on the FG swapchain, summed over a log window (ms)
+    double _fgQueueWaitMs = 0, _fgIdleWaitMs = 0, _fgFrameMs = 0, _fgPresentMs = 0;
     bool FgStep(UINT64 g, UINT s, UINT m, const SlotMeta& meta, bool haveMv, bool haveDp, bool haveHud, bool useHud, bool nrWrote,
                 bool sizeHold, bool dump, std::chrono::steady_clock::time_point tSched);
     bool _loggedHudFmt = false, _loggedMvFmt = false;

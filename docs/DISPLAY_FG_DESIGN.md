@@ -26,6 +26,8 @@ One row: `Frame generation (display card)`: off / on. It only shows when multi-G
 
 `MgpuFgVersion` picks the FG provider by version prefix (`3` = FSR 3.1 frame generation of OptiScaler's FidelityFX module, default = the newest, which is the driver's FSR 4 ML frame generation on RDNA 4).
 
+`MgpuFgSwapOnDemand` (default false) makes the real swapchain the FFX one only while FG is on, and a plain one otherwise, swapped on the game's thread between two frames (frames in flight are dropped, colour space and HDR metadata are set again). It removes the FFX swapchain's cost with FG off (about 1.1 ms per frame when the display card is the bound) for a 0.2-0.6 s hitch at each FG toggle.
+
 Everything else stays an ini key for diagnostics, not a menu row: `MgpuFgHudless`, `MgpuFgAsync`, `MgpuFgOwnQueue`, `MgpuFgPacing*`, `MgpuFgCamera*`, `MgpuFgVerticalFov`, `MgpuFgSynthetic*`, `MgpuFgDebug`.
 
 Camera near/far/FOV: FFX uses them only for its depth-based disocclusion heuristics. Defaults (0.1 / 100000 / 60°) are acceptable. A per-game value can come from the upscaler's camera fields when the game passes them (OptiScaler has them for FSR/XeSS inputs), so no user knob is needed.
@@ -47,7 +49,10 @@ Harness (3840x2160, Performance preset, synthetic depth and vectors, no render l
 
 | Test | Result |
 |---|---|
-| FG on, provider 4.0.2 | 92-94 real frames/s, 184-187 displayed/s; FG off through the same swapchain 63-76 fps; the plain swapchain without FG 114 fps |
+| FG on, provider 4.0.2 | 92-94 real frames/s, 184-187 displayed/s |
+| Cost of the FFX swapchain, one batch, display-card bound | plain swapchain 10.50 ms per frame (95.2 fps); FFX swapchain with FG off 11.63 ms (86.0); with FG on 11.69 ms (85.5 real). The 1.1-1.2 ms is the presenter's CPU wait for its own queue before FFX's Present (1.35-1.46 ms; FFX copies the back buffer on its own queue, so that work has to be done first) and the Present call (0.24 ms); FG on adds prepare + configure (0.4-0.8 ms) and the wait for FFX's queue (0.2-0.3 ms). The network time is the same in all three. Flip metering off (`[FSRFG] DisableFlipMetering`) changes nothing |
+| `MgpuFgSwapOnDemand=true` | the real swapchain is the FFX one only while FG is on: with FG off the frame time is the plain swapchain's (10.45-10.52 ms). Swapping takes 604 ms the first time (FFX swapchain and context), then 166-185 ms; three live swaps in one run, clean |
+| Upscaler start with a HUD-less colour of a wrong pairing, gate frames, the right pairing, upscaler stop and start, with 1.7 s render stalls (`mgpu_harness --upscaler --hudless --upscaler-late --script`), FG on, 4.0.2 and 3.1.6 | clean; the FG context is rebuilt when the render size appears |
 | Display pacing, FG on (PresentMon, 50 s) | each presented frame on screen 5.42 ms (p05 4.90, p95 5.95), none dropped, Independent Flip. The Present calls come in pairs 0.2 ms apart: the driver's flip metering spaces the flips, so call times say nothing about pacing |
 | Generated frame vs its neighbours (`fg_compare.py`), 4.0.2 | 31.5 dB against the neighbours' mean, 27.2 / 29.1 against each neighbour (the neighbours 24.6 apart): an interpolation |
 | Same, provider 3.1.6 | 33.8 dB against the mean, 28.8 / 28.9 against each neighbour |
