@@ -1609,6 +1609,12 @@ bool ProxySwapChain::FgStep(UINT64 g, UINT s, UINT m, const SlotMeta& meta, bool
             fi.hudless = _hudD.Get();
         }
     }
+    if (fgOn && (!fi.depth || !fi.motion) && !_fgNoInputLogged)
+    {
+        _fgNoInputLogged = true;
+        Log(1, std::format("display FG: the game gives no {}: real frames only (MgpuFgSynthetic=true: far depth, zero motion)",
+                           !fi.depth && !fi.motion ? "depth or motion vectors" : !fi.depth ? "depth" : "motion vectors"));
+    }
     fi.tGame = tSched;
     fi.frameMs = _prevSched.time_since_epoch().count()
                      ? std::chrono::duration<double, std::milli>(tSched - _prevSched).count()

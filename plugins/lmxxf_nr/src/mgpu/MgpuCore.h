@@ -38,7 +38,7 @@ struct Settings
     std::string fgVersion; // FG provider by version name prefix ("3.1"), empty: the host's default (the newest)
     float fgSyntheticScale = 1.0f; // synthetic depth / motion size relative to the frame
     bool fgOwnQueue = true; // FFX on its own queue (_fq); false: on the presenter's queue (_dq)
-    bool fgSwapOnDemand = false; // the real swapchain is the FFX one only while FG is on (swapped live)
+    bool fgSwapOnDemand = true;  // the real swapchain is the FFX one only while FG is on (swapped live)
     // FFX swapchain pacing tuning; fgPtMargin < 0: FFX defaults
     float fgPtMargin = -1.0f, fgPtVariance = 0.1f;
     bool fgPtHybridSpin = false, fgPtFenceWait = false;

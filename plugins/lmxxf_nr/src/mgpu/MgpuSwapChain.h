@@ -222,6 +222,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     UINT64 _fqValue = 0;
     std::chrono::steady_clock::time_point _prevSched {}, _fgLog {};
     UINT64 _fgDumpAt = 0, _fgPresents = 0;
+    bool _fgNoInputLogged = false;
     // what the game set on the swapchain, for a real swapchain made later (SwapReal)
     bool _csSet = false, _fgSwapFailed = false;
     UINT64 _fgSwapAfter = 0; // no swap before this frame

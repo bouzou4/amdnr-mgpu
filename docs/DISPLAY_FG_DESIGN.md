@@ -26,7 +26,7 @@ One row: `Frame generation (display card)`: off / on. It only shows when multi-G
 
 `MgpuFgVersion` picks the FG provider by version prefix (`3` = FSR 3.1 frame generation of OptiScaler's FidelityFX module, default = the newest, which is the driver's FSR 4 ML frame generation on RDNA 4).
 
-`MgpuFgSwapOnDemand` (default false) makes the real swapchain the FFX one only while FG is on, and a plain one otherwise, swapped on the game's thread between two frames (frames in flight are dropped, colour space and HDR metadata are set again). It removes the FFX swapchain's cost with FG off (1.1-3.1 ms per frame when the display card is the bound) for a 0.2-0.6 s hitch at each FG toggle.
+`MgpuFgSwapOnDemand` (default true) makes the real swapchain the FFX one only while FG is on, and a plain one otherwise, swapped on the game's thread between two frames (frames in flight are dropped, colour space and HDR metadata are set again). It removes the FFX swapchain's cost with FG off (1.1-3.1 ms per frame when the display card is the bound) for a 0.2-0.6 s hitch at each FG toggle.
 
 Everything else stays an ini key for diagnostics, not a menu row: `MgpuFgHudless`, `MgpuFgAsync`, `MgpuFgOwnQueue`, `MgpuFgPacing*`, `MgpuFgCamera*`, `MgpuFgVerticalFov`, `MgpuFgSynthetic*`, `MgpuFgDebug`.
 
