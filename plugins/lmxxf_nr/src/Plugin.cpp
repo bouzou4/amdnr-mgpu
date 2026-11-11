@@ -566,6 +566,8 @@ void DrawTab(void*)
         Text("Cadence: %s; %llu frames with the reprojected edit, %llu waited for an answer",
              g_ui.cadence == 0 ? "async" : g_ui.cadence == 2 ? "network every 2nd frame" : "network every 3rd frame",
              (unsigned long long) st.framesHeld, (unsigned long long) st.cadenceWaits);
+    if (!st.cadenceHeld.empty())
+        g_api->TextColored(1.0f, 0.6f, 0.3f, 1.0f, ("Cadence held back: " + st.cadenceHeld).c_str());
     if (!st.status.empty())
         g_api->TextDisabled(st.status.c_str());
     if (!g_needsApi)

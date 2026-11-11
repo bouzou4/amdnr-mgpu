@@ -84,6 +84,7 @@ struct NrStats
     uint64_t framesSkipped = 0;
     uint64_t framesHeld = 0;   // cadence: frames shown with the reprojected edit, no new answer
     uint64_t cadenceWaits = 0; // cadence N: frames that had to wait for an answer older than N frames
+    std::string cadenceHeld;   // why the cadence is held back (the network on every frame meanwhile), empty: it is not
     uint32_t frameInfoSize = 0;
     bool temporal = false; // the runtime gets motion vectors and keeps a history
     uint32_t encoding = 1; // of the last source: 0 linear, 1 sRGB, 2 PQ, 3 scRGB, 4 scene HDR
@@ -264,6 +265,7 @@ class NrEngine
     bool EnsureHudCopies(const D3D12_RESOURCE_DESC& d);
     ComPtr<ID3D12Resource> _dumpTex[6];
     bool _dumpArmed = false;
+    bool _dumpWanted = false; // trigger seen, waiting for a frame with an answer
     uint64_t _dumpGameValue = 0, _dumpOwnValue = 0;
     uint32_t _dumpCount = 0;
   public:
@@ -321,6 +323,22 @@ class NrEngine
     bool _cadStale = false;  // the job in flight was fed before a break: its answer is dropped
     uint32_t _sinceFeed = 0; // frames since the last feed
     uint64_t _cadFrames = 0;
+    uint64_t _cadLastList = 0; // own list of the last cadence frame: a gap restarts the accumulated motion
+
+    // Cadence guard: every 8th pixel against last frame's guide in the history (HistoryCheck), read back a few frames
+    // later. Vectors that do not explain the frame, or a lot of content changing in place, hold the cadence back
+    // (the every-frame path runs) until kGuardRelease clean readings in a row
+    static constexpr uint32_t kGuardSlots = 4, kGuardRelease = 30;
+    ComPtr<ID3D12PipelineState> _psoCheck;
+    ComPtr<ID3D12Resource> _guardStat, _guardReadback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT _guardFp {};
+    uint64_t _guardBytes = 0;
+    uint64_t _guardValue[kGuardSlots] = {};
+    uint32_t _guardNext = 0, _guardGood = 0;
+    bool _guardHold = false;
+    void GuardCheck(ID3D12GraphicsCommandList* list, ID3D12Resource* color, DXGI_FORMAT colorFmt, uint32_t w, uint32_t h,
+                    uint32_t encoding, ID3D12Resource* mv, uint32_t mvW, uint32_t mvH, float mvScaleX, float mvScaleY);
+    void GuardRead();
 
     ComPtr<ID3D12Resource> _feed;     // network input, RGBA16F
     ComPtr<ID3D12Resource> _srcCopy;  // after upscaling: copy of the output

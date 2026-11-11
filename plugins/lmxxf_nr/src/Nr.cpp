@@ -193,6 +193,9 @@ void NrEngine::Configure(const NrSettings& s)
         _cadReset = true;
         _accChain = false;
         _sinceFeed = 1000;
+        _guardHold = false;
+        _guardGood = 0;
+        _stats.cadenceHeld.clear();
     }
     if (s.testFailFeed && !_settings.testFailFeed)
         _failNextFeed = true;
@@ -411,6 +414,16 @@ bool NrEngine::CreatePipelines()
     if (!_psoAcc)
         Log(OptiLog_Warn, "cadence motion shader failed (the edit is held unmoved): %s",
             err ? (const char*) err->GetBufferPointer() : "?");
+    ComPtr<ID3DBlob> check;
+    if (SUCCEEDED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "HistoryCheck", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &check, &err)))
+    {
+        pd.CS = { check->GetBufferPointer(), check->GetBufferSize() };
+        _device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&_psoCheck));
+    }
+    if (!_psoCheck)
+        Log(OptiLog_Warn, "cadence guard shader failed (no check of the vectors): %s",
+            err ? (const char*) err->GetBufferPointer() : "?");
     ComPtr<ID3DBlob> meter;
     if (SUCCEEDED(compile(kMeterSource, sizeof(kMeterSource) - 1, "lmxxf_nr_meter", nullptr, nullptr, "Meter", "cs_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &meter, &err)))
@@ -532,6 +545,128 @@ void NrEngine::StabFinish(ID3D12GraphicsCommandList* list, const StabBind& b)
     _stabValid = true;
 }
 
+// Records the guard's check of this frame against the history as it stands (last frame's) and its readback
+void NrEngine::GuardCheck(ID3D12GraphicsCommandList* list, ID3D12Resource* color, DXGI_FORMAT colorFmt, uint32_t w,
+                          uint32_t h, uint32_t encoding, ID3D12Resource* mv, uint32_t mvW, uint32_t mvH, float mvScaleX,
+                          float mvScaleY)
+{
+    if (!_psoCheck || !_stabValid || !_stab[_stabCur] || !_presentFence)
+    {
+        // nothing to check against: a hold ends after twice the usual wait
+        if (_guardHold && ++_guardGood >= 2 * kGuardRelease)
+        {
+            _guardHold = false;
+            _stats.cadenceHeld.clear();
+            Log(OptiLog_Info, "cadence (%ls): resumed (no history to check against)", name.c_str());
+        }
+        return;
+    }
+    const uint32_t bw = (w + 31) / 32, bh = (h + 31) / 32;
+    if (!_guardStat || _guardStat->GetDesc().Width != bw || _guardStat->GetDesc().Height != bh)
+    {
+        Retire(_guardStat);
+        Retire(_guardReadback);
+        _guardStat = Texture(_device.Get(), bw, bh, DXGI_FORMAT_R32G32B32A32_FLOAT, true, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (!_guardStat)
+            return;
+        const auto sd = _guardStat->GetDesc();
+        _device->GetCopyableFootprints(&sd, 0, 1, 0, &_guardFp, nullptr, nullptr, &_guardBytes);
+        D3D12_HEAP_PROPERTIES rp { D3D12_HEAP_TYPE_READBACK };
+        D3D12_RESOURCE_DESC b {};
+        b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        b.Width = _guardBytes * kGuardSlots;
+        b.Height = b.DepthOrArraySize = b.MipLevels = 1;
+        b.SampleDesc.Count = 1;
+        b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        _device->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                         IID_PPV_ARGS(&_guardReadback));
+        for (auto& v : _guardValue)
+            v = 0;
+    }
+    const uint32_t slot = _guardNext % kGuardSlots;
+    if (!_guardReadback || _guardValue[slot] != 0)
+        return;
+    ShaderConstants c {};
+    c.sizeX = w;
+    c.sizeY = h;
+    c.encoding = encoding;
+    c.paperWhite = _settings.paperWhite / 80.0f;
+    StabBind sb;
+    sb.hist = _stab[_stabCur].Get();
+    if (mv != nullptr && mvW > 0 && mvH > 0)
+    {
+        const auto md = mv->GetDesc();
+        c.mvUvScaleX = float(mvW) / float(md.Width);
+        c.mvUvScaleY = float(mvH) / float(md.Height);
+        c.mvToUvX = mvScaleX / float(mvW);
+        c.mvToUvY = mvScaleY / float(mvH);
+        c.histMode = 4;
+        sb.motion = mv;
+        sb.motionFmt = md.Format;
+    }
+    Barrier(list, _guardStat.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* srv[4] = { color, nullptr, nullptr, nullptr };
+    const DXGI_FORMAT fmt[4] = { colorFmt, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN };
+    Dispatch(list, _psoCheck.Get(), c, srv, fmt, _guardStat.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, bw, bh, nullptr, &sb);
+    Barrier(list, _guardStat.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION from { _guardStat.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    D3D12_TEXTURE_COPY_LOCATION to { _guardReadback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    to.PlacedFootprint = _guardFp;
+    to.PlacedFootprint.Offset = _guardBytes * slot;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    _guardValue[slot] = _presentCounter; // this own list's fence value
+    _guardNext++;
+}
+
+// Thresholds on recorded sequences: right vectors miss 0-8 % at the moved position and 0.02-0.4 of the in-place
+// misses, wrong-sign ones 1.2 of them; an animated menu changes 27-31 % of the frame in place, gameplay under 7 %
+void NrEngine::GuardRead()
+{
+    if (!_guardReadback || !_presentFence)
+        return;
+    const uint64_t done = _presentFence->GetCompletedValue();
+    for (uint32_t i = 0; i < kGuardSlots; i++)
+    {
+        if (_guardValue[i] == 0 || _guardValue[i] > done)
+            continue;
+        _guardValue[i] = 0;
+        const uint8_t* p = nullptr;
+        D3D12_RANGE r { SIZE_T(_guardBytes * i), SIZE_T(_guardBytes * (i + 1)) };
+        if (FAILED(_guardReadback->Map(0, &r, (void**) &p)))
+            continue;
+        double n[4] = {};
+        for (uint32_t y = 0; y < _guardFp.Footprint.Height; y++)
+        {
+            const float* row = (const float*) (p + _guardBytes * i + _guardFp.Offset + size_t(y) * _guardFp.Footprint.RowPitch);
+            for (uint32_t x = 0; x < _guardFp.Footprint.Width * 4; x++)
+                n[x & 3] += row[x];
+        }
+        D3D12_RANGE none { 0, 0 };
+        _guardReadback->Unmap(0, &none);
+        const double total = 16.0 * _guardFp.Footprint.Width * _guardFp.Footprint.Height;
+        const bool vectors = n[0] >= 0.02 * total && n[1] >= 0.01 * n[0] && n[1] >= 0.75 * n[2];
+        const bool changing = n[3] >= 0.15 * total;
+        if (vectors || changing)
+        {
+            const char* why = vectors ? "the motion vectors do not explain the frames" : "much of the frame changes in place";
+            if (!_guardHold)
+                Log(OptiLog_Info, "cadence (%ls): held back, %s (moving %.0f %%, guide misses moved %.1f %% / in place "
+                                  "%.1f %% of them, changed in place %.1f %%): the network on every frame",
+                    name.c_str(), why, 100 * n[0] / total, n[0] ? 100 * n[1] / n[0] : 0.0, n[0] ? 100 * n[2] / n[0] : 0.0,
+                    100 * n[3] / total);
+            _guardHold = true;
+            _guardGood = 0;
+            _stats.cadenceHeld = why;
+        }
+        else if (_guardHold && ++_guardGood >= kGuardRelease)
+        {
+            _guardHold = false;
+            _stats.cadenceHeld.clear();
+            Log(OptiLog_Info, "cadence (%ls): resumed after %u clean checks", name.c_str(), kGuardRelease);
+        }
+    }
+}
+
 // NrCadence != 1, first half: this frame's place in the accumulated motion, the answer that is in (or due), and the
 // edit onto in.color: that answer read where each pixel was when it was fed, or the stabiliser's history reprojected
 bool NrEngine::CadenceApply(ID3D12GraphicsCommandList* list, const CadIn& in, uint64_t* wait, ID3D12Resource** enhOut)
@@ -541,6 +676,16 @@ bool NrEngine::CadenceApply(ID3D12GraphicsCommandList* list, const CadIn& in, ui
     _cadFrames++;
     bool reset = in.reset;
     const bool mv = in.mv != nullptr && in.mvW > 0 && in.mvH > 0 && _psoAcc;
+    // back from the every-frame path (the guard, a settings change): its job in flight was fed one frame ago
+    if (_cadLastList + 1 != _presentCounter)
+    {
+        _accChain = false;
+        _cadReset = true;
+        _sinceFeed = 1000;
+    }
+    _cadLastList = _presentCounter;
+    GuardCheck(list, in.color, in.colorFmt, in.w, in.h, in.encoding, mv ? in.mv : nullptr, in.mvW, in.mvH, in.mvScaleX,
+               in.mvScaleY);
     if (mv && (!_acc[0] || _acc[0]->GetDesc().Width != in.mvW || _acc[0]->GetDesc().Height != in.mvH))
     {
         ComPtr<ID3D12Resource>* ts[] = { std::addressof(_acc[0]), std::addressof(_acc[1]), std::addressof(_accFed) };
@@ -1129,6 +1274,7 @@ void NrEngine::ReadTimings()
     FinishDump();
     SeqPoll();
     MeterRead();
+    GuardRead();
     if (_readback && _tsFreq > 0)
     {
         const uint64_t done = _hipFence->GetCompletedValue();
@@ -1831,7 +1977,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
     uint64_t wait = 0;
     ID3D12Resource* enh = nullptr;
     // not with the game's FG input edited in place: that path keeps the network on every frame
-    if (_settings.Cadenced() && hudTarget == nullptr)
+    if (_settings.Cadenced() && !_guardHold && hudTarget == nullptr)
     {
         if (!whole)
         {
@@ -1910,6 +2056,9 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
             c.mvToUvY = _mvCap.scaleY / float(_mvCap.h);
         }
         StabBind sb;
+        if (_settings.Cadenced() && hudTarget == nullptr) // held back: checked until it can resume
+            GuardCheck(list, _termCopy.Get(), bd.Format, w, h, encoding, mv ? _mvCopy.Get() : nullptr, _mvCap.w, _mvCap.h,
+                       _mvCap.scaleX, _mvCap.scaleY);
         const bool stab = StabPrepare(list, w, h, mv && _mvCap.reset, c, mv ? _mvCopy.Get() : nullptr, sb);
         Dispatch(list, _psoTerminal.Get(), c, srv, fmt, _termOut.Get(), bd.Format, w, h, nullptr, stab ? &sb : nullptr);
         if (stab)
@@ -2213,6 +2362,9 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
         const bool stab = StabPrepare(list, w, h, in.reset, c, mv ? in.motion : nullptr, sb);
         if (mv)
             Barrier(list, in.motion, in.motionState, kRead);
+        if (_settings.Cadenced()) // held back: checked until it can resume
+            GuardCheck(list, _termCopy.Get(), sd.Format, w, h, in.encoding, mv ? in.motion : nullptr, in.motionW,
+                       in.motionH, in.mvScaleX, in.mvScaleY);
         Dispatch(list, _psoApply.Get(), c, srv, fmt, _termOut.Get(), sd.Format, w, h, nullptr, stab ? &sb : nullptr);
         if (stab)
             StabFinish(list, sb);
@@ -2243,7 +2395,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     bool wrote = false;
     uint64_t wait = 0;
     ID3D12Resource* enh = nullptr;
-    if (_settings.Cadenced())
+    if (_settings.Cadenced() && !_guardHold)
     {
         auto* list = NextOwnList(&slot);
         if (list == nullptr)
@@ -2341,12 +2493,22 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
                          D3D12_RESOURCE_STATES resultState, ID3D12Resource* source, ID3D12Resource* hudless,
                          ID3D12Resource* hudResult, D3D12_RESOURCE_STATES hudResultState)
 {
-    if (_dumpArmed || dumpDir.empty() || enh == nullptr || (_dumpCount++ % 30) != 0)
+    if (_dumpArmed || dumpDir.empty())
         return;
-    const std::wstring trigger = dumpDir + L"\\lmxxf_nr_dump.trigger";
-    if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
+    // polled every 30 calls (presents with an edit), taken on the next one that has an answer
+    if (!_dumpWanted)
+    {
+        if ((_dumpCount++ % 30) != 0)
+            return;
+        const std::wstring trigger = dumpDir + L"\\lmxxf_nr_dump.trigger";
+        if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return;
+        DeleteFileW(trigger.c_str());
+        _dumpWanted = true;
+    }
+    if (enh == nullptr)
         return;
-    DeleteFileW(trigger.c_str());
+    _dumpWanted = false;
 
     ID3D12Resource* src[6] = { enh, _feed.Get(), result, source, hudless, hudResult };
     const D3D12_RESOURCE_STATES st[6] = { kRead, kRead, resultState, kRead, kRead, hudResultState };

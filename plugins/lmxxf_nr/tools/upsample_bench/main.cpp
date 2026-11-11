@@ -5,6 +5,7 @@
 //       --stab: the edit stabiliser on, history across frames, optional mv_NN.f32 (4K px toward the previous frame).
 //       --cadence P,D (with --stab): NrCadence as the plugin runs it. The pair of every P-th frame, applied D frames
 //       later (1 <= D <= P) at the accumulated motion; the other frames hold the reprojected history. Writes cd_NN.f32.
+//       Prints the cadence guard's sums per frame (HistoryCheck: moving, missed moved, missed in place, changed in place).
 //       Runs the plugin shader <entry> (ApplyTerminal, HUD-less = Src) and writes up_NN.f32; prints the GPU ms.
 //   upsample_bench fsr <dir> <ffx dir> [--bus N] [--version S] [--frames N] [--sharp X] [--reps N]
 //       dir: col_NN.f32 (render size, linear), mv_NN.f32 (render px toward the previous frame, no jitter),
@@ -224,8 +225,8 @@ struct Gpu
         Barrier(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Submit();
     }
-    // RGBA32F texture in `state` -> WxHx3 floats
-    std::vector<float> Download(ID3D12Resource* t, D3D12_RESOURCE_STATES state)
+    // RGBA32F texture in `state` -> WxHx3 floats (ch 4: all four channels)
+    std::vector<float> Download(ID3D12Resource* t, D3D12_RESOURCE_STATES state, int ch = 3)
     {
         auto d = t->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
@@ -238,15 +239,15 @@ struct Gpu
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         Barrier(t, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
         Submit();
-        std::vector<float> v(UINT64(d.Width) * d.Height * 3);
+        std::vector<float> v(UINT64(d.Width) * d.Height * ch);
         uint8_t* p;
         CK(rb->Map(0, nullptr, (void**) &p));
         for (UINT y = 0; y < d.Height; y++)
         {
             const float* row = (const float*) (p + fp.Offset + UINT64(y) * fp.Footprint.RowPitch);
             for (UINT x = 0; x < UINT(d.Width); x++)
-                for (int k = 0; k < 3; k++)
-                    v[(UINT64(y) * d.Width + x) * 3 + k] = row[x * 4 + k];
+                for (int k = 0; k < ch; k++)
+                    v[(UINT64(y) * d.Width + x) * ch + k] = row[x * 4 + k];
         }
         rb->Unmap(0, nullptr);
         return v;
@@ -311,9 +312,15 @@ static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps,
     ComPtr<ID3D12PipelineState> pso;
     CK(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)));
 
-    ComPtr<ID3D12PipelineState> psoAcc;
+    ComPtr<ID3D12PipelineState> psoAcc, psoCheck;
     if (period)
     {
+        ComPtr<ID3DBlob> cb;
+        if (FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "HistoryCheck", "cs_5_0",
+                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cb, &err)))
+            Die(err ? (const char*) err->GetBufferPointer() : "compile");
+        pd.CS = { cb->GetBufferPointer(), cb->GetBufferSize() };
+        CK(g.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&psoCheck)));
         ComPtr<ID3DBlob> ab;
         if (FAILED(compile(kShaderSource, sizeof(kShaderSource) - 1, "lmxxf_nr", nullptr, nullptr, "Accumulate", "cs_5_0",
                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ab, &err)))
@@ -329,6 +336,8 @@ static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps,
     ComPtr<ID3D12Resource> hist[2] = { g.Tex(W, H, F16, true), g.Tex(W, H, F16, true) };
     ComPtr<ID3D12Resource> acc[2] = { g.Tex(W, H, A16, true), g.Tex(W, H, A16, true) };
     auto mvt = g.Tex(W, H, DXGI_FORMAT_R32G32_FLOAT, false);
+    const UINT bw = (W + 31) / 32, bh = (H + 31) / 32;
+    auto stat = g.Tex(bw, bh, F, true);
     // descriptor sets of 10 (t0-t7, u0-u1): 0 the apply, 1 the accumulated motion; rewritten per frame
     ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 20, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
@@ -430,6 +439,43 @@ static int RunApply(Gpu& g, const std::string& dir, const char* entry, int reps,
             msAcc.push_back(g.Ms());
             acur ^= 1;
             accValid = true;
+        }
+        if (period && histValid)
+        {
+            // the guard's check of this frame against the history as it stands
+            ShaderConstants k = c;
+            k.cadence = 0;
+            k.histMode = haveMv ? 4u : 0u;
+            ID3D12Resource* srvs[8] = { src.Get(), nullptr, nullptr, nullptr, nullptr, hist[cur].Get(), mvt.Get(), nullptr };
+            const DXGI_FORMAT sf[8] = { F, F, F, F, F, F16, DXGI_FORMAT_R32G32_FLOAT, A16 };
+            bind(1, srvs, sf, stat.Get(), F, nullptr);
+            g.Barrier(stat.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g.Barrier(hist[cur].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            ID3D12DescriptorHeap* hs[] = { heap.Get() };
+            g.list->SetDescriptorHeaps(1, hs);
+            g.list->SetComputeRootSignature(rs.Get());
+            g.list->SetPipelineState(psoCheck.Get());
+            g.list->SetComputeRoot32BitConstants(0, sizeof k / 4, &k, 0);
+            auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += UINT64(10) * st;
+            g.list->SetComputeRootDescriptorTable(1, gpu);
+            g.list->SetComputeRootDescriptorTable(2, { gpu.ptr + UINT64(8) * st });
+            g.Stamp(0);
+            g.list->Dispatch((bw + 7) / 8, (bh + 7) / 8, 1);
+            g.Stamp(1);
+            g.Resolve();
+            g.Barrier(hist[cur].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g.Submit();
+            const double ms1 = g.Ms();
+            auto v = g.Download(stat.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 4);
+            g.Barrier(stat.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            g.Submit();
+            double n[4] = {};
+            for (size_t i = 0; i < v.size(); i++)
+                n[i & 3] += v[i];
+            const double total = 16.0 * bw * bh;
+            std::printf("check %02u: moving %.3f missed moved %.4f in place %.4f, changed in place %.4f of the frame (%.3f ms)\n", t,
+                        n[0] / total, n[0] ? n[1] / n[0] : 0.0, n[0] ? n[2] / n[0] : 0.0, n[3] / total, ms1);
         }
         const bool hold = period && !arrive;
         if (period)

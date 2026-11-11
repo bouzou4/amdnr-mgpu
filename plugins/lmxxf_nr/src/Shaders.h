@@ -373,6 +373,36 @@ void Accumulate(uint3 id : SV_DispatchThreadID)
     Dst[id.xy] = float4(all(isfinite(a)) ? clamp(a, -8, 8) : 8, 0, 0);
 }
 
+// Cadence guard: one thread per 32x32 block of Src, every 8th pixel of it against last frame's guide in the history.
+// x: samples moving 2 px or more, y: of them the guide differs at the moved position, z: differs in place;
+// w: still samples whose guide changed in place
+[numthreads(8, 8, 1)]
+void HistoryCheck(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy * 32 >= Size))
+        return;
+    float4 n = 0;
+    for (uint i = 0; i < 16; i++)
+    {
+        uint2 px = id.xy * 32 + uint2(i % 4, i / 4) * 8 + 4;
+        if (any(px >= Size))
+            continue;
+        float2 uv = (px + 0.5) / Size;
+        float g = Guide(ToNet(max(ToLinear(Src[px].rgb), 0)));
+        float2 m = 0;
+        if (HistMode & 4)
+            m = Motion.SampleLevel(Pt, uv * MvUvScale, 0).xy * MvToUv;
+        float d = length(m * Size);
+        bool here = abs(g - Hist.SampleLevel(Lin, uv, 0).a) > kStabGuideTau;
+        float2 q = uv + m;
+        if (d >= 2 && all(q >= 0) && all(q <= 1))
+            n.xyz += float3(1, abs(g - Hist.SampleLevel(Lin, q, 0).a) > kStabGuideTau, here);
+        else if (d < 0.5)
+            n.w += here;
+    }
+    Dst[id.xy] = n;
+}
+
 // Terminal: the edit goes onto the back buffer where it matches the HUD-less colour; UI pixels stay as they are
 [numthreads(8, 8, 1)]
 void ApplyTerminal(uint3 id : SV_DispatchThreadID)
