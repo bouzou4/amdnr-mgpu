@@ -35,25 +35,28 @@ Camera near/far/FOV: FFX uses them only for its depth-based disocclusion heurist
 | Gate | How it is measured | Status |
 |---|---|---|
 | No display device loss, FG on, NR on and off, 10-minute run | in-process log, DRED page faults | see Results |
-| Even pacing: generated->real and real->generated within 15 % of half the frame time, p99 | `fg pacing:` log line | harness: yes after start-up |
-| Latency added by FG at most one real frame + 2 ms | `fg:` log, game present -> DXGI present | harness: +9.6 ms at 100 fps (one frame) |
+| Even pacing: every presented frame on screen for half the real frame time, within 15 %, p95 | PresentMon displayed time (the `fg pacing:` call times do not show it under flip metering) | harness: yes (5.42 ms, p05 4.90, p95 5.95) |
+| Latency added by FG at most one real frame + 2 ms | PresentMon display latency against FG off | not measured at display level yet |
 | UI pixels in generated frames equal the real frame's UI | `fg_compare.py` on the dumps (UI mask from display vs HUD-less) | see Results |
 | Generated frame closer to the neighbours' mean than to either neighbour | `fg_compare.py` | harness: yes |
 | Resize, fullscreen, display card loss, minimise: the same behaviour as without FG | the README robustness checks, rerun with FG | not run |
 
 ## Results
 
+Harness (3840x2160, Performance preset, synthetic depth and vectors, no render load), on the hang-fix presenter:
+
 | Test | Result |
 |---|---|
-| Harness, FG on (synthetic depth/motion, HUD-less, 0.6 scale) | FG runs; pacing settles to 4.8/5.0 ms gaps after a 10-20 s start-up collapse; +9.6 ms latency at 100 fps |
-| Satisfactory, FG on (dfg4, dfg5) | display device hang ~1 s after FG on, DRED page fault at an unowned VA; not HUD-less, render scale or queue |
-| Satisfactory input isolation (dfg6: synthetic depth / motion / real / old call order) | not run: the display card was in a post-TDR state |
-| Multi-frame (numGeneratedFrames 2 and 4, own outputs[1..]) | dispatch returns OK, outputs[1] stays all zero: 4.0.2 generates one frame. MFG dropped |
-| Generated frame vs neighbours, builds before the 4.0.2 call order | closer to the neighbours' mean (31-32 dB) than to either neighbour (25-29 dB) |
-| Generated frame vs neighbours, 4.0.2 call order + multi-frame probe | bit-identical to the next real frame: no interpolation. Open: probe or call order |
-| UI pixels in generated frames | not scored: needs game dumps (dfg6) |
+| FG on, provider 4.0.2 | 92-94 real frames/s, 184-187 displayed/s; FG off through the same swapchain 63-76 fps; the plain swapchain without FG 114 fps |
+| Display pacing, FG on (PresentMon, 50 s) | each presented frame on screen 5.42 ms (p05 4.90, p95 5.95), none dropped, Independent Flip. The Present calls come in pairs 0.2 ms apart: the driver's flip metering spaces the flips, so call times say nothing about pacing |
+| Generated frame vs its neighbours (`fg_compare.py`), 4.0.2 | 31.5 dB against the neighbours' mean, 27.2 / 29.1 against each neighbour (the neighbours 24.6 apart): an interpolation |
+| Same, provider 3.1.6 | 33.8 dB against the mean, 28.8 / 28.9 against each neighbour |
+| Generated frame equal to the next real one (seen after the 4.0.2 call order change) | the harness passed an all-zero HUD-less colour: the whole frame was UI and FFX kept it as drawn. Both call orders and both providers showed it. The harness now passes the frame itself |
+| Render queue stalls of 2.5 s (NR on, NR off) and 3.5 s with FG on | no device loss; the send wait logs each stall, nothing is queued meanwhile |
+| FG on / off live, provider 4.0.2 <-> 3.1.6 live | clean (the context is rebuilt) |
+| Multi-frame (numGeneratedFrames 2 and 4, own outputs[1..]) | spike result: dispatch returns OK, outputs[1] stays all zero: 4.0.2 generates one frame. Dropped, the probe is removed |
 
-After a display TDR, every later D3D12 harness start on the display card hangs before the first log line until a reboot. Any FG result taken after a TDR in the same boot is invalid.
+Satisfactory (spike, before the port): dfg4 and dfg5 lost the display device about 0.5 s after FG came on (provider 4.0.2, page fault at a VA DRED could not attribute). Not HUD-less, render scale or the queue. Not rerun yet on this branch; the jobs that separate provider (3.1.6 against 4.0.2) and inputs (synthetic against the game's) are in the rig queue.
 
 ## Failure handling
 
