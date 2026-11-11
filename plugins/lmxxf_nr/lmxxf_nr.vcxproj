@@ -36,7 +36,7 @@
       <Optimization>MaxSpeed</Optimization>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;NDEBUG;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- Detours (MIT) as vendored by upstream OptiScaler under src/ -->
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\src\OptiScaler\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\src\OptiScaler\include;$(ProjectDir)..\..\src\external\FidelityFX-SDK\ffx-api\include\ffx_api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <FunctionLevelLinking>true</FunctionLevelLinking>
@@ -59,6 +59,7 @@
     <ClInclude Include="src\mgpu\MgpuCommon.h" />
     <ClInclude Include="src\mgpu\MgpuComposite.h" />
     <ClInclude Include="src\mgpu\MgpuCore.h" />
+    <ClInclude Include="src\mgpu\MgpuFrameGen.h" />
     <ClInclude Include="src\mgpu\MgpuSwapChain.h" />
     <ClInclude Include="src\mgpu\MgpuLatency.h" />
     <ClInclude Include="third_party\lmxxf\LmxxfNrApi.h" />
@@ -71,6 +72,7 @@
     <ClCompile Include="src\MgpuPlugin.cpp" />
     <ClCompile Include="src\mgpu\MgpuComposite.cpp" />
     <ClCompile Include="src\mgpu\MgpuCore.cpp" />
+    <ClCompile Include="src\mgpu\MgpuFrameGen.cpp" />
     <ClCompile Include="src\mgpu\MgpuDump.cpp" />
     <ClCompile Include="src\mgpu\MgpuGpuLoad.cpp" />
     <ClCompile Include="src\mgpu\MgpuSwapChain.cpp" />

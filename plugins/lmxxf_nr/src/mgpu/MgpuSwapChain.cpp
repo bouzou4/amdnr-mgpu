@@ -1,9 +1,11 @@
 #include "MgpuCommon.h"
 #include "MgpuSwapChain.h"
 #include "MgpuComposite.h"
+#include "MgpuFrameGen.h"
 #include "../GpuWait.h"
 #include "MgpuLatency.h"
 
+#include <algorithm>
 #include <format>
 
 namespace Mgpu
@@ -20,7 +22,7 @@ static std::atomic<ProxySwapChain*> s_active { nullptr };
 ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
 
 bool WantHudless() { return CurrentSettings().hudless && s_active.load() != nullptr; }
-bool WantGuides() { return CurrentSettings().temporal && s_active.load() != nullptr; }
+bool WantGuides() { return (CurrentSettings().temporal || CurrentSettings().frameGen) && s_active.load() != nullptr; }
 void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state)
 {
     if (auto* p = s_active.load())
@@ -165,12 +167,43 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
     d.BufferCount = _realCount;
     d.Flags = RealFlags(desc->Flags, _tearing);
     d.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    ComPtr<IDXGISwapChain1> sc1;
-    hr = original(factory, _dq.Get(), hwnd, &d, fs, restrict, &sc1);
-    if (FAILED(hr))
-        return hr;
-    if (FAILED(hr = sc1.As(&_real)))
-        return hr;
+    if (CurrentSettings().frameGen && DisplayFg::Available())
+    {
+        DisplayFg::InstallPresentTiming(original, factory, _dq.Get());
+        _fgen = new DisplayFg();
+        D3D12_COMMAND_QUEUE_DESC qd {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+        if (!CurrentSettings().fgOwnQueue)
+            _fq = _dq; // A/B: FFX behind the presenter's waits
+        else if (FAILED(_ddev->CreateCommandQueue(&qd, IID_PPV_ARGS(&_fq))))
+        {
+            qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+            _ddev->CreateCommandQueue(&qd, IID_PPV_ARGS(&_fq));
+        }
+        if (_fq && CurrentSettings().fgOwnQueue)
+            _fq->SetName(L"Mgpu FG game queue");
+        _ddev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_fqFence));
+        ComPtr<IDXGISwapChain4> sc4;
+        if (_fq && _fqFence && SUCCEEDED(_fgen->CreateSwapChain(factory, _fq.Get(), hwnd, &d, fs, &sc4)) && sc4)
+            _real = sc4;
+        else
+        {
+            delete _fgen;
+            _fgen = nullptr;
+        }
+    }
+    else if (CurrentSettings().frameGen)
+        Log(2, "display FG: the host has no FFX API: off");
+    if (!_real)
+    {
+        ComPtr<IDXGISwapChain1> sc1;
+        hr = original(factory, _dq.Get(), hwnd, &d, fs, restrict, &sc1);
+        if (FAILED(hr))
+            return hr;
+        if (FAILED(hr = sc1.As(&_real)))
+            return hr;
+    }
 
     // Shared fences: filled (render signals), released (display signals).
     HANDLE h = nullptr;
@@ -214,7 +247,8 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
         _waitable = CreateSemaphoreW(nullptr, (LONG) _maxLatency, 64, nullptr);
 
     _wantHud = CurrentSettings().hudless;
-    _wantMv = CurrentSettings().temporal;
+    _wantMv = CurrentSettings().temporal || _fgen != nullptr;
+    _wantDp = _fgen != nullptr;
     if (FAILED(hr = CreateBuffers()))
         return hr;
     StartPresenter();
@@ -240,9 +274,9 @@ HRESULT ProxySwapChain::Init(PFN_CreateSwapChainForHwnd original, IDXGIFactory2*
                            mi.rcMonitor.bottom - mi.rcMonitor.top, (int) aw));
     }
     Log(0, std::format("proxy swapchain {}x{} fmt {} game buffers {} real buffers {} tearing {} waitable {} hudless {} "
-                       "motion {}",
+                       "motion {} frame generation {}",
                        _gameDesc.Width, _gameDesc.Height, (int) _gameDesc.Format, _gameCount, _realCount, _tearing,
-                       _waitable != nullptr, _wantHud, _wantMv));
+                       _waitable != nullptr, _wantHud, _wantMv, _fgen != nullptr));
     LogOutput();
     return S_OK;
 }
@@ -285,6 +319,13 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
     for (UINT i = 0; i < _realCount; ++i)
         if (FAILED(hr = _real->GetBuffer(i, IID_PPV_ARGS(&_realBb[i]))))
             return hr;
+    if (_fgen && _realCount)
+    {
+        const auto bd = _realBb[0]->GetDesc();
+        Log(0, std::format("display FG: real buffers {} x {}x{} fmt {} flags {:X} layout {} (swapchain {}x{} fmt {})",
+                           _realCount, bd.Width, bd.Height, (int) bd.Format, (int) bd.Flags, (int) bd.Layout, rd.Width,
+                           rd.Height, (int) rd.Format));
+    }
 
     D3D12_RESOURCE_DESC t {};
     t.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -355,6 +396,23 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
             _mvCap = AlignUp(mt, 65536);
             slot += _mvCap;
             _mvR.resize(_gameCount);
+        }
+        _dpR.clear();
+        _dpTag.assign(_gameCount, 0);
+        _dpFp.assign(_gameCount, {});
+        _dpOffset = _dpCap = 0;
+        if (_wantDp)
+        {
+            // plane 0 of the game's depth, 4 bytes per texel, at most the frame's size
+            D3D12_RESOURCE_DESC m = t;
+            m.Format = DXGI_FORMAT_R32_FLOAT;
+            m.Flags = D3D12_RESOURCE_FLAG_NONE;
+            UINT64 dt = 0;
+            _rdev->GetCopyableFootprints(&m, 0, 1, 0, nullptr, nullptr, nullptr, &dt);
+            _dpOffset = slot;
+            _dpCap = AlignUp(dt, 65536);
+            slot += _dpCap;
+            _dpR.resize(_gameCount);
         }
     }
     _slotBytes = slot;
@@ -647,10 +705,14 @@ void ProxySwapChain::ReleaseBuffers(bool keepGameBuffers, bool retire)
         std::lock_guard g(_capM);
         dropAll(_hudR);
         dropAll(_mvR);
+        dropAll(_dpR);
         dropAll(_graveR);
     }
     drop(_hudD);
     drop(_mvD);
+    drop(_dpD);
+    drop(_fgZeroDepth);
+    drop(_fgZeroMv);
     drop(_nrD);
     drop(_bbD);
     drop(_compD);
@@ -741,7 +803,53 @@ void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& g
     cl->ResourceBarrier(nb, b);
     _mvConst[i] = gd;
     _mvConst[i].motion = nullptr;
+    _mvConst[i].depth = nullptr;
     _mvTag[i] = _scheduled + 1;
+
+    if (!_wantDp || i >= _dpR.size() || !gd.depth)
+        return;
+    const auto dd = gd.depth->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+    UINT64 dpNeed = 0;
+    _rdev->GetCopyableFootprints(&dd, 0, 1, 0, &fp, nullptr, nullptr, &dpNeed);
+    const auto pf = fp.Footprint.Format;
+    if ((pf != DXGI_FORMAT_R32_TYPELESS && pf != DXGI_FORMAT_R32_FLOAT && pf != DXGI_FORMAT_D32_FLOAT) ||
+        dpNeed > _dpCap || dd.SampleDesc.Count != 1)
+    {
+        if (!_loggedDpFmt)
+            Log(1, std::format("depth {}x{} fmt {} (plane 0 fmt {}) not supported: no frame generation", dd.Width,
+                               dd.Height, (int) dd.Format, (int) pf));
+        _loggedDpFmt = true;
+        return;
+    }
+    if (!_dpR[i])
+    {
+        D3D12_RESOURCE_DESC bufd {};
+        bufd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufd.Width = _dpCap;
+        bufd.Height = bufd.DepthOrArraySize = bufd.MipLevels = 1;
+        bufd.SampleDesc.Count = 1;
+        bufd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
+        if (FAILED(_rdev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bufd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&_dpR[i]))))
+            return;
+        Log(0, std::format("depth staging {} for {}x{} fmt {}", i, dd.Width, dd.Height, (int) dd.Format));
+    }
+    auto bd = Tr(gd.depth, gd.depthState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const bool tr = gd.depthState != D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (tr)
+        cl->ResourceBarrier(1, &bd);
+    D3D12_TEXTURE_COPY_LOCATION ddl { _dpR[i].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    ddl.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION dsl { gd.depth, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    dsl.SubresourceIndex = 0;
+    cl->CopyTextureRegion(&ddl, 0, 0, 0, &dsl, nullptr);
+    std::swap(bd.Transition.StateBefore, bd.Transition.StateAfter);
+    if (tr)
+        cl->ResourceBarrier(1, &bd);
+    _dpFp[i] = fp;
+    _dpTag[i] = _scheduled + 1;
 }
 
 static void WaitFence(ID3D12Fence* f, UINT64 v, DWORD ms)
@@ -833,6 +941,11 @@ void ProxySwapChain::StopPresenter()
         _dq->Signal(_dFence.Get(), ++_dValue);
         GpuWaitDone(_dFence.Get(), _dValue);
     }
+    if (_fq && _fqFence)
+    {
+        _fq->Signal(_fqFence.Get(), ++_fqValue);
+        GpuWaitDone(_fqFence.Get(), _fqValue);
+    }
     // the network may still read this side's motion vectors on its own queue
     if (CurrentEnv().nrQuiesce)
         CurrentEnv().nrQuiesce();
@@ -892,6 +1005,9 @@ void ProxySwapChain::PresenterLoop()
         // The send lands before anything of this frame is queued: no display queue waits on the render card's fence
         // (a hitch held submitted work there for seconds; a Present behind it hung the display card)
         if (!WaitSend(g))
+            continue;
+        // FFX's work of the previous Present reads the HUD-less colour, depth and vectors this frame overwrites
+        if (_fq && _fqValue && !WaitReuse(_fqFence.Get(), _fqValue, "FG queue", &_stop))
             continue;
 
         // Minimised or occluded (an exclusive fullscreen left by DXGI): nothing goes to the real back buffers until a
@@ -961,7 +1077,7 @@ void ProxySwapChain::PresenterLoop()
             ID3D12CommandList* l[2] = { _dList[s * _realCount + m].Get(), nullptr };
             UINT nl = 1;
             const bool haveHud = meta.hud && _hudD && _ui;
-            bool haveMv = false;
+            bool haveMv = false, haveDp = false;
             if ((haveHud || meta.mv) && _dxList[s])
             {
                 if (meta.mv && (!_mvD || _mvD->GetDesc().Width != meta.mvDesc.Width ||
@@ -998,6 +1114,32 @@ void ProxySwapChain::PresenterLoop()
                     ingest(_hudD.Get(), _hudOffset);
                 if (haveMv)
                     ingest(_mvD.Get(), _mvOffset);
+                if (haveMv && meta.dp)
+                {
+                    const auto& f = meta.dpFp.Footprint;
+                    if (!_dpD || _dpD->GetDesc().Width != f.Width || _dpD->GetDesc().Height != f.Height)
+                    {
+                        if (_dpD)
+                            _graveD.push_back(_dpD);
+                        _dpD = Tex(_ddev.Get(), f.Width, f.Height, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE, ns);
+                        if (_dpD)
+                            _dpD->SetName(L"Mgpu depth D");
+                    }
+                    if (_dpD)
+                    {
+                        auto b = Tr(_dpD.Get(), ns, D3D12_RESOURCE_STATE_COPY_DEST);
+                        c->ResourceBarrier(1, &b);
+                        D3D12_TEXTURE_COPY_LOCATION dl { _dpD.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+                        D3D12_TEXTURE_COPY_LOCATION sl { _slotD[s].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+                        sl.PlacedFootprint = meta.dpFp;
+                        sl.PlacedFootprint.Offset = _dpOffset;
+                        sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+                        c->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+                        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+                        c->ResourceBarrier(1, &b);
+                        haveDp = true;
+                    }
+                }
                 c->Close();
                 l[nl++] = c;
             }
@@ -1070,7 +1212,8 @@ void ProxySwapChain::PresenterLoop()
                 std::lock_guard sg(StatsMutex());
                 MutableStats().nrSource = whole ? "whole frame, UI included (no HUD-less colour)" : "HUD-less colour";
             }
-            const bool nrOn = env.nrWanted && env.nrWanted() && env.nrFrame;
+            const bool nrOn = (LiveNr() >= 0 ? LiveNr() != 0 : (env.nrWanted && env.nrWanted())) && env.nrFrame;
+            bool nrWrote = false;
             const char* idle = sizeHold ? "NR held: window and swapchain sizes differ"
                                : !nrOn  ? "NR off"
                                : _wantHud && !useHud && !whole ? (_gateOn ? "HUD-less gate" : "no HUD-less colour this frame")
@@ -1086,7 +1229,7 @@ void ProxySwapChain::PresenterLoop()
                 const bool gap = _lastNr.time_since_epoch().count() && !dumpStall &&
                                  std::chrono::duration<double, std::milli>(now - _lastNr).count() > 250.0;
                 _lastNr = now;
-                if (haveMv)
+                if (haveMv && CurrentSettings().temporal)
                 {
                     in.motion = _mvD.Get();
                     in.motionState = ns;
@@ -1120,6 +1263,7 @@ void ProxySwapChain::PresenterLoop()
                 // nr stays record + submit time; the CPU wait for the answer is reported on its own
                 nrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() - answerMs;
                 nrAnswerMs = answerMs;
+                nrWrote = wrote && useHud;
                 if (useHud)
                 {
                     c = prepUi();
@@ -1180,6 +1324,9 @@ void ProxySwapChain::PresenterLoop()
                 WaitFence(_dFence.Get(), _dValue, 2000);
                 Alive("NR and UI composite");
             }
+            // FFX's queue gets this frame only once the presenter's work on it is done (false: no Present)
+            if (settled && _fgen && !FgStep(g, meta, haveMv, haveDp, haveHud, useHud, nrWrote, sizeHold, dump, tSched))
+                settled = false;
             BOOL fs = FALSE;
             _real->GetFullscreenState(&fs, nullptr);
             _fsCached = fs;
@@ -1196,6 +1343,8 @@ void ProxySwapChain::PresenterLoop()
             _lastPresentHr = hr;
             if (hr == DXGI_STATUS_OCCLUDED)
                 _occluded = true;
+            if (_fq)
+                _fq->Signal(_fqFence.Get(), ++_fqValue);
             if (hr == DXGI_ERROR_INVALID_CALL && (pf & DXGI_PRESENT_ALLOW_TEARING))
             {
                 // DXGI still in (or leaving) exclusive fullscreen: no tearing until the next mode change
@@ -1298,6 +1447,122 @@ void ProxySwapChain::PresenterLoop()
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
                                st.sendWaitMs, st.answerWaitMs, st.sendStalls));
     }
+}
+
+// Display FG for one frame, right before its real Present
+bool ProxySwapChain::FgStep(UINT64 g, const SlotMeta& meta, bool haveMv, bool haveDp, bool haveHud, bool useHud,
+                            bool nrWrote, bool sizeHold, bool dump, std::chrono::steady_clock::time_point tSched)
+{
+    const auto& env = CurrentEnv();
+    const bool switched = g % 30 == 0 && PollLive(env.dumpDir);
+    _fgPresents++;
+    const bool fgOn = (LiveFg() >= 0 ? LiveFg() != 0 : CurrentSettings().fgStartOn) && !GameFg() && !sizeHold;
+    FgFrame fi;
+    fi.depth = haveDp ? _dpD.Get() : nullptr;
+    fi.motion = haveMv ? _mvD.Get() : nullptr;
+    // the frame as NR made it, without its UI: FFX interpolates it and keeps the back buffer's UI
+    fi.hudMode = LiveFgHud() >= 0 ? LiveFgHud() != 0 : CurrentSettings().fgHudless;
+    if (fi.hudMode && useHud && haveHud)
+        fi.hudless = nrWrote ? _nrD.Get() : _hudD.Get();
+    fi.g = meta.g;
+    // synthetic inputs: titles without an upscaler (MgpuFgSynthetic), or the fgsyn live mask (1 depth, 2 motion) to
+    // isolate the game's inputs; far depth / zero motion (zero-initialised), at the game's render size when known
+    int syn = LiveFgSyn();
+    if (syn < 0)
+        syn = CurrentSettings().fgSynthetic ? ((!fi.depth ? 1 : 0) | (!fi.motion ? 2 : 0)) : 0;
+    if (syn)
+    {
+        const float sc = std::clamp(CurrentSettings().fgSyntheticScale, 0.25f, 1.0f);
+        const bool real = fi.depth || fi.motion;
+        const UINT rw = real && meta.g.renderW ? meta.g.renderW : UINT(_gameDesc.Width * sc);
+        const UINT rh = real && meta.g.renderH ? meta.g.renderH : UINT(_gameDesc.Height * sc);
+        if (!_fgZeroDepth || _fgZeroDepth->GetDesc().Width != rw || _fgZeroDepth->GetDesc().Height != rh)
+        {
+            // previous ones may still be read by FFX: retired like the ring's
+            if (_fgZeroDepth)
+                _graveD.push_back(_fgZeroDepth), _graveD.push_back(_fgZeroMv);
+            const auto ns = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            _fgZeroDepth = Tex(_ddev.Get(), rw, rh, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE, ns);
+            _fgZeroMv = Tex(_ddev.Get(), rw, rh, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE, ns);
+            Log(1, std::format("display FG: synthetic inputs {}x{} (mask {})", rw, rh, syn));
+        }
+        if (!real)
+        {
+            fi.g = {};
+            fi.g.renderW = fi.g.motionW = rw;
+            fi.g.renderH = fi.g.motionH = rh;
+            fi.g.depthInverted = true;
+        }
+        if (syn & 1)
+            fi.depth = _fgZeroDepth.Get();
+        if (syn & 2)
+        {
+            fi.motion = _fgZeroMv.Get();
+            fi.g.motionW = rw, fi.g.motionH = rh;
+        }
+        if (!real && fi.hudMode && !fi.hudless && _hudD)
+            fi.hudless = _hudD.Get();
+    }
+    fi.tGame = tSched;
+    fi.frameMs = _prevSched.time_since_epoch().count()
+                     ? std::chrono::duration<double, std::milli>(tSched - _prevSched).count()
+                     : 16.7;
+    _prevSched = tSched;
+    if (dump && !_fgDumpAt)
+    {
+        _fgen->ArmDump(6);
+        _fgDumpAt = g + 8;
+        Log(0, std::format("display FG: dumping the next presented frames from frame {}", g));
+    }
+    // FFX reads what the presenter's queue wrote: that work is done first, on the CPU (no queue waits on another)
+    _dq->Signal(_dFence.Get(), ++_dValue);
+    if (!WaitReuse(_dFence.Get(), _dValue, "FG after the presenter", &_stop))
+        return false;
+    _fgen->Frame(_ddev.Get(), _fq.Get(), _real.Get(), &fi, fgOn);
+    if (_fgDumpAt && g >= _fgDumpAt)
+    {
+        _fgen->FlushDumps(_ddev.Get(), _dq.Get(), env.dumpDir);
+        _fgDumpAt = 0;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!_fgLog.time_since_epoch().count())
+        _fgLog = now;
+    if (now - _fgLog < std::chrono::seconds(10) && !switched)
+        return true;
+    auto t = _fgen->TakeTiming();
+    auto stat = [](std::vector<float>& v, const char* name)
+    {
+        if (v.empty())
+            return std::format("{} -", name);
+        double sum = 0;
+        for (float x : v)
+            sum += x;
+        std::sort(v.begin(), v.end());
+        return std::format("{} mean {:.2f} median {:.2f} p01 {:.2f} p99 {:.2f} max {:.2f}", name, sum / v.size(),
+                           v[v.size() / 2], v[v.size() / 100], v[(std::min)(v.size() - 1, v.size() * 99 / 100)],
+                           v.back());
+    };
+    const double secs = std::chrono::duration<double>(now - _fgLog).count();
+    std::string busy;
+    {
+        std::lock_guard sg(StatsMutex());
+        const auto& st = MutableStats();
+        busy = std::format("render {:.0f}% display {:.0f}% busy, game frame {:.2f} ms", st.renderBusy, st.displayBusy,
+                           st.renderFrameMs);
+    }
+    Log(0, std::format("fg: {:.1f} s{}, presenter {} ({:.1f}/s), callbacks real {} generated {}; DXGI presents real {} "
+                       "generated {} unknown {} ({:.1f}/s), {}; {}; {}; fg {} nr live {}",
+                       secs, switched ? " (to a live switch)" : "", _fgPresents, _fgPresents / secs, t.real,
+                       t.generated, t.dxgiReal, t.dxgiGenerated, t.dxgiUnknown,
+                       (t.dxgiReal + t.dxgiGenerated + t.dxgiUnknown) / secs, stat(t.dxgiIntervals, "present interval ms"),
+                       stat(t.dxgiLatency, "game present->DXGI present of its frame ms"), busy, fgOn ? "on" : "off",
+                       LiveNr()));
+    if (!t.genToReal.empty())
+        Log(0, std::format("fg pacing: {}; {}", stat(t.genToReal, "generated->real ms"),
+                           stat(t.realToGen, "real->generated ms")));
+    _fgPresents = 0;
+    _fgLog = now;
+    return true;
 }
 
 HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
@@ -1422,9 +1687,10 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
             std::lock_guard cg(_capM);
             meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g;
             meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g;
-            // the slot's previous send list must be done before its allocator is reset: else no extras this frame
+            meta.dp = _wantDp && meta.mv && i < _dpR.size() && _dpR[i] && _dpTag[i] == g;
+            // the slot's previous send list must be done before its allocator is reset, else no extras this frame
             if ((meta.hud || meta.mv) && g > K && !WaitReuse(_filledR.Get(), g - K, "send", &_stop, &_lost))
-                meta.hud = meta.mv = false;
+                meta.hud = meta.mv = meta.dp = false;
             if (meta.hud || meta.mv)
             {
                 _rxAlloc[s]->Reset();
@@ -1447,6 +1713,12 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
                     send(_mvR[i].Get(), _mvOffset);
                     meta.g = _mvConst[i];
                     meta.mvDesc = _mvR[i]->GetDesc();
+                }
+                if (meta.dp)
+                {
+                    meta.dpFp = _dpFp[i];
+                    const UINT64 bytes = UINT64(meta.dpFp.Footprint.RowPitch) * meta.dpFp.Footprint.Height;
+                    c->CopyBufferRegion(_slotR[s].Get(), _dpOffset, _dpR[i].Get(), 0, bytes);
                 }
                 c->Close();
                 l[nl++] = c;
@@ -1530,6 +1802,13 @@ HRESULT ProxySwapChain::EnterFallback()
         _real.Reset();
         _fsCached = FALSE;
         _fsDesc.Windowed = TRUE;
+    }
+    if (_fgen)
+    {
+        // the FG swapchain holds the window: gone before the fallback swapchain is made on it
+        _fgen->Destroy();
+        delete _fgen;
+        _fgen = nullptr;
     }
     DXGI_SWAP_CHAIN_DESC1 d = _gameDesc;
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -1625,7 +1904,16 @@ ProxySwapChain::~ProxySwapChain()
     ReleaseRetired();
     delete _ui;
     _ui = nullptr;
+    if (_fgen)
+        _fgen->ReleaseContext();
+    _realBb.clear();
     _real.Reset();
+    if (_fgen)
+    {
+        _fgen->Destroy();
+        delete _fgen;
+        _fgen = nullptr;
+    }
     if (_waitable)
         CloseHandle(_waitable);
     std::lock_guard g(StatsMutex());
@@ -1775,6 +2063,8 @@ HRESULT STDMETHODCALLTYPE ProxySwapChain::ResizeBuffers(UINT n, UINT w, UINT h, 
     if (n)
         _gameCount = (std::max)(2u, n);
     _gameDesc.Flags = flags;
+    if (_fgen)
+        _fgen->ReleaseContext();
     HRESULT hr;
     {
         std::lock_guard g(_scMutex);

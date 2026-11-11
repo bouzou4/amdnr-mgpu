@@ -67,6 +67,8 @@ class PluginApi
     // Adapter override and unhooked device creation (D3D12CreateDevice hooks)
     static bool UnhookedDeviceCreate();
     static IUnknown* OverrideAdapter(IUnknown* requested, void* caller);
+    // A plugin creates an FFX frame generation swapchain: the factory hooks pass it through
+    static bool FfxSwapchainCreate();
 
     // Swapchain provider (CreateSwapChainForHwnd hook)
     static bool HasSwapchainProvider();

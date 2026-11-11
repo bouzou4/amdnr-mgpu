@@ -9,6 +9,7 @@
 #include "proxies/D3D12_Proxy.h"
 #include "proxies/Dxgi_Proxy.h"
 #include "upscalers/IFeature.h"
+#include "proxies/FfxApi_Proxy.h"
 
 #include <imgui/imgui_internal.h>
 
@@ -708,6 +709,56 @@ int32_t Api_CreateSwapChainForHwndUnhooked(void* factory, void* device, void* hw
         (IDXGISwapChain1**) swapChain);
 }
 
+thread_local bool _ffxSwapchainCreate = false;
+
+bool FfxReady()
+{
+    if (!FfxApiProxy::IsFGReady(false))
+        FfxApiProxy::InitFfxDx12();
+    return FfxApiProxy::IsFGReady(false);
+}
+
+uint32_t Api_FfxCreateContextDx12(void** context, void* desc, const void* memCb)
+{
+    if (context == nullptr || desc == nullptr || !FfxReady())
+        return FFX_API_RETURN_NO_PROVIDER;
+
+    // the FG swapchain's own CreateSwapChainForHwnd passes straight through the factory hooks
+    _ffxSwapchainCreate = true;
+    const auto result = FfxApiProxy::D3D12_CreateContext((ffxContext*) context, (ffxCreateContextDescHeader*) desc,
+                                                         (const ffxAllocationCallbacks*) memCb);
+    _ffxSwapchainCreate = false;
+    return result;
+}
+
+uint32_t Api_FfxDestroyContextDx12(void** context, const void* memCb)
+{
+    if (context == nullptr)
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    return FfxApiProxy::D3D12_DestroyContext((ffxContext*) context, (const ffxAllocationCallbacks*) memCb);
+}
+
+uint32_t Api_FfxConfigureDx12(void** context, const void* desc)
+{
+    if (context == nullptr || desc == nullptr)
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    return FfxApiProxy::D3D12_Configure((ffxContext*) context, (const ffxConfigureDescHeader*) desc);
+}
+
+uint32_t Api_FfxQueryDx12(void** context, void* desc)
+{
+    if (desc == nullptr || !FfxReady())
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    return FfxApiProxy::D3D12_Query((ffxContext*) context, (ffxQueryDescHeader*) desc);
+}
+
+uint32_t Api_FfxDispatchDx12(void** context, const void* desc)
+{
+    if (context == nullptr || desc == nullptr)
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    return FfxApiProxy::D3D12_Dispatch((ffxContext*) context, (const ffxDispatchDescHeader*) desc);
+}
+
 bool CallAdapterOverride(OptiAdapterOverrideFn fn, void* requested, void* caller, void* userData, void** result)
 {
     __try
@@ -790,6 +841,12 @@ const OptiPluginApi _api = {
 
     .RegisterSwapchainProvider = Api_RegisterSwapchainProvider,
     .CreateSwapChainForHwndUnhooked = Api_CreateSwapChainForHwndUnhooked,
+
+    .FfxCreateContextDx12 = Api_FfxCreateContextDx12,
+    .FfxDestroyContextDx12 = Api_FfxDestroyContextDx12,
+    .FfxConfigureDx12 = Api_FfxConfigureDx12,
+    .FfxQueryDx12 = Api_FfxQueryDx12,
+    .FfxDispatchDx12 = Api_FfxDispatchDx12,
 };
 } // namespace
 
@@ -1199,6 +1256,8 @@ void PluginApi::RunPresentCallbacks(OptiPresentFrame* frame)
 }
 
 bool PluginApi::UnhookedDeviceCreate() { return _unhookedDeviceCreate; }
+
+bool PluginApi::FfxSwapchainCreate() { return _ffxSwapchainCreate; }
 
 IUnknown* PluginApi::OverrideAdapter(IUnknown* requested, void* caller)
 {

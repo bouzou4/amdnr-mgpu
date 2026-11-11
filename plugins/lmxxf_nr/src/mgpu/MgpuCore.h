@@ -29,6 +29,27 @@ struct Settings
     bool presentIdle = false;  // the real Present goes only to an idle display queue (bounded CPU wait)
     int dred = 0;              // DRED on the display device: 1 breadcrumbs + page faults, 2 page faults only
     bool forwardOutputs = true; // the render adapter's EnumOutputs returns the display card's outputs
+    // frame generation on the display card (FFX FG swapchain), needs depth and motion vectors
+    bool frameGen = false;
+    bool fgHudless = true; // the NR'd HUD-less colour as FFX's HUDLessColor (UI not interpolated)
+    bool fgAsync = false, fgHdr = true, fgInfiniteDepth = true, fgDebug = false, fgSynthetic = false;
+    float fgCameraNear = 0.1f, fgCameraFar = 100000.0f, fgVFov = 1.0472f;
+    bool fgStartOn = true; // FG on before any live switch (MgpuFgOn)
+    float fgSyntheticScale = 1.0f; // synthetic depth / motion size relative to the frame
+    bool fgOwnQueue = true; // FFX on its own queue (_fq); false: on the presenter's queue (_dq)
+    // FFX swapchain pacing tuning; fgPtMargin < 0: FFX defaults
+    float fgPtMargin = -1.0f, fgPtVariance = 0.1f;
+    bool fgPtHybridSpin = false, fgPtFenceWait = false;
+};
+
+// FFX API of the host (OptiScaler's own modules), ffxContext* contexts
+struct FfxFns
+{
+    uint32_t (*create)(void** context, void* desc, const void* memCb) = nullptr;
+    uint32_t (*destroy)(void** context, const void* memCb) = nullptr;
+    uint32_t (*configure)(void** context, const void* desc) = nullptr;
+    uint32_t (*query)(void** context, void* desc) = nullptr;
+    uint32_t (*dispatch)(void** context, const void* desc) = nullptr;
 };
 
 // Once per device: removed reason and, with DRED on, the page fault and the last breadcrumbs
@@ -42,7 +63,9 @@ struct Guides
     UINT motionW = 0, motionH = 0; // active extent of the vectors
     UINT renderW = 0, renderH = 0;
     float mvScaleX = 1, mvScaleY = 1, jitterX = 0, jitterY = 0;
-    bool reset = false, depthInverted = false;
+    bool reset = false, depthInverted = false, jitteredMv = false;
+    ID3D12Resource* depth = nullptr; // frame generation only
+    D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 };
 
 // What NR gets on the display card for one frame. `src` is read, the result goes to `dst` (both in their states).
@@ -77,6 +100,7 @@ struct Env
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
     std::function<void(ID3D12Device*)> hookExecute; // latency probe: the game queue's submits
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it
+    FfxFns ffx;
 };
 
 struct AdapterView
