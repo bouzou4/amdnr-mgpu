@@ -52,6 +52,7 @@ class PluginApi
     // Present callbacks of the plugins
     static bool HasPresentCallbacks();
     static bool WantsHudless(); // a plugin asked for the HUD-less capture without frame generation
+    static bool WantsPreOverlay(); // a plugin asked for the OptiPresent_PreOverlay call
     static uint64_t LastUpscaleFrameId();
     // HUD-less colour the game hands its own frame generation, and whether it generates frames
     static void SetGameFg(const char* source, ID3D12Resource* hudless, uint32_t hudlessState, bool generating);

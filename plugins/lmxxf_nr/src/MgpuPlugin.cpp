@@ -164,7 +164,7 @@ struct CaptureLists
     HANDLE event = nullptr;
 } g_cap;
 
-void CaptureHudless(OptiPresentFrame* f)
+void CaptureHudless(OptiPresentFrame* f, void* res, uint32_t state, bool standIn)
 {
     auto* dev = static_cast<ID3D12Device*>(f->device);
     auto* q = static_cast<ID3D12CommandQueue*>(f->queue);
@@ -186,14 +186,15 @@ void CaptureHudless(OptiPresentFrame* f)
         return Log(OptiLog_Warn, "[mgpu] HUD-less capture skipped: its list from 4 frames ago is not done");
     g_cap.alloc[s]->Reset();
     g_cap.list->Reset(g_cap.alloc[s].Get(), nullptr);
-    Mgpu::CaptureHudless(g_cap.list.Get(), static_cast<ID3D12Resource*>(f->hudless),
-                         (D3D12_RESOURCE_STATES) f->hudlessState);
+    Mgpu::CaptureHudless(g_cap.list.Get(), static_cast<ID3D12Resource*>(res), (D3D12_RESOURCE_STATES) state, standIn);
     g_cap.list->Close();
     ID3D12CommandList* l[] = { g_cap.list.Get() };
     o_ExecuteCommandLists ? o_ExecuteCommandLists(q, 1, l) : q->ExecuteCommandLists(1, l);
     g_cap.value[s] = ++g_cap.counter;
     q->Signal(g_cap.fence.Get(), g_cap.value[s]);
 }
+
+int g_standIn = 1; // MgpuMenuStandIn: 0 off, 1 while the menu is open, 2 every frame (the FPS overlay too)
 
 std::string Busy(double v) { return v < 0 ? std::string("-") : std::format("{:.0f}%", v); }
 } // namespace
@@ -236,6 +237,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     // MgpuDred: true / 1 breadcrumbs + page faults, 2 page faults only (breadcrumbs serialise the queue)
     s.dred = std::clamp(g_keys.Int("MgpuDred", g_keys.Bool("MgpuDred", false) ? 1 : 0), 0, 2);
     s.forwardOutputs = g_keys.Bool("MgpuForwardOutputs", true);
+    g_standIn = std::clamp(g_keys.Int("MgpuMenuStandIn", 1), 0, 2);
 
     g_dir = dumpDir;
     Mgpu::Env e;
@@ -265,6 +267,21 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
     e.nrQuiesce = [] { DisplayEngine().Quiesce(); };
     e.nrIdle = [](const char* why) { DisplayEngine().SeqIdle(why); };
     e.nrWanted = [] { return Engine().Settings().enabled; };
+    // jobs since the last call x the network's GPU time, over the wall time (the load sampler's thread only)
+    e.nrBusy = []() -> double
+    {
+        static uint64_t lastRun = 0;
+        static std::chrono::steady_clock::time_point last {};
+        const auto st = DisplayEngine().Stats();
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        const uint64_t jobs = st.framesRun >= lastRun ? st.framesRun - lastRun : 0;
+        const bool first = !last.time_since_epoch().count();
+        last = now, lastRun = st.framesRun;
+        if (first || ms <= 0)
+            return -1;
+        return std::min(100.0, double(jobs) * st.hipMs / ms * 100.0);
+    };
     e.nrStatus = []
     {
         const auto st = DisplayEngine().Stats();
@@ -287,13 +304,31 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
 
 bool MgpuWantsHudless() { return g_on && Mgpu::CurrentSettings().hudless; }
 
+uint32_t MgpuPresentRequests()
+{
+    return MgpuWantsHudless() ? OptiPresentRequest_Hudless | OptiPresentRequest_PreOverlay : 0;
+}
+
 void MgpuOnPresent(OptiPresentFrame* f)
 {
     if (!g_on)
         return;
     g_colorSpace = f->colorSpace;
+    static bool fgHud = false; // this frame's HUD-less colour came at the game's FG swapchain, before PreOverlay
     if (f->phase == OptiPresent_AfterOverlay && f->hudless != nullptr && Mgpu::WantHudless())
-        CaptureHudless(f);
+    {
+        CaptureHudless(f, f->hudless, f->hudlessState, false);
+        fgHud = f->fgSwapchain != 0;
+    }
+    else if (f->phase == OptiPresent_PreOverlay)
+    {
+        // No HUD-less colour and the menu about to be drawn: the frame as it is now stands in for one, so the
+        // whole-frame fallback runs on it and the menu is composited back like a HUD
+        const bool real = f->hudless != nullptr || std::exchange(fgHud, false);
+        const bool menu = g_standIn == 2 || (g_standIn == 1 && OPTI_API_HAS(g_api, IsMenuOpen) && g_api->IsMenuOpen());
+        if (!real && menu && Mgpu::WantHudless() && f->backBuffer != nullptr)
+            CaptureHudless(f, f->backBuffer, f->backBufferState, true);
+    }
 }
 
 void MgpuOnUpscale(OptiUpscaleFrame* f)
@@ -334,7 +369,8 @@ void MgpuDrawTab(const OptiPluginApi* api)
     if (!st.output.empty())
         line("Display output: " + st.output);
     line(std::format("Render card: {} (bus {}), {} busy", st.render.name, st.render.bus, Busy(st.renderBusy)));
-    line(std::format("Display card: {} (bus {}), {} busy", st.display.name, st.display.bus, Busy(st.displayBusy)));
+    line(std::format("Display card: {} (bus {}), {} busy (D3D {}, network {})", st.display.name, st.display.bus,
+                     Busy(st.displayBusy), Busy(st.displayD3dBusy), Busy(st.displayNetBusy)));
     line(std::format("Mode: {}, NR every frame {}, motion vectors {}, frames ahead {}", s.hudless ? "HUD-less" : "whole frame",
                      s.nrEveryFrame ? "on" : "off", s.temporal ? "on" : "off", s.maxLead));
     line(std::format("Frame {}x{}, render {:.2f} ms, display {:.2f} ms, added latency {:.2f} ms", st.width, st.height,

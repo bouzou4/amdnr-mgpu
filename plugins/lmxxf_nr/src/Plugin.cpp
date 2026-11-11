@@ -40,6 +40,7 @@ const char* const kPlacements[] = { "Before upscaling", "After upscaling", "Term
 const char* const kSizes[] = { "1080 tier", "1440 (2560x1440)", "Native" };
 const char* const kModels[] = { "Full (71 blocks)", "Small (31 blocks)" };
 const char* const kStyles[] = { "Auto (2 before / after upscaling, 0 terminal)", "0 (NVIDIA look)", "1", "2" };
+const char* const kCadences[] = { "Every frame", "Every 2nd frame", "Every 3rd frame", "Async" };
 const char* const kPasses[] = { "1", "2 (about 2x the network)", "3 (2 run + 1 predicted, about 2x)" };
 
 std::atomic<int> g_eclInFlight { 0 }; // calls inside the detour, waited out before a hot-reload unload
@@ -91,6 +92,9 @@ void WriteSettings(const NrSettings& s)
     g_api->SetFloat(g_plugin, "ColorStrength", s.colorStrength);
     g_api->SetInt(g_plugin, "EditUpsample", s.upsample);
     g_api->SetBool(g_plugin, "EditStabilise", s.stabilise);
+    g_api->SetString(g_plugin, "NrCadence", s.cadence == 0 ? "async" : std::to_string(s.cadence).c_str());
+    g_api->SetFloat(g_plugin, "HdrPaperWhite", s.paperWhite);
+    g_api->SetBool(g_plugin, "FlickerMeter", s.meter);
     g_api->SetBool(g_plugin, "MotionVectors", s.motion);
     g_api->SetBool(g_plugin, "Exposure", s.exposure);
     g_api->SetBool(g_plugin, "Temporal", s.temporal);
@@ -477,10 +481,22 @@ void DrawTab(void*)
     if (g_api->Checkbox("Network history from motion vectors", &g_ui.temporal))
         changed = true;
     g_api->ItemTooltip("Runtimes with motion-fed history (lmxxf temporal builds): the network sees its last answer");
+    int32_t cadence = g_ui.cadence == 0 ? 3 : g_ui.cadence - 1;
+    if (g_api->Combo("Network cadence", &cadence, kCadences, 4, nullptr))
+        g_ui.cadence = cadence == 3 ? 0 : cadence + 1, changed = true;
+    g_api->ItemTooltip("How often the network runs. Every 2nd / 3rd: the frames between show the last edit moved along\n"
+                       "the motion vectors. Async: every frame is shown at once with the newest answer, the network\n"
+                       "runs as fast as it can. Terminal placement and multi-GPU; needs the stabilised guided edit.");
     if (g_api->Checkbox("Game exposure", &g_ui.exposure))
         changed = true;
     g_api->ItemTooltip("Before/after upscaling with HDR colour: map it into the network's range with the game's\n"
                        "exposure texture (off or missing: auto-exposure). SDR: give the runtime the texture.");
+
+    if (g_api->SliderFloat("HDR paper white (nits)", &g_ui.paperWhite, 80.0f, 1000.0f, "%.0f"))
+        changed = true;
+    g_api->ItemTooltip("HDR outputs: the level the network's 1.0 maps to");
+    if (g_api->Checkbox("Flicker meter", &g_ui.meter))
+        changed = true;
 
     if (changed)
         ConfigureAll(g_ui);
@@ -749,7 +765,10 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     if (g_hasPresent)
     {
         g_hudlessRequested = g_ui.placement == Placement::Terminal || (mgpu && MgpuWantsHudless());
-        api->RegisterPresentCallback(plugin, Present, g_hudlessRequested ? OptiPresentRequest_Hudless : 0, nullptr);
+        api->RegisterPresentCallback(plugin, Present,
+                                     (g_hudlessRequested ? OptiPresentRequest_Hudless : 0) |
+                                         (mgpu ? MgpuPresentRequests() : 0),
+                                     nullptr);
     }
     if (OPTI_API_HAS(api, RegisterOverlayText))
     {

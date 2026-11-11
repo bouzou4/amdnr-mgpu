@@ -1107,6 +1107,11 @@ bool PluginApi::WantsHudless()
     return (_presentRequests.load(std::memory_order_relaxed) & OptiPresentRequest_Hudless) != 0;
 }
 
+bool PluginApi::WantsPreOverlay()
+{
+    return (_presentRequests.load(std::memory_order_relaxed) & OptiPresentRequest_PreOverlay) != 0;
+}
+
 uint64_t PluginApi::LastUpscaleFrameId() { return _lastUpscaleFrameId.load(std::memory_order_relaxed); }
 
 namespace

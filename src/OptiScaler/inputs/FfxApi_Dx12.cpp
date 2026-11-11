@@ -17,6 +17,7 @@
 #include <magic_enum.hpp>
 
 #include <plugins/PluginApi.h>
+#include <hudfix/Hudfix_Dx12.h>
 #include <detours/detours.h>
 
 static std::unordered_map<ffxContext, ffxCreateContextDescUpscale> _initParams;
@@ -254,6 +255,19 @@ void RunFgSwapchainCallbacks(IDXGISwapChain* sc, UINT syncInterval, UINT flags)
             f.hudless = hud;
             f.hudlessState = hudState;
             f.hudlessSource = OptiHudless_FfxFG;
+        }
+        else if (!generating)
+        {
+            // The game gives its FG no HUD-less colour (FG off, Hellraiser): HUDfix's pick of this frame, as at
+            // the wrapped swapchain's present
+            UINT64 hudlessFrame = 0;
+            if (auto pick = Hudfix_Dx12::PluginHudless(&hudlessFrame);
+                pick != nullptr && hudlessFrame == Hudfix_Dx12::ActiveUpscaleFrame())
+            {
+                f.hudless = pick;
+                f.hudlessState = D3D12_RESOURCE_STATE_COPY_DEST;
+                f.hudlessSource = OptiHudless_Hudfix;
+            }
         }
         f.frameGeneration = generating ? OptiFrameGen_Game : OptiFrameGen_Off;
         f.fgSwapchain = 1;

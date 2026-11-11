@@ -21,10 +21,10 @@ ProxySwapChain* ProxySwapChain::Active() { return s_active.load(); }
 
 bool WantHudless() { return CurrentSettings().hudless && s_active.load() != nullptr; }
 bool WantGuides() { return CurrentSettings().temporal && s_active.load() != nullptr; }
-void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state)
+void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state, bool standIn)
 {
     if (auto* p = s_active.load())
-        p->RecordHudless(cl, src, state);
+        p->RecordHudless(cl, src, state, standIn);
 }
 void CaptureGuides(ID3D12GraphicsCommandList* cl, const Guides& g)
 {
@@ -330,6 +330,7 @@ HRESULT ProxySwapChain::CreateBuffers(bool keepGameBuffers)
         _hudR.clear();
         _mvR.clear();
         _hudTag.assign(_gameCount, 0);
+        _hudStand.assign(_gameCount, 0);
         _mvTag.assign(_gameCount, 0);
         _mvConst.assign(_gameCount, Guides {});
         if (_wantHud)
@@ -664,7 +665,8 @@ void ProxySwapChain::ReleaseRetired()
         delete u;
     _retiredUi.clear();
 }
-void ProxySwapChain::RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state)
+void ProxySwapChain::RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state,
+                                   bool standIn)
 {
     std::lock_guard g(_capM);
     const UINT i = _bbIndex;
@@ -692,6 +694,7 @@ void ProxySwapChain::RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource
         std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
     cl->ResourceBarrier(nb, b);
     _hudTag[i] = _scheduled + 1;
+    _hudStand[i] = standIn;
 }
 
 void ProxySwapChain::RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& gd)
@@ -1024,7 +1027,11 @@ void ProxySwapChain::PresenterLoop()
             }
 
             // UI mask from the back buffer against the HUD-less colour: count always, composite unless gated.
-            const bool useHud = haveHud && !_gateOn;
+            // a stand-in is no HUD-less colour: it only keeps the menu out of the whole-frame fallback
+            const bool realHud = haveHud && !meta.hudStand;
+            _hudMissStreak = realHud ? 0 : _hudMissStreak + 1;
+            const bool whole = _wantHud && !realHud && CurrentSettings().wholeFrameFallback && _hudMissStreak > 30;
+            const bool useHud = haveHud && !_gateOn && (realHud || whole);
             auto prepUi = [&]
             {
                 _duAlloc[s]->Reset();
@@ -1060,8 +1067,6 @@ void ProxySwapChain::PresenterLoop()
 
             // HUD-less mode runs NR over the UI only as the fallback for a game with no HUD-less colour (a run of
             // misses); a lone miss or the gate presents without NR
-            _hudMissStreak = haveHud ? 0 : _hudMissStreak + 1;
-            const bool whole = _wantHud && !haveHud && CurrentSettings().wholeFrameFallback && _hudMissStreak > 30;
             if (whole != _wholeFallback)
             {
                 _wholeFallback = whole;
@@ -1266,9 +1271,9 @@ void ProxySwapChain::PresenterLoop()
         st.skipped += skipped;
         if (_wantHud)
         {
-            if (hudFrame)
+            if (hudFrame && !meta.hudStand)
                 st.hudlessFrames++;
-            else if (!meta.hud)
+            else if (!meta.hud || meta.hudStand)
                 st.hudlessMissed++;
             if (uiShare >= 0)
                 st.uiShare = uiShare;
@@ -1292,11 +1297,12 @@ void ProxySwapChain::PresenterLoop()
         if (st.presented % 600 == 0)
             Log(0, std::format("stats: render {:.2f} ms ({:.0f}% busy) display {:.2f} ms ({:.0f}% busy) send {:.2f} ms {:.1f} GB/s "
                                "ingest {:.2f} ms {:.1f} GB/s latency {:.2f} ms nr {:.2f} ms produced {} presented {} skipped {} "
-                               "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {}",
+                               "hudless {} missed {} ui {:.2f}% gate {} motion {} cpu wait send {:.2f} answer {:.2f} ms stalls {} "
+                               "display D3D {:.0f}% network {:.0f}%",
                                st.renderFrameMs, st.renderBusy, st.displayFrameMs, st.displayBusy, st.sendMs, st.sendGBs,
                                st.ingestMs, st.ingestGBs, st.latencyMs, st.nrMs, st.produced, st.presented, st.skipped,
                                st.hudlessFrames, st.hudlessMissed, st.uiShare * 100, st.gateFallbacks, st.guideFrames,
-                               st.sendWaitMs, st.answerWaitMs, st.sendStalls));
+                               st.sendWaitMs, st.answerWaitMs, st.sendStalls, st.displayD3dBusy, st.displayNetBusy));
     }
 }
 
@@ -1421,6 +1427,7 @@ HRESULT ProxySwapChain::DoPresent(UINT sync, UINT flags)
         {
             std::lock_guard cg(_capM);
             meta.hud = _wantHud && i < _hudR.size() && _hudTag[i] == g;
+            meta.hudStand = meta.hud && _hudStand[i];
             meta.mv = _wantMv && i < _mvR.size() && _mvR[i] && _mvTag[i] == g;
             // the slot's previous send list must be done before its allocator is reset: else no extras this frame
             if ((meta.hud || meta.mv) && g > K && !WaitReuse(_filledR.Get(), g - K, "send", &_stop, &_lost))

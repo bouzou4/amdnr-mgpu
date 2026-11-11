@@ -74,7 +74,7 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE t, UINT s, void* m) override;
 
     // Render card, on the game's list: copy into the staging of the back buffer being drawn.
-    void RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state);
+    void RecordHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state, bool standIn);
     void RecordGuides(ID3D12GraphicsCommandList* cl, const Guides& g);
     static ProxySwapChain* Active();
 
@@ -193,13 +193,14 @@ class DECLSPEC_UUID("6d1b3a52-7f0e-4c8b-9a41-2f6b8e0d5c13") ProxySwapChain final
     std::mutex _capM;
     std::vector<ComPtr<ID3D12Resource>> _hudR, _mvR, _graveR;
     std::vector<UINT64> _hudTag, _mvTag; // frame id each staging holds
+    std::vector<uint8_t> _hudStand;      // the staging holds the pre-menu back buffer, not a HUD-less colour
     std::vector<Guides> _mvConst;
     UINT64 _hudOffset = 0, _mvOffset = 0, _mvCap = 0;
     ComPtr<ID3D12CommandAllocator> _rxAlloc[K];
     ComPtr<ID3D12GraphicsCommandList> _rxList[K];
     struct SlotMeta
     {
-        bool hud = false, mv = false;
+        bool hud = false, mv = false, hudStand = false;
         Guides g;
         D3D12_RESOURCE_DESC mvDesc {};
     } _meta[K];

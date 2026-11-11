@@ -72,9 +72,12 @@ static void Sample()
                 v = (std::max)(v, x);
             return (std::min)(v, 100.0);
         };
+        const double net = CurrentEnv().nrBusy ? CurrentEnv().nrBusy() : -1;
         std::lock_guard g(StatsMutex());
         MutableStats().renderBusy = top(r);
-        MutableStats().displayBusy = top(d);
+        MutableStats().displayD3dBusy = top(d);
+        MutableStats().displayNetBusy = net;
+        MutableStats().displayBusy = (std::min)(top(d) + (std::max)(net, 0.0), 100.0);
     }
 }
 

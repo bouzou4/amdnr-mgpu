@@ -547,6 +547,44 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             PluginApi::RunPresentCallbacks(&pluginPresent);
         }
 
+        // The frame as it is before the menu, also when the pair above ran at the game's FG swapchain
+        if (PluginApi::HasPresentCallbacks() && PluginApi::WantsPreOverlay() && cq != nullptr && device12 != nullptr)
+        {
+            OptiPresentFrame pre = pluginPresent;
+            if (!pluginPresentOn)
+            {
+                const auto& st = State::Instance();
+                pre.size = sizeof(OptiPresentFrame);
+                pre.api = OptiApi_D3D12;
+                pre.device = device12;
+                pre.queue = cq;
+                pre.swapchain = pSwapChain;
+                IDXGISwapChain3* sc3 = nullptr;
+                if (pSwapChain->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+                {
+                    ID3D12Resource* buffer = nullptr;
+                    if (sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer)) == S_OK)
+                    {
+                        pre.backBuffer = buffer;
+                        buffer->Release(); // the swapchain keeps it
+                    }
+                    sc3->Release();
+                }
+                pre.backBufferState = D3D12_RESOURCE_STATE_PRESENT;
+                pre.colorSpace = st.outputColorSpace.dxgiColorSpace;
+                pre.width = st.currentSwapchainDesc.BufferDesc.Width;
+                pre.height = st.currentSwapchainDesc.BufferDesc.Height;
+                pre.format = st.currentSwapchainDesc.BufferDesc.Format;
+                pre.syncInterval = SyncInterval;
+                pre.presentFlags = Flags;
+            }
+            if (pre.backBuffer != nullptr)
+            {
+                pre.phase = OptiPresent_PreOverlay;
+                PluginApi::RunPresentCallbacks(&pre);
+            }
+        }
+
         // Draw overlay
         MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
 

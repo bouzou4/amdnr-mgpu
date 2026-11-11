@@ -137,6 +137,10 @@ extern "C"
     {
         OptiPresent_BeforeOverlay = 0, // OptiScaler's menu and FPS overlay are not drawn yet
         OptiPresent_AfterOverlay = 1,  // right before the swapchain Present
+        // Only with OptiPresentRequest_PreOverlay: on the swapchain OptiScaler draws its menu on, right before it
+        // draws (after BeforeOverlay when both come from this present). Also sent when the Before / After pair ran
+        // earlier at the game's FG swapchain. backBuffer only: hudless is the pair's or NULL.
+        OptiPresent_PreOverlay = 2,
     } OptiPresentPhase;
 
     typedef enum OptiPresentRequest
@@ -144,6 +148,9 @@ extern "C"
         // Capture the HUD-less colour (HUDfix's detection) even without frame generation. Ask in OptiPluginInit:
         // the resource tracking it needs is set up when the game creates its device.
         OptiPresentRequest_Hudless = 1 << 0,
+        // Also call with phase OptiPresent_PreOverlay (a plugin that presents the frame elsewhere and must keep
+        // the menu out of its processing)
+        OptiPresentRequest_PreOverlay = 1 << 1,
     } OptiPresentRequest;
 
     // One D3D12 present of the game's swapchain (frame generation off). The plugin submits its own lists to queue

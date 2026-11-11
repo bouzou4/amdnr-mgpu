@@ -11,6 +11,7 @@ bool MgpuInit(const OptiPluginApi* api, OptiPlugin* plugin, const std::wstring& 
 bool MgpuActive(); // the game renders on the render card: no NR there
 bool MgpuFallback(); // the display card was lost: single-GPU passthrough, NR off
 bool MgpuWantsHudless();
+uint32_t MgpuPresentRequests(); // OptiPresentRequest bits multi-GPU needs
 void MgpuOnPresent(OptiPresentFrame* frame);
 void MgpuOnUpscale(OptiUpscaleFrame* frame);
 void MgpuDrawTab(const OptiPluginApi* api);

@@ -74,6 +74,7 @@ struct Env
     std::function<void()> nrQuiesce; // NR's queued work is done: the resources it was given may be freed
     std::function<void(const char*)> nrIdle; // no NR this frame, and why (sequence dump requests log it)
     std::function<std::string()> nrStatus;
+    std::function<double()> nrBusy; // share of time the network runs on the display card, %, < 0 unknown
     std::function<void()> onPresent; // game Present on the proxy (render thread), before the send
     std::function<void(ID3D12Device*)> hookExecute; // latency probe: the game queue's submits
     std::wstring dumpDir; // frame dumps go here when mgpu_dump.trigger appears in it
@@ -103,7 +104,8 @@ struct Stats
     double nrMs = 0;                                 // CPU time of the NR record+submit
     uint32_t ringDepth = 0, ringSlots = 0;
     uint64_t slotBytes = 0;
-    double renderBusy = -1, displayBusy = -1;        // 3D engine use %, -1 = unknown
+    double renderBusy = -1, displayBusy = -1;        // card use %, -1 = unknown; display: D3D engines + network
+    double displayD3dBusy = -1, displayNetBusy = -1; // its parts (the network runs outside the D3D engine counters)
     std::string nrStatus;
     uint64_t hudlessFrames = 0, hudlessMissed = 0, gateFallbacks = 0, guideFrames = 0, sendStalls = 0;
     double uiShare = -1; // share of pixels the UI composite took from the back buffer, last measured
@@ -146,7 +148,9 @@ bool NrOnDisplay();
 bool WantGuides();
 bool WantHudless();
 void CaptureGuides(ID3D12GraphicsCommandList* cl, const Guides& g);
-void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state);
+// standIn: not a HUD-less colour but the back buffer before OptiScaler's menu, so the menu stays out of whole-frame NR
+void CaptureHudless(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, D3D12_RESOURCE_STATES state,
+                    bool standIn = false);
 Stats GetStats();
 
 // internal
