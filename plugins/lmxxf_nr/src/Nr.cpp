@@ -90,7 +90,7 @@ void UavBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res)
 }
 
 ComPtr<ID3D12Resource> Texture(ID3D12Device* device, uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool uav,
-                               D3D12_RESOURCE_STATES state)
+                               D3D12_RESOURCE_STATES state, HRESULT* hr = nullptr)
 {
     D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_RESOURCE_DESC d {};
@@ -105,9 +105,19 @@ ComPtr<ID3D12Resource> Texture(ID3D12Device* device, uint32_t w, uint32_t h, DXG
     if (state & D3D12_RESOURCE_STATE_RENDER_TARGET)
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> r;
-    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r))))
+    const HRESULT h2 = device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r));
+    if (hr)
+        *hr = h2;
+    if (FAILED(h2))
         return nullptr;
     return r;
+}
+
+std::string Hex(HRESULT hr)
+{
+    char b[16];
+    snprintf(b, sizeof(b), "%08X", (uint32_t) hr);
+    return b;
 }
 
 float Median(const float* samples, uint32_t count)
@@ -178,6 +188,9 @@ void NrEngine::Configure(const NrSettings& s)
     std::lock_guard lock(_mutex);
     if (s.placement != _settings.placement)
         _placementSwitch = true;
+    if (s.testFailFeed && !_settings.testFailFeed)
+        _failNextFeed = true;
+    _refusedW = _refusedH = 0;
     _settings = s;
     // A history session drops adaptive ViT reuse: toggling history rebuilds it off the render thread
     _dirty = s.size != _active.size || s.model != _active.model || s.Style() != _active.Style() ||
@@ -260,6 +273,16 @@ bool NrEngine::InitDevice(ID3D12Device* device, ID3D12CommandQueue* gameQueue)
 {
     _device = device;
     _gameQueue = gameQueue;
+    {
+        extern const OptiPluginApi* g_api;
+        ComPtr<IDXGIFactory4> f;
+        if (OPTI_API_HAS(g_api, CreateDxgiFactoryUnhooked))
+            g_api->CreateDxgiFactoryUnhooked(&__uuidof(IDXGIFactory4), (void**) f.GetAddressOf());
+        if (!f)
+            CreateDXGIFactory1(IID_PPV_ARGS(&f));
+        if (f)
+            f->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&_adapter));
+    }
 
     D3D12_COMMAND_QUEUE_DESC qd { D3D12_COMMAND_LIST_TYPE_DIRECT };
     if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&_queue))) ||
@@ -456,13 +479,17 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
     if (!_stab[0] || _stab[0]->GetDesc().Width != w || _stab[0]->GetDesc().Height != h)
     {
         _stabValid = false;
-        for (auto& t : _stab)
-        {
-            Retire(t); // the last apply may still read it (a placement or size change)
-            if (!(t = Texture(_device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead)))
+        // both or neither: a lone one would be bound as the other's partner
+        ComPtr<ID3D12Resource> t[2];
+        for (auto& x : t)
+            if (!(x = Texture(_device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead)))
                 return false;
+        for (int i = 0; i < 2; i++)
+        {
+            Retire(_stab[i]); // the last apply may still read it (a placement or size change)
+            _stab[i] = std::move(t[i]);
+            _stab[i]->SetName(L"lmxxf_nr edit history");
         }
-        _stab[0]->SetName(L"lmxxf_nr edit history"), _stab[1]->SetName(L"lmxxf_nr edit history");
     }
     c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u);
     b.hist = _stab[_stabCur].Get();
@@ -654,6 +681,24 @@ void NrEngine::WaitIdle()
     wait(_queue.Get(), _hipFence.Get(), _hipValue);
 }
 
+std::string NrEngine::VramNote()
+{
+    DXGI_QUERY_VIDEO_MEMORY_INFO l {}, n {};
+    if (!_adapter || FAILED(_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &l)))
+        return "VRAM -";
+    _adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &n);
+    char b[160];
+    snprintf(b, sizeof(b), "VRAM %llu / %llu MB, shared %llu MB, retired %zu", l.CurrentUsage >> 20, l.Budget >> 20,
+             n.CurrentUsage >> 20, _retired.size());
+    return b;
+}
+
+std::string NrEngine::DeviceNote()
+{
+    const HRESULT r = _device ? _device->GetDeviceRemovedReason() : S_OK;
+    return (FAILED(r) ? "device removed " + Hex(r) : std::string("device ok")) + ", " + VramNote();
+}
+
 void NrEngine::Retire(ComPtr<ID3D12Resource>& r)
 {
     if (!r)
@@ -750,10 +795,74 @@ bool NrEngine::WarmUp()
     DrainJob();
     WaitIdle();
     _motion = {};
-    Log(OptiLog_Info, "network ready for %ux%u in %lu ms (%s, %d pass(es), history %d)%s", _feedW, _feedH,
+    Log(OptiLog_Info, "network ready for %ux%u in %lu ms (%s, %d pass(es), history %d)%s, %s", _feedW, _feedH,
         GetTickCount() - t0, _rt.Native() ? (_settings.model == 0 || _forceFull ? "Full" : "Small") : "runtime's model",
-        _forceFull ? 1 : _settings.Passes(), (int) _stats.temporal, _forceFull ? " [model pin reset]" : "");
+        _forceFull ? 1 : _settings.Passes(), (int) _stats.temporal, _forceFull ? " [model pin reset]" : "",
+        VramNote().c_str());
     return true;
+}
+
+void NrEngine::DestroySession()
+{
+    const int32_t d = _rt.api.Drain(_ctx);
+    const int32_t x = _rt.api.Destroy(_ctx);
+    _ctx = nullptr;
+    if (d != LMXXF_NR_OK || x != LMXXF_NR_OK)
+        Log(OptiLog_Warn, "NR (%ls): session teardown: Drain %d, Destroy %d (%s), %s", name.c_str(), d, x,
+            _rt.LastError().c_str(), DeviceNote().c_str());
+}
+
+bool NrEngine::Build(uint32_t feedW, uint32_t feedH, bool recreate, bool* kept)
+{
+    *kept = false;
+    if (DeviceLost())
+        return Fail("rebuild: " + DeviceNote()), false;
+    ReleaseRetired();
+    Log(OptiLog_Info, "NR (%ls): building %ux%u%s, %s", name.c_str(), feedW, feedH, recreate ? ", new session" : "",
+        VramNote().c_str());
+    // The new feed first: when it can't be made the running session stays as it is
+    ComPtr<ID3D12Resource> feed;
+    if (feedW != _feedW || feedH != _feedH || !_feed)
+    {
+        HRESULT hr = S_OK;
+        const bool injected = std::exchange(_failNextFeed, false);
+        if (injected)
+            hr = E_OUTOFMEMORY;
+        else
+            feed = Texture(_device.Get(), feedW, feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead, &hr);
+        if (!feed)
+        {
+            _stats.error = "feed texture " + std::to_string(feedW) + "x" + std::to_string(feedH) + " creation failed " +
+                           Hex(hr) + (injected ? " (TestFailFeed)" : "") + ", " + DeviceNote();
+            Log(OptiLog_Error, "NR (%ls): %s", name.c_str(), _stats.error.c_str());
+            *kept = _ctx != nullptr && _feed != nullptr;
+            return false;
+        }
+        feed->SetName(L"lmxxf_nr feed");
+    }
+    if (_ctx != nullptr)
+    {
+        DrainJob();
+        WaitIdle();
+        ReleaseRetired(); // the queues are past every marker: the old resources go before the new network
+    }
+    if (recreate && _ctx != nullptr)
+        DestroySession();
+    if (_ctx == nullptr)
+    {
+        ApplyEnv();
+        if (!CreateSession())
+            return false;
+    }
+    if (feed)
+    {
+        Retire(_feed);
+        _feed = std::move(feed);
+        _feedW = feedW;
+        _feedH = feedH;
+        _meterPrevValid = false;
+    }
+    return WarmUp();
 }
 
 void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
@@ -770,46 +879,45 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
     }
 
     _stats.state = "preparing";
-    if (_ctx != nullptr)
+    const NrSettings prev = _active;
+    const uint32_t prevW = _feedW, prevH = _feedH;
+    const bool hadSession = _ctx != nullptr && _feed != nullptr;
+    bool kept = false;
+    bool ok = Build(feedW, feedH, recreate, &kept);
+    std::string refused;
+    if (!ok && hadSession && !DeviceLost())
     {
-        DrainJob();
-        WaitIdle();
+        // Back to the running configuration; the new one is tried again at the next settings change
+        refused = _stats.error;
+        _refusedW = feedW;
+        _refusedH = feedH;
+        NrSettings s = _settings;
+        s.size = prev.size;
+        s.model = prev.model;
+        s.passes = prev.passes;
+        s.style = prev.style;
+        s.temporal = prev.temporal;
+        _settings = s;
+        Log(OptiLog_Warn, "NR (%ls): new settings not applied, back to %ux%u (%s)", name.c_str(), prevW, prevH,
+            kept ? "session kept" : "rebuilding it");
+        ok = kept || Build(prevW, prevH, true, &kept);
     }
-    if (recreate && _ctx != nullptr)
-    {
-        _rt.api.Drain(_ctx);
-        _rt.api.Destroy(_ctx);
-        _ctx = nullptr;
-    }
-
-    bool ok = true;
-    if (_ctx == nullptr)
-    {
-        ApplyEnv();
-        ok = CreateSession();
-    }
-    if (ok && (feedW != _feedW || feedH != _feedH || !_feed))
-    {
-        Retire(_feed);
-        _feed = Texture(_device.Get(), feedW, feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead);
-        _feedW = feedW;
-        _feedH = feedH;
-        ok = _feed != nullptr || (Fail("feed texture creation failed"), false);
-    }
-    if (ok)
-        ok = WarmUp();
     if (ok)
     {
         _active = _settings;
         _dirty = false;
         _failures = 0;
         _stats.state = "running";
-        _stats.error.clear();
+        _stats.error = refused.empty() ? std::string() : "not applied: " + refused;
         _stats.feedWidth = _feedW;
         _stats.feedHeight = _feedH;
         _readyFrame = _frameId;
         _meterPrevValid = false;
         _state = State::Ready;
+    }
+    else if (_state != State::Failed)
+    {
+        Fail(_stats.error.empty() ? "rebuild failed, " + DeviceNote() : _stats.error);
     }
     _mutex.unlock();
 }
@@ -908,7 +1016,7 @@ bool NrEngine::Begin(ID3D12Device* device, ID3D12CommandQueue* queue, uint32_t s
     }
 
     // Ready: a new network size or new runtime settings rebuild off the render thread
-    if (dirty || feedW != _feedW || feedH != _feedH)
+    if ((dirty || feedW != _feedW || feedH != _feedH) && (dirty || feedW != _refusedW || feedH != _refusedH))
     {
         {
             std::lock_guard lock(_mutex);
@@ -966,7 +1074,7 @@ void NrEngine::OnUpscale(OptiUpscaleFrame* f, bool after)
         return SeqIdle(_state == State::Failed ? "NR failed" : "the network is being built");
 
     std::lock_guard lock(_mutex);
-    if (_state != State::Ready)
+    if (_state != State::Ready || !_feed)
         return;
     _srcW = srcW;
     _srcH = srcH;
@@ -1050,10 +1158,10 @@ void NrEngine::Produce(ID3D12GraphicsCommandList* list, const OptiUpscaleFrame* 
             if (_rt.api.GetStatus != nullptr)
                 _rt.api.GetStatus(_ctx, status, sizeof(status));
             const char* hip = strstr(status, "hip_ms=");
-            Log(OptiLog_Info, "stats (%ls): GPU network+handoff %.2f ms median, network %.2f ms, %llu run, %llu skipped, %ux%u -> %ux%u, history %d, runtime %.14s",
+            Log(OptiLog_Info, "stats (%ls): GPU network+handoff %.2f ms median, network %.2f ms, %llu run, %llu skipped, %ux%u -> %ux%u, history %d, runtime %.14s, %s",
                 name.c_str(), Median(_hipSamples, _hipCount), Median(_netSamples, _netCount),
                 (unsigned long long) _stats.framesRun, (unsigned long long) _stats.framesSkipped, _stats.srcWidth,
-                _stats.srcHeight, _feedW, _feedH, (int) _stats.temporal, hip ? hip : "-");
+                _stats.srcHeight, _feedW, _feedH, (int) _stats.temporal, hip ? hip : "-", VramNote().c_str());
         }
         if (_stats.framesRun % 180 == 0 && (_flkStaticN || _flkMcN))
         {
@@ -1106,6 +1214,14 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         Barrier(list, color, colorState, kRead);
     if (mvMove)
         Barrier(list, mv, mvState, kRead);
+    // a texture that can't be made: no NR this frame, the game's states as they were
+    auto bail = [&]
+    {
+        if (colorMove)
+            Barrier(list, color, kRead, colorState);
+        if (mvMove)
+            Barrier(list, mv, kRead, mvState);
+    };
 
     // Source of this frame (what we feed and what the edit is added to) and where the result goes
     ID3D12Resource* src = nullptr;
@@ -1132,7 +1248,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
             _srcCopy->GetDesc().Format != od.Format)
             Retire(_srcCopy), _srcCopy = Texture(_device.Get(), (uint32_t) od.Width, od.Height, od.Format, false, kRead);
         if (!_srcCopy)
-            return;
+            return bail();
         Barrier(list, output, outputState, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Barrier(list, _srcCopy.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(_srcCopy.Get(), output);
@@ -1143,7 +1259,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         target = output;
     }
     if (target == nullptr)
-        return;
+        return bail();
     const uint32_t w = pre ? f->renderWidth : f->outputWidth;
     const uint32_t h = pre ? f->renderHeight : f->outputHeight;
 
@@ -1463,7 +1579,7 @@ void NrEngine::OnPresent(OptiPresentFrame* f)
         return SeqIdle(_state == State::Failed ? "NR failed" : "the network is being built");
 
     std::unique_lock lock(_mutex);
-    if (_state != State::Ready)
+    if (_state != State::Ready || !_feed)
         return;
     _stats.srcWidth = w;
     _stats.srcHeight = h;
@@ -1740,19 +1856,25 @@ bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
     if (_termCopy && _termCopy->GetDesc().Width == bd.Width && _termCopy->GetDesc().Height == bd.Height &&
         _termCopy->GetDesc().Format == bd.Format)
         return true;
-    Retire(_termCopy);
-    Retire(_termOut);
-    _termCopy = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, bd.Format, false, kRead);
-    _termOut = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, UavFormat(bd.Format), true,
-                       D3D12_RESOURCE_STATE_COPY_SOURCE);
-    if (_termCopy && _termOut)
-        _termCopy->SetName(L"lmxxf_nr source copy"), _termOut->SetName(L"lmxxf_nr result");
-    if (!_termCopy || !_termOut)
+    HRESULT hr = S_OK;
+    auto copy = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, bd.Format, false, kRead, &hr);
+    auto out = copy ? Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, UavFormat(bd.Format), true,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE, &hr)
+                    : nullptr;
+    if (!copy || !out)
     {
-        Fail("copy textures failed for format " + std::to_string(bd.Format) + ", device " +
-             std::to_string((uint32_t) _device->GetDeviceRemovedReason()));
+        // the old pair stays: this frame has no NR, the next one tries again
+        if (_copyFails++ % 600 == 0)
+            Log(OptiLog_Error, "NR (%ls): copy textures %llux%u fmt %d failed %s, %s: no NR", name.c_str(),
+                (unsigned long long) bd.Width, bd.Height, (int) bd.Format, Hex(hr).c_str(), DeviceNote().c_str());
         return false;
     }
+    _copyFails = 0;
+    Retire(_termCopy);
+    Retire(_termOut);
+    _termCopy = std::move(copy);
+    _termOut = std::move(out);
+    _termCopy->SetName(L"lmxxf_nr source copy"), _termOut->SetName(L"lmxxf_nr result");
     return true;
 }
 
@@ -1790,7 +1912,7 @@ bool NrEngine::RunOwn(ID3D12Device* device, ID3D12CommandQueue* queue, const Own
     }
 
     std::unique_lock lock(_mutex);
-    if (_state != State::Ready || !EnsureCopies(sd))
+    if (_state != State::Ready || !_feed || !EnsureCopies(sd))
         return false;
     _stats.srcWidth = w;
     _stats.srcHeight = h;
