@@ -11,6 +11,7 @@ Spike result. The network no longer has to run on every displayed frame: `NrCade
 - **Feed at the output size** (Ultra): the history is used under cadence too; the pair's own ratio, the 3x3 only for the clamp's spread.
 - `2` / `3`: fed every 2nd / 3rd frame; a fed frame waits only when the last answer is older than that.
 - `async`: fed again as soon as the last answer is in; no frame waits. With multi-GPU the presenter never waits for the network.
+- **Guard**: on every 4th frame, every 8th pixel's guide is compared with last frame's in the history, at the moved position and in place. Vectors that are wrong (the moved read misses at least 0.9 times as often as the in-place one, on 1 % of the frame or more) or 15 % of the frame changing in place hold the cadence back: the every-frame path runs until the checks have been clean for 2 s.
 - Not with the game's FG input edited in place (that path keeps the network on every frame). Live through `lmxxf_nr_ini.trigger`.
 
 ## Offline quality (numpy prototype on recorded sequences, half-size feed)
@@ -55,9 +56,33 @@ P = frames between network runs, d = frames until the answer lands; for P 2 and 
 - Not kept: re-referencing a late answer to the current frame's feed-size colour. It brings the still flicker back to the every-frame level but holds stale content: 2.5-3.7 dB lost on the animated menu, 0.5-0.9 dB at 25 px/frame.
 - It depends on the motion vectors. On the synthetic sets with the background's vectors of the wrong sign, P1 d1 lost 2.8-5.6 dB and P3 d3 5.2-9.3 dB, while the same-frame answer lost nothing.
 
+### The guard on the same sequences
+Held frames take the every-frame path: with multi-GPU that is the frame's own answer, on one GPU the terminal path as it ships.
+
+| set | checks flagged | P3 d3 | P3 d3 with the guard, multi-GPU | one GPU |
+|---|---|---|---|---|
+| Synthetic pans, wrong-sign vectors | every one (moved read misses 1.2 times as often as in place) | -5.2 / -9.3 dB | -0.2 / -0.0 dB | -3.6 / -3.1 dB, the shipped path's level |
+| Animated menu | its bursts (27-31 % of the frame changes in place) | -7.6 dB | +0.1 dB | -8.5 dB, the shipped path's level |
+| Satisfactory 2.5 and 5 px/frame, DX11 game 25 px/frame | none (0.02-0.44 times; under 7 % in place) | unchanged | unchanged | unchanged |
+
+- On one GPU nothing cheap helps content that changes in place: every path there applies a late answer, and dropping the edit on changed pixels is worse than the stale one (-11.4 against -8.7 dB on the menu).
+- In the Satisfactory menu the guard holds for 2 s at the scene cuts (the vectors mean nothing across a cut) and nowhere else.
+
 ## GPU
 - `upsample_bench --cadence P,D` against the numpy prototype: 88-96 dB over 6 frames (cadence 3,2 at 4K), as for the stabiliser alone.
-- Cost at 4K on one R9700: held frame 0.74 ms, answer frame 0.95-0.97 ms (every-frame stabilised apply: 0.86 ms), accumulate 0.21-0.24 ms at 4K vectors. Native-size feed: 0.78 / 1.21 ms.
+- Cost at 4K on one R9700: held frame 0.74 ms, answer frame 0.95-0.97 ms (every-frame stabilised apply: 0.86 ms), accumulate 0.21-0.24 ms at 4K vectors. Native-size feed: 0.78 / 1.21 ms. The guard's check: 0.25-0.3 ms on every 4th frame; its sums match the prototype's (wrong sign 3.6 % against 2.9 %, corrected 0.1 % against 2.9 %).
+
+## Satisfactory, one GPU, 4K (rig: real HUD-less colour and vectors)
+| | NR off | every frame | cadence 2 | cadence 3 | async |
+|---|---|---|---|---|---|
+| Quality, fps | 62.0 | 32.9 | 42.4 | 46.7 | 46.2 |
+| Quality, p99 frame ms | 18.5 | 36.1 | 28.7 | 30.6 | 30.9 |
+| Ultra, fps | 62.0 | 18.5 | 29.1 | 35.1 | 39.1 |
+| Ultra, p99 frame ms | 19.0 | 59.2 | 47.0 | 34.0 | 34.4 |
+
+- Async: no frame waits; the network lands every 3rd frame at Quality and every 4th at Ultra.
+- Gates pass at both sizes with the dump taken in async: UI pixels unchanged (0.000 %), edit transfer faithful, feed in [0, 1], no failed present. The network's answers, fed the accumulated vectors, stay steadier than their input (moving flicker -0.0019 / -0.0003).
+- Cadence 2 / 3 were measured one build earlier (before the guard); they have no advantage over async here.
 
 ## Harness (4K, no motion vectors, emulated game load; NR off 112-124 fps)
 | | every frame | cadence 2 | cadence 3 | async |
@@ -72,8 +97,8 @@ P = frames between network runs, d = frames until the answer lands; for P 2 and 
 - Single GPU async paces evenly (p99 14 ms) but the game takes the GPU first: the network lands only every 5th (Quality) to 8th (Ultra) frame, outside the offline study's range.
 
 ## Open
-- In game the vectors path (accumulate on the game's vectors, the network fed the accumulated offset) has only run offline so far. Multi-GPU game runs were parked while this was written, after display-card losses at the loading-to-menu transition that also hit other builds.
-- Single GPU: a pacer for cadence 2 / 3, or a floor on the network rate for async.
-- A vector sanity check that falls back to every frame when the vectors do not explain the frames.
+- Multi-GPU game runs were parked while this was written, after display-card losses at the loading-to-menu transition that also hit other builds.
+- Single GPU: a pacer for cadence 2 / 3. Async in the game needs no floor on the network rate (every 3rd-4th frame); in the harness it did (every 5th-8th).
+- The guard's hold at scene cuts could be skipped when the game flags the cut.
 - The every-frame terminal path could take the moved read of last frame's pair (P1 d1 above).
 - The stabiliser at the native size (every frame): 48-56 dB from the unstabilised answer, its still flicker a tenth to a third.
