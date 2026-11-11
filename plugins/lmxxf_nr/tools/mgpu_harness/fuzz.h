@@ -76,6 +76,7 @@ struct Pipeline
     ComPtr<ID3D12DescriptorHeap> rtv, views;
     UINT rtvInc = 0, viewInc = 0;
     ComPtr<ID3D12Resource> color, mv, out, hud;
+    ComPtr<ID3D12Resource> wrong; // a HUD-less colour that matches no frame (never written: black)
     UINT rw = 0, rh = 0, ow = 0, oh = 0;
     uint64_t upscaleId = 0;
 
@@ -141,7 +142,7 @@ struct Pipeline
     // The GPU is idle (the caller waited) and the plugin has no HUD-less pointer of ours
     bool Targets(UINT outW, UINT outH, float scale)
     {
-        color.Reset(), mv.Reset(), out.Reset(), hud.Reset();
+        color.Reset(), mv.Reset(), out.Reset(), hud.Reset(), wrong.Reset();
         ow = outW, oh = outH;
         rw = (std::max)(64u, UINT(outW * scale + 0.5f) & ~1u);
         rh = (std::max)(64u, UINT(outH * scale + 0.5f) & ~1u);
@@ -153,7 +154,8 @@ struct Pipeline
         out = Tex(ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, L"harness upscaled output");
         hud = Tex(ow, oh, bbFmt, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, kRead, nullptr, L"harness HUD-less colour");
-        if (!color || !mv || !out || !hud)
+        wrong = Tex(ow, oh, bbFmt, D3D12_RESOURCE_FLAG_NONE, kRead, nullptr, L"harness wrong HUD-less colour");
+        if (!color || !mv || !out || !hud || !wrong)
             return false;
         auto h = rtv->GetCPUDescriptorHandleForHeapStart();
         dev->CreateRenderTargetView(color.Get(), nullptr, h);
@@ -267,7 +269,7 @@ struct Pipeline
 // One fuzz step. The harness applies it; files are trigger files for the plugin's dump folder.
 struct Action
 {
-    enum Kind { Ini, Hud, Dump, Seq, Resize, Minimise, Scale, MgpuLive, Reset, NoMv } kind = Ini;
+    enum Kind { Ini, Hud, Dump, Seq, Resize, Minimise, Scale, MgpuLive, Reset, NoMv, Upscaler } kind = Ini;
     char cls = 'i';
     std::string what;
     std::vector<std::pair<std::wstring, std::string>> files;
@@ -511,6 +513,8 @@ inline bool LoadScript(const char* path, std::vector<Action>& steps)
             a.kind = Action::Reset, a.a = atoi(rest);
         else if (w == "nomv")
             a.kind = Action::NoMv, a.a = atoi(rest);
+        else if (w == "upscaler")
+            a.kind = Action::Upscaler, a.a = atoi(rest);
         else
             continue;
         steps.push_back(a);

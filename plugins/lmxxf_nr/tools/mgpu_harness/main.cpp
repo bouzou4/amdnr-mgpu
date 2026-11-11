@@ -17,7 +17,9 @@
 //   presenting meanwhile
 //   Fake upscaler (the plugin's TestHooks=true): --upscaler renders the scene at --render-scale <f> (0.667) with motion
 //   vectors, calls the plugin's upscale callbacks around its own scaling pass and copies the result to the back
-//   buffer; --hudless gives the plugin that picture before the frame counter strip as the HUD-less colour
+//   buffer; --hudless gives the plugin that picture before the frame counter strip as the HUD-less colour.
+//   --upscaler-late starts with the upscaler's callbacks and the HUD-less colour off (a title in its menu); the script
+//   steps "upscaler 1" / "upscaler 0" start and stop them, "hud 2" gives a HUD-less colour that matches no frame
 //   Switch fuzzer: --fuzz <seed> [--fuzz-steps <n>] [--fuzz-classes <letters>] [--cap <fps>] [--mgpu]: a seeded
 //   sequence of live switches through the plugin's trigger files (i ini keys, d frame dumps, s sequence dumps,
 //   g multi-GPU triggers), window changes (r resize, m minimise) and upscaler changes (h HUD-less source on / off,
@@ -122,7 +124,7 @@ int main(int argc, char** argv)
     double stallAt = -1, stallMs = 2500, stallEvery = 0;
     const char* csvPath = nullptr;
     const char* format = "sdr";
-    bool useUpscaler = false, useHudless = false, fuzz = false, mgpuHint = false;
+    bool useUpscaler = false, useHudless = false, fuzz = false, mgpuHint = false, upscalerLate = false;
     float renderScale = 0.667f;
     UINT64 fuzzSeed = 0;
     int fuzzSteps = 200;
@@ -172,6 +174,8 @@ int main(int argc, char** argv)
             useUpscaler = true;
         else if (!strcmp(argv[i], "--hudless"))
             useHudless = true;
+        else if (!strcmp(argv[i], "--upscaler-late"))
+            upscalerLate = true;
         else if (!strcmp(argv[i], "--mgpu"))
             mgpuHint = true;
         else if (!strcmp(argv[i], "--render-scale") && i + 1 < argc)
@@ -342,7 +346,8 @@ int main(int argc, char** argv)
     const bool pipe = useUpscaler || useHudless;
     hx::Hooks hooks;
     hx::Pipeline pl;
-    bool hudOn = useHudless;
+    bool hudOn = useHudless, hudWrong = false;
+    bool upOn = useUpscaler && !upscalerLate; // the upscaler's callbacks run (off: a title still in its menu)
     if (pipe || fuzz)
         printf("plugin test hooks: %s\n", hooks.Load() ? "found" : "not found (TestHooks=true, lmxxf_nr.asi loaded?)");
     if (pipe && (!hooks.upscale || !pl.Init(dev.Get(), q.Get(), fmt, fp16 ? 4.0f : 1.0f)))
@@ -696,6 +701,10 @@ int main(int argc, char** argv)
                         {
                         case hx::Action::Hud:
                             hudOn = a.a != 0;
+                            hudWrong = a.a == 2;
+                            break;
+                        case hx::Action::Upscaler:
+                            upOn = a.a != 0;
                             break;
                         case hx::Action::Resize:
                             SetWindowPos(hwnd, nullptr, 0, 0, a.a, a.b, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -814,7 +823,7 @@ int main(int argc, char** argv)
         float bg[4] = { 0.1f, 0.12f, 0.2f, 1 };
         if (pipe)
         {
-            pl.Frame(cl.Get(), bb[i].Get(), i, frames, hooks, useUpscaler, resetLeft > 0, noMvLeft > 0);
+            pl.Frame(cl.Get(), bb[i].Get(), i, frames, hooks, upOn, resetLeft > 0, noMvLeft > 0);
             resetLeft -= resetLeft > 0;
             noMvLeft -= noMvLeft > 0;
         }
@@ -864,7 +873,8 @@ int main(int argc, char** argv)
         ID3D12CommandList* ls[] = { cl.Get() };
         q->ExecuteCommandLists(1, ls);
         if (pipe)
-            hooks.hudless(hudOn ? pl.hud.Get() : nullptr, hx::Pipeline::kRead);
+            hooks.hudless(hudOn && (upOn || !useUpscaler) ? (hudWrong ? pl.wrong.Get() : pl.hud.Get()) : nullptr,
+                          hx::Pipeline::kRead);
         marker(frames + 1, 3); // RENDERSUBMIT_END
         marker(frames + 1, 4); // PRESENT_START
         const LONGLONG tPresent = qpc();
