@@ -20,14 +20,14 @@ The one arm kept: alpha 0.1 + spread clamp. Rejected:
 ## Offline (numpy prototype vs the native network; ratios vs plain guided, lower is better)
 | set | arm | PSNR | flk_mc | err_dis | err_edge | err_mov |
 |---|---|---|---|---|---|---|
-| mctl | guided | 46.27 | +.00023 | 1 | 1 | 1 |
-| mctl | + runtime smooth | 46.18 | +.00009 | 1.00 | 1.08 | 0.99 |
-| mctl | a.1 unclamped | 46.05 | +.00001 | 1.00 | 1.07 | 1.00 |
-| mctl | **a.1 clamp** | 46.31 | +.00004 | 1.00 | 1.03 | 0.95 |
-| mlego | guided | 45.52 | +.00162 | 1 | 1 | 1 |
-| mlego | + runtime smooth | 45.08 | +.00055 | 0.99 | 1.03 | 1.04 |
-| mlego | a.1 unclamped | 45.09 | +.00028 | 1.00 | 0.98 | 1.04 |
-| mlego | **a.1 clamp** | 45.43 | +.00033 | 1.00 | 0.98 | 1.01 |
+| mctl | guided | 45.42 | +.00080 | 1 | 1 | 1 |
+| mctl | + runtime smooth | 45.09 | +.00056 | 0.99 | 1.03 | 0.99 |
+| mctl | a.1 unclamped | 45.97 | +.00008 | 1.00 | 0.97 | 0.90 |
+| mctl | **a.1 clamp** | 45.87 | +.00011 | 1.00 | 0.98 | 0.91 |
+| mlego | guided | 45.68 | +.00181 | 1 | 1 | 1 |
+| mlego | + runtime smooth | 45.36 | +.00068 | 1.05 | 1.05 | 0.99 |
+| mlego | a.1 unclamped | 46.12 | +.00024 | 1.00 | 0.93 | 0.95 |
+| mlego | **a.1 clamp** | 46.19 | +.00029 | 1.00 | 0.94 | 0.95 |
 | sat4k | guided | 35.06 | +.00013 | 1 | 1 | 1 |
 | sat4k | + runtime smooth | 35.06 | +.00003 | 1.02 | 1.03 | 1.02 |
 | sat4k | a.1 unclamped | 35.32 | -.00044 | 1.00 | 0.94 | 0.93 |
@@ -38,7 +38,9 @@ The one arm kept: alpha 0.1 + spread clamp. Rejected:
 | satmv | **a.1 clamp** | 34.77 | -.00008 | 1.00 | 0.99 | 1.02 |
 
 The test sets:
-- mlego / mctl: synthetic 4K pans with a crossing patch and exact vectors;
+- mlego / mctl: synthetic 4K pans with a crossing patch and exact vectors. Re-measured 2026-11-10: the first table had
+  the background's vectors with the wrong sign (the history was dropped by the guide test nearly everywhere, so the
+  stabiliser showed little effect); with them corrected it gains 0.45-0.5 dB and removes 85 % of the moving flicker;
 - sat4k: a Satisfactory 4K feed;
 - satmv: Satisfactory 1080 vs 540 with game vectors.
 
