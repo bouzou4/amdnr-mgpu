@@ -179,6 +179,10 @@ void CaptureHudless(OptiPresentFrame* f)
         g_cap.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!g_cap.list || !g_cap.fence)
             return;
+        for (auto& a : g_cap.alloc)
+            if (a)
+                a->SetName(L"Mgpu hudless capture allocator");
+        g_cap.list->SetName(L"Mgpu hudless capture list");
         g_cap.list->Close();
     }
     const uint32_t s = uint32_t(g_cap.counter % 4);

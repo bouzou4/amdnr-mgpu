@@ -115,6 +115,10 @@ bool UiComposite::Init(ID3D12Device* dev, DXGI_FORMAT outFormat)
         FAILED(dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                             IID_PPV_ARGS(&_readback))))
         return false;
+    _heap->SetName(L"Mgpu UI descriptors");
+    _counter->SetName(L"Mgpu UI counter");
+    _zero->SetName(L"Mgpu UI zero");
+    _readback->SetName(L"Mgpu UI readback");
     void* z = nullptr;
     if (SUCCEEDED(_zero->Map(0, nullptr, &z)))
     {

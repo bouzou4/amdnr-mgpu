@@ -55,6 +55,7 @@
     <ClInclude Include="src\Nr.h" />
     <ClInclude Include="src\Runtime.h" />
     <ClInclude Include="src\Shaders.h" />
+    <ClInclude Include="src\Validation.h" />
     <ClInclude Include="src\MgpuPlugin.h" />
     <ClInclude Include="src\mgpu\MgpuCommon.h" />
     <ClInclude Include="src\mgpu\MgpuComposite.h" />
@@ -69,6 +70,7 @@
     <ClCompile Include="src\Nr.cpp" />
     <ClCompile Include="src\Plugin.cpp" />
     <ClCompile Include="src\Runtime.cpp" />
+    <ClCompile Include="src\Validation.cpp" />
     <ClCompile Include="src\MgpuPlugin.cpp" />
     <ClCompile Include="src\mgpu\MgpuComposite.cpp" />
     <ClCompile Include="src\mgpu\MgpuCore.cpp" />

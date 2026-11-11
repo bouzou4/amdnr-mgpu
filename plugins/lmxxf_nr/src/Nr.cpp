@@ -13,6 +13,7 @@
 #include "mgpu/MgpuCore.h"
 #include "GpuWait.h"
 #include "Progress.h"
+#include "Validation.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -91,7 +92,7 @@ void UavBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res)
 }
 
 ComPtr<ID3D12Resource> Texture(ID3D12Device* device, uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool uav,
-                               D3D12_RESOURCE_STATES state)
+                               D3D12_RESOURCE_STATES state, const wchar_t* name)
 {
     D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_RESOURCE_DESC d {};
@@ -108,6 +109,7 @@ ComPtr<ID3D12Resource> Texture(ID3D12Device* device, uint32_t w, uint32_t h, DXG
     ComPtr<ID3D12Resource> r;
     if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&r))))
         return nullptr;
+    r->SetName(name);
     return r;
 }
 
@@ -271,7 +273,10 @@ bool NrEngine::InitDevice(ID3D12Device* device, ID3D12CommandQueue* gameQueue)
                                          IID_PPV_ARGS(&_ownList))))
         return false;
     _queue->SetName(L"lmxxf_nr session queue");
+    _ownAlloc->SetName(L"lmxxf_nr session allocator");
+    _ownList->SetName(L"lmxxf_nr session list");
     _ownList->Close();
+    Validation::Attach(device, _settings.display ? "display" : "game");
     _event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     // Timestamps around EnqueueHip, resolved into a persistently mapped readback buffer
@@ -289,6 +294,8 @@ bool NrEngine::InitDevice(ID3D12Device* device, ID3D12CommandQueue* gameQueue)
         SUCCEEDED(device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
                                                   nullptr, IID_PPV_ARGS(&_readback))))
     {
+        _queryHeap->SetName(L"lmxxf_nr timestamps");
+        _readback->SetName(L"lmxxf_nr timestamp readback");
         UINT64 freq = 0;
         _queue->GetTimestampFrequency(&freq);
         _tsFreq = double(freq);
@@ -298,6 +305,8 @@ bool NrEngine::InitDevice(ID3D12Device* device, ID3D12CommandQueue* gameQueue)
             device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _tsAlloc[i].Get(), nullptr,
                                       IID_PPV_ARGS(&_tsList[i]));
             _tsList[i]->EndQuery(_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, i);
+            _tsAlloc[i]->SetName(L"lmxxf_nr timestamp allocator");
+            _tsList[i]->SetName(L"lmxxf_nr timestamp list");
             if (i & 1)
                 _tsList[i]->ResolveQueryData(_queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, i - 1, 2, _readback.Get(),
                                              (i / 2) * 16);
@@ -388,6 +397,7 @@ bool NrEngine::CreatePipelines()
                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
     if (FAILED(_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_heap))))
         return Fail("descriptor heap creation failed"), false;
+    _heap->SetName(L"lmxxf_nr descriptors");
     _heapStride = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return true;
 }
@@ -460,10 +470,9 @@ bool NrEngine::StabPrepare(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t
         for (auto& t : _stab)
         {
             Retire(t); // the last apply may still read it (a placement or size change)
-            if (!(t = Texture(_device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead)))
+            if (!(t = Texture(_device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead, L"lmxxf_nr edit history")))
                 return false;
         }
-        _stab[0]->SetName(L"lmxxf_nr edit history"), _stab[1]->SetName(L"lmxxf_nr edit history");
     }
     c.histMode = (_stabValid && !reset ? 2u : 1u) | (motion ? 4u : 0u);
     b.hist = _stab[_stabCur].Get();
@@ -792,7 +801,7 @@ void NrEngine::Worker(uint32_t feedW, uint32_t feedH, bool recreate)
     if (ok && (feedW != _feedW || feedH != _feedH || !_feed))
     {
         Retire(_feed);
-        _feed = Texture(_device.Get(), feedW, feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead);
+        _feed = Texture(_device.Get(), feedW, feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, true, kRead, L"lmxxf_nr feed");
         _feedW = feedW;
         _feedH = feedH;
         ok = _feed != nullptr || (Fail("feed texture creation failed"), false);
@@ -1125,7 +1134,7 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         {
             Retire(_override);
             _override = Texture(_device.Get(), (uint32_t) srcDesc.Width, srcDesc.Height,
-                                DXGI_FORMAT_R16G16B16A16_FLOAT, true, colorState);
+                                DXGI_FORMAT_R16G16B16A16_FLOAT, true, colorState, L"lmxxf_nr colour override");
             _overrideState = colorState;
         }
         target = _override.Get();
@@ -1135,7 +1144,8 @@ void NrEngine::Record(OptiUpscaleFrame* f, bool pre)
         const auto od = output->GetDesc();
         if (!_srcCopy || _srcCopy->GetDesc().Width != od.Width || _srcCopy->GetDesc().Height != od.Height ||
             _srcCopy->GetDesc().Format != od.Format)
-            Retire(_srcCopy), _srcCopy = Texture(_device.Get(), (uint32_t) od.Width, od.Height, od.Format, false, kRead);
+            Retire(_srcCopy), _srcCopy = Texture(_device.Get(), (uint32_t) od.Width, od.Height, od.Format, false, kRead,
+                                                  L"lmxxf_nr output copy");
         if (!_srcCopy)
             return;
         Barrier(list, output, outputState, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1251,7 +1261,7 @@ ID3D12Resource* NrEngine::RunStats(ID3D12GraphicsCommandList* list, const OptiUp
 {
     if (!_norm)
     {
-        _norm = Texture(_device.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, kRead);
+        _norm = Texture(_device.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, true, kRead, L"lmxxf_nr stats");
         D3D12_HEAP_PROPERTIES hp { D3D12_HEAP_TYPE_READBACK };
         D3D12_RESOURCE_DESC d {};
         d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1265,6 +1275,7 @@ ID3D12Resource* NrEngine::RunStats(ID3D12GraphicsCommandList* list, const OptiUp
                                                                 IID_PPV_ARGS(&_normReadback))) &&
             SUCCEEDED(_normReadback->Map(0, nullptr, &p)))
             _normMapped = static_cast<const float*>(p);
+        Validation::Name(_normReadback, L"lmxxf_nr stats readback");
         if (!_norm || !_normMapped)
         {
             _norm.Reset();
@@ -1389,7 +1400,8 @@ void NrEngine::CaptureMotion(OptiUpscaleFrame* f)
     const auto md = mv->GetDesc();
     if (!_mvCopy || _mvCopy->GetDesc().Width != md.Width || _mvCopy->GetDesc().Height != md.Height ||
         _mvCopy->GetDesc().Format != ViewFormat(md.Format))
-        Retire(_mvCopy), _mvCopy = Texture(_device.Get(), (uint32_t) md.Width, md.Height, ViewFormat(md.Format), false, kRead);
+        Retire(_mvCopy), _mvCopy = Texture(_device.Get(), (uint32_t) md.Width, md.Height, ViewFormat(md.Format), false, kRead,
+                                                 L"lmxxf_nr motion copy");
     if (!_mvCopy)
         return;
     const auto st = D3D12_RESOURCE_STATES(f->motionVectorsState);
@@ -1628,6 +1640,9 @@ ID3D12GraphicsCommandList* NrEngine::NextOwnList(uint32_t* slot)
                                    IID_PPV_ARGS(&_presentList));
         if (_presentList)
             _presentList->Close();
+        for (auto& a : _presentAlloc)
+            Validation::Name(a, L"lmxxf_nr own allocator");
+        Validation::Name(_presentList, L"lmxxf_nr own list");
         _device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_presentFence));
     }
     if (!_presentList || !_presentFence)
@@ -1749,11 +1764,9 @@ bool NrEngine::EnsureCopies(const D3D12_RESOURCE_DESC& bd)
         return true;
     Retire(_termCopy);
     Retire(_termOut);
-    _termCopy = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, bd.Format, false, kRead);
+    _termCopy = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, bd.Format, false, kRead, L"lmxxf_nr source copy");
     _termOut = Texture(_device.Get(), (uint32_t) bd.Width, bd.Height, UavFormat(bd.Format), true,
-                       D3D12_RESOURCE_STATE_COPY_SOURCE);
-    if (_termCopy && _termOut)
-        _termCopy->SetName(L"lmxxf_nr source copy"), _termOut->SetName(L"lmxxf_nr result");
+                       D3D12_RESOURCE_STATE_COPY_SOURCE, L"lmxxf_nr result");
     if (!_termCopy || !_termOut)
     {
         Fail("copy textures failed for format " + std::to_string(bd.Format) + ", device " +
@@ -1770,9 +1783,9 @@ bool NrEngine::EnsureHudCopies(const D3D12_RESOURCE_DESC& hd)
         return true;
     Retire(_hudCopy);
     Retire(_hudOut);
-    _hudCopy = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, hd.Format, false, kRead);
+    _hudCopy = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, hd.Format, false, kRead, L"lmxxf_nr HUD-less copy");
     _hudOut = Texture(_device.Get(), (uint32_t) hd.Width, hd.Height, UavFormat(hd.Format), true,
-                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+                      D3D12_RESOURCE_STATE_COPY_SOURCE, L"lmxxf_nr HUD-less result");
     if (_hudCopy && _hudOut)
         return true;
     _hudCopy.Reset();
@@ -1969,7 +1982,8 @@ void NrEngine::MaybeDump(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, I
             continue;
         auto d = src[i]->GetDesc();
         d.Flags = D3D12_RESOURCE_FLAG_NONE;
-        _dumpTex[i] = Texture(_device.Get(), (uint32_t) d.Width, d.Height, d.Format, false, D3D12_RESOURCE_STATE_COPY_DEST);
+        _dumpTex[i] = Texture(_device.Get(), (uint32_t) d.Width, d.Height, d.Format, false, D3D12_RESOURCE_STATE_COPY_DEST,
+                              L"lmxxf_nr dump copy");
         if (!_dumpTex[i])
             continue;
         Barrier(list, src[i], st[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1993,12 +2007,12 @@ void NrEngine::Meter(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, bool 
     if (!_meterPrev || _meterPrev->GetDesc().Width != 2ull * _feedW || _meterPrev->GetDesc().Height != _feedH)
     {
         Retire(_meterPrev);
-        _meterPrev = Texture(_device.Get(), 2 * _feedW, _feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, false, kRead);
+        _meterPrev = Texture(_device.Get(), 2 * _feedW, _feedH, DXGI_FORMAT_R16G16B16A16_FLOAT, false, kRead, L"lmxxf_nr meter pair");
         _meterPrevValid = false;
     }
     if (!_meterAcc)
     {
-        _meterAcc = Texture(_device.Get(), 8, 1, DXGI_FORMAT_R32_UINT, true, D3D12_RESOURCE_STATE_COPY_DEST);
+        _meterAcc = Texture(_device.Get(), 8, 1, DXGI_FORMAT_R32_UINT, true, D3D12_RESOURCE_STATE_COPY_DEST, L"lmxxf_nr meter sums");
         D3D12_RESOURCE_DESC b {};
         b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         b.Width = 256;
@@ -2011,6 +2025,8 @@ void NrEngine::Meter(ID3D12GraphicsCommandList* list, ID3D12Resource* enh, bool 
         b.Width = 256 * kMeterSlots;
         _device->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                          IID_PPV_ARGS(&_meterReadback));
+        Validation::Name(_meterZero, L"lmxxf_nr meter zero");
+        Validation::Name(_meterReadback, L"lmxxf_nr meter readback");
         void* z = nullptr;
         if (_meterZero && SUCCEEDED(_meterZero->Map(0, nullptr, &z)))
             memset(z, 0, 256), _meterZero->Unmap(0, nullptr);
@@ -2113,6 +2129,7 @@ void NrEngine::SeqCopy(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D
     if (FAILED(_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &b, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                 IID_PPV_ARGS(&img.buf))))
         return;
+    img.buf->SetName(L"lmxxf_nr sequence readback");
     D3D12_TEXTURE_COPY_LOCATION dst { img.buf.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
     dst.PlacedFootprint = img.fp;
     D3D12_TEXTURE_COPY_LOCATION src { res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
